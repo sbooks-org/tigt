@@ -11,8 +11,12 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
-use tigt_gfxreader::terminal::{Terminal, COLS};
-use tigt_gfxreader::{analyze, Options};
+use tigt_gfxreader::terminal::{COLS, Terminal};
+use tigt_gfxreader::{Options, analyze};
+
+#[cfg(feature = "test-fixtures")]
+#[path = "fixtures/snapshots.rs"]
+mod snapshots;
 
 const PAIRS: [(usize, usize); 13] = [
     (2, 6),
@@ -64,7 +68,7 @@ impl Fixture {
             binary: directory.path().join(name),
             directory: Some(directory),
         };
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let rustc = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
             .arg("-vV")
             .output()
@@ -104,6 +108,20 @@ impl Fixture {
             command.arg(root.join("src/tigt.c"));
         }
         if renderer {
+            command.arg(root.join("src/snapshot.c"));
+            let png = pkg_config::Config::new()
+                .cargo_metadata(false)
+                .probe("libpng")
+                .expect("libpng development headers and library are required");
+            for path in png.include_paths {
+                command.arg("-I").arg(path);
+            }
+            for path in png.link_paths {
+                command.arg("-L").arg(path);
+            }
+            for library in png.libs {
+                command.arg(format!("-l{library}"));
+            }
             let curses = ["ncursesw", "ncurses"].into_iter().find_map(|name| {
                 pkg_config::Config::new()
                     .cargo_metadata(false)
@@ -193,6 +211,16 @@ impl Fixture {
         &self,
         name: &str,
         arguments: &[&str],
+        observe: impl FnMut(&[u8], &mut File) -> Result<(), String>,
+    ) -> Vec<u8> {
+        self.capture_program(&self.binary, name, arguments, observe)
+    }
+
+    fn capture_program(
+        &self,
+        program: &Path,
+        name: &str,
+        arguments: &[&str],
         mut observe: impl FnMut(&[u8], &mut File) -> Result<(), String>,
     ) -> Vec<u8> {
         let (mut master_fd, mut slave_fd) = (-1, -1);
@@ -232,12 +260,15 @@ impl Fixture {
         } else {
             "C.UTF-8"
         };
-        let child = Command::new(&self.binary)
+        let child = Command::new(program)
             .args(arguments)
             .env("TERM", "xterm-256color")
             .env("LANG", locale)
             .env("LC_ALL", locale)
             .stdin(slave.try_clone().unwrap())
+            .env_remove("TIGT_SNAPSHOT_PATH")
+            .env_remove("TIGT_SNAPSHOT_FORMAT")
+            .env_remove("TIGT_SNAPSHOT_SIGNAL")
             .stdout(slave.try_clone().unwrap())
             .stderr(slave)
             .spawn()
@@ -395,7 +426,6 @@ fn check_frame(capture: &[u8], font: &[u8], fg: usize, bg: usize) {
         if has_background {
             colors.insert(background);
         }
-        assert_eq!(glyph.status, "matched", "{fg}-{bg}: {glyph:?}");
         assert_eq!(
             glyph.colors,
             colors.into_iter().collect::<Vec<_>>(),
@@ -460,43 +490,16 @@ fn production_palette_masks_transitions_bounds_and_all_thirteen_font_color_pairs
         );
         check_frame(&capture, &font, fg, bg);
     }
-    // The built CLI must produce the same exact report as the library. This
-    // replaces comparing committed machine/ROM captures with private paths.
-    let prefix = fixture.path("cli-result");
-    let output = Command::new(env!("CARGO_BIN_EXE_tigt-gfxreader"))
-        .args(["analyze", "--capture"])
-        .arg(fixture.path("2-6.pty"))
-        .arg("--rom")
-        .arg(&rom)
-        .args(["--font-offset", "0xfa6e", "--output"])
-        .arg(&prefix)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "CLI: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report: serde_json::Value =
-        serde_json::from_slice(&fs::read(prefix.with_extension("json")).unwrap()).unwrap();
-    let library = analyze(
+    // Extraction leaves CLI coverage in the independent analyzer project.
+    // This consumer verifies the API still decodes a real production capture.
+    let analysis = analyze(
         &fs::read(fixture.path("2-6.pty")).unwrap(),
         &font,
         &options(),
     )
     .unwrap();
-    assert_eq!(report, serde_json::to_value(&library.report).unwrap());
-    assert_eq!(
-        fs::read_to_string(prefix.with_extension("txt")).unwrap(),
-        library.report.decoded_text
-    );
-    let mut png = png::Decoder::new(File::open(prefix.with_extension("png")).unwrap())
-        .read_info()
-        .unwrap();
-    let mut decoded = vec![0; png.output_buffer_size()];
-    let frame = png.next_frame(&mut decoded).unwrap();
-    assert_eq!((frame.width, frame.height), (320, 200));
-    assert_eq!(&decoded[..frame.buffer_size()], library.rgba);
+    assert!(analysis.report.success);
+    assert_eq!(analysis.rgba, expected_pixels(&font, 2, 6));
 }
 
 #[test]

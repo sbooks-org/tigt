@@ -5,6 +5,7 @@
 include(CMakeFindDependencyMacro)
 find_dependency(Curses)
 find_dependency(Threads)
+find_dependency(PNG)
 if(NOT TARGET tigt::curses)
     add_library(tigt::curses INTERFACE IMPORTED)
     set_target_properties(tigt::curses PROPERTIES

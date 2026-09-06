@@ -419,22 +419,25 @@ name = "tigt"
 version = "0.2.0"
 dependencies = [
  "cc",
+ "libc",
  "pc-xt-keyboard",
  "pkg-config",
+ "png",
+ "serde_json",
+ "tempfile",
+ "tigt-gfxreader",
 ]
 
 [[package]]
 name = "tigt-gfxreader"
 version = "0.1.0"
+source = "git+ssh://git@github.com/sbooks-org/tigt-gfxreader.git?rev=2cb76de904f9a7397a57253704a7265a00ff06ab#2cb76de904f9a7397a57253704a7265a00ff06ab"
 dependencies = [
- "cc",
  "clap",
  "libc",
- "pkg-config",
  "png",
  "serde",
  "serde_json",
- "tempfile",
  "unicode-width",
  "vte",
 ]

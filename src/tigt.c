@@ -7,6 +7,7 @@
 #endif
 
 #include "tigt.h"
+#include "snapshot.h"
 
 #include <curses.h>
 #include <errno.h>
@@ -26,7 +27,7 @@
 
 #define TERMINAL_MAX_COLUMNS 320
 #define TERMINAL_MAX_ROWS 128
-#define TERMINAL_MAX_CELLS 21440
+#define TERMINAL_MAX_CELLS TIGT_MAX_TEXT_CELLS
 
 static pthread_mutex_t renderer_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t renderer_thread;
@@ -41,7 +42,7 @@ static uint16_t renderer_bitmap_width;
 static uint8_t renderer_bitmap_pixel_width;
 static bool renderer_bitmap_valid;
 static bool renderer_has_frame;
-static bool renderer_active;
+static atomic_bool renderer_active;
 static atomic_bool renderer_running;
 static atomic_bool input_running;
 static bool renderer_initialized;
@@ -508,48 +509,57 @@ render_text(const tigt_text_cell *cells, uint16_t columns, uint16_t rows)
     rendered_cells_valid = true;
 }
 
+/* Both the display and snapshot encoders consume this same native-frame copy.
+ * Callers hold renderer_mutex; no application buffers survive submission. */
+static void
+copy_native_frame(tigt_native_frame *frame)
+{
+    frame->bitmap = renderer_bitmap_valid;
+    frame->width = frame->bitmap ? renderer_bitmap_width : renderer_text_columns;
+    frame->height = frame->bitmap ? 200 : renderer_text_rows;
+    frame->pixel_width = frame->bitmap ? renderer_bitmap_pixel_width : 1;
+    frame->overscan = renderer_overscan;
+    if (frame->bitmap)
+        memcpy(frame->content.pixels, renderer_bitmap_pixels,
+               (size_t) frame->width * frame->height * sizeof(*frame->content.pixels));
+    else
+        memcpy(frame->content.cells, renderer_text_cells,
+               (size_t) frame->width * frame->height * sizeof(*frame->content.cells));
+}
+
+int
+tigt_snapshot_capture(tigt_native_frame *frame)
+{
+    pthread_mutex_lock(&renderer_mutex);
+    if (!renderer_active || !renderer_has_frame) {
+        pthread_mutex_unlock(&renderer_mutex);
+        return TIGT_ERROR_BUSY;
+    }
+    copy_native_frame(frame);
+    pthread_mutex_unlock(&renderer_mutex);
+    return TIGT_OK;
+}
+
 static void
 render_frame(void)
 {
-    /* Only the renderer thread owns this snapshot; keep it off small pthread stacks. */
-    static union {
-        uint32_t bitmap_pixels[640 * 200];
-        tigt_text_cell text_cells[TERMINAL_MAX_CELLS];
-    } snapshot;
-    uint16_t bitmap_width;
-    uint8_t bitmap_pixel_width;
-    uint16_t columns;
-    uint16_t rows;
-    bool bitmap_valid;
-
+    /* Only the renderer thread owns this copy; keep it off small pthread stacks. */
+    static tigt_native_frame snapshot;
     pthread_mutex_lock(&renderer_mutex);
-    if (!renderer_has_frame) {
+    if (!renderer_has_frame ||
+        (rendered_cells_valid && renderer_frame_serial == rendered_frame_serial)) {
         pthread_mutex_unlock(&renderer_mutex);
         return;
     }
     const uint64_t frame_serial = renderer_frame_serial;
-
-    if (rendered_cells_valid && frame_serial == rendered_frame_serial) {
-        pthread_mutex_unlock(&renderer_mutex);
-        return;
-    }
-    bitmap_valid = renderer_bitmap_valid;
-    bitmap_width = renderer_bitmap_width;
-    bitmap_pixel_width = renderer_bitmap_pixel_width;
-    columns = renderer_text_columns;
-    rows = renderer_text_rows;
-    if (bitmap_valid)
-        memcpy(snapshot.bitmap_pixels, renderer_bitmap_pixels,
-               (size_t) bitmap_width * 200 * sizeof(*snapshot.bitmap_pixels));
-    else
-        memcpy(snapshot.text_cells, renderer_text_cells,
-               (size_t) columns * rows * sizeof(*snapshot.text_cells));
+    copy_native_frame(&snapshot);
     pthread_mutex_unlock(&renderer_mutex);
 
-    if (bitmap_valid)
-        render_bitmap_graphics(snapshot.bitmap_pixels, bitmap_width, 200, bitmap_pixel_width, true);
+    if (snapshot.bitmap)
+        render_bitmap_graphics(snapshot.content.pixels, snapshot.width, snapshot.height,
+                               snapshot.pixel_width, true);
     else
-        render_text(snapshot.text_cells, columns, rows);
+        render_text(snapshot.content.cells, snapshot.width, snapshot.height);
     rendered_frame_serial = frame_serial;
 }
 
@@ -612,6 +622,10 @@ restore_terminal_mode(int descriptor, const struct termios *mode)
 static void
 stop_session(void)
 {
+    pthread_mutex_lock(&renderer_mutex);
+    renderer_active = false;
+    pthread_mutex_unlock(&renderer_mutex);
+    tigt_snapshot_session_stop(false);
     /* Joining, not cancellation, lets every application callback finish safely. */
     atomic_store_explicit(&input_running, false, memory_order_relaxed);
     atomic_store_explicit(&renderer_running, false, memory_order_relaxed);
@@ -642,7 +656,6 @@ stop_session(void)
         restore_terminal_mode(STDIN_FILENO, &saved_input_termios);
         terminal_modes_saved = false;
     }
-    renderer_active = false;
 }
 
 int
@@ -710,7 +723,10 @@ tigt_resume(void)
         goto failure;
     }
     renderer_thread_created = true;
+    pthread_mutex_lock(&renderer_mutex);
     renderer_active = true;
+    pthread_mutex_unlock(&renderer_mutex);
+    tigt_snapshot_session_start();
     if (renderer_input != NULL) {
         atomic_store_explicit(&input_running, true, memory_order_relaxed);
         thread_error = pthread_create(&input_thread, NULL, input_main, NULL);
@@ -742,6 +758,8 @@ tigt_init(const tigt_config *config)
         return TIGT_ERROR_ARGUMENT;
     if (renderer_initialized)
         return TIGT_ERROR_BUSY;
+    tigt_snapshot_session_reset();
+    pthread_mutex_lock(&renderer_mutex);
     renderer_config = *config;
     renderer_has_frame = false;
     renderer_bitmap_valid = false;
@@ -749,9 +767,14 @@ tigt_init(const tigt_config *config)
     renderer_frame_serial = 0;
     rendered_frame_serial = 0;
     renderer_initialized = true;
-    const int result = tigt_resume();
+    pthread_mutex_unlock(&renderer_mutex);
+    int result = tigt_resume();
+    if (result == TIGT_OK)
+        result = tigt_snapshot_environment();
 
     if (result != TIGT_OK) {
+        stop_session();
+        tigt_snapshot_session_stop(true);
         renderer_initialized = false;
         memset(&renderer_config, 0, sizeof(renderer_config));
     }
@@ -764,11 +787,14 @@ tigt_shutdown(void)
     if (!renderer_initialized)
         return;
     stop_session();
+    tigt_snapshot_session_stop(true);
+    pthread_mutex_lock(&renderer_mutex);
     renderer_initialized = false;
     renderer_has_frame = false;
     renderer_bitmap_valid = false;
     memset(&renderer_overscan, 0, sizeof(renderer_overscan));
     memset(&renderer_config, 0, sizeof(renderer_config));
+    pthread_mutex_unlock(&renderer_mutex);
 }
 
 int
@@ -781,6 +807,10 @@ tigt_present_bitmap(const uint32_t *pixels, uint16_t width, uint16_t height,
     if (!renderer_active)
         return TIGT_ERROR_BUSY;
     pthread_mutex_lock(&renderer_mutex);
+    if (!renderer_active) {
+        pthread_mutex_unlock(&renderer_mutex);
+        return TIGT_ERROR_BUSY;
+    }
     for (uint16_t row = 0; row < height; row++)
         memcpy(renderer_bitmap_pixels + row * width, pixels + (size_t) row * stride, width * sizeof(*pixels));
     renderer_bitmap_width = width;
@@ -826,6 +856,10 @@ tigt_present_text(const tigt_text_cell *cells, uint16_t columns, uint16_t rows,
     }
 
     pthread_mutex_lock(&renderer_mutex);
+    if (!renderer_active) {
+        pthread_mutex_unlock(&renderer_mutex);
+        return TIGT_ERROR_BUSY;
+    }
     for (uint16_t row = 0; row < rows; row++)
         memcpy(renderer_text_cells + (size_t) row * columns, cells + (size_t) row * stride,
                columns * sizeof(*cells));
@@ -848,6 +882,10 @@ tigt_set_overscan(const tigt_overscan *overscan)
     if ((overscan->color & 0xff000000u) != 0)
         return TIGT_ERROR_ARGUMENT;
     pthread_mutex_lock(&renderer_mutex);
+    if (!renderer_active) {
+        pthread_mutex_unlock(&renderer_mutex);
+        return TIGT_ERROR_BUSY;
+    }
     renderer_overscan = *overscan;
     pthread_mutex_unlock(&renderer_mutex);
     return TIGT_OK;
@@ -861,6 +899,10 @@ tigt_get_overscan(tigt_overscan *overscan)
     if (!renderer_active)
         return TIGT_ERROR_BUSY;
     pthread_mutex_lock(&renderer_mutex);
+    if (!renderer_active) {
+        pthread_mutex_unlock(&renderer_mutex);
+        return TIGT_ERROR_BUSY;
+    }
     *overscan = renderer_overscan;
     pthread_mutex_unlock(&renderer_mutex);
     return TIGT_OK;

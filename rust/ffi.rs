@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Simplebooks Foundation
 // Copyright (C) 2026 Josh Rodd
 
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_char, c_int, c_void};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -50,6 +50,14 @@ unsafe extern "C" {
     pub(crate) fn tigt_cp437_codepoint(character: u8) -> u32;
     pub(crate) fn tigt_set_overscan(overscan: *const crate::Overscan) -> c_int;
     pub(crate) fn tigt_get_overscan(overscan: *mut crate::Overscan) -> c_int;
+    pub(crate) fn tigt_snapshot_write_fd(fd: c_int, format: u32) -> c_int;
+    pub(crate) fn tigt_snapshot_configure(
+        signal_number: c_int,
+        format: u32,
+        path: *const c_char,
+    ) -> c_int;
+    pub(crate) fn tigt_snapshot_set_font(font: *const u8, height: u16) -> c_int;
+    pub(crate) fn tigt_snapshot_status(sequence: *mut u64, result: *mut c_int) -> c_int;
     pub(crate) fn tigt_input_create(
         callback: Option<InputCallback>,
         user: *mut c_void,

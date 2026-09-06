@@ -18,25 +18,41 @@ fn main() {
             .ok()
             .map(|library| (name, library))
     });
+    let png = pkg_config::Config::new()
+        .cargo_metadata(false)
+        .probe("libpng")
+        .expect("tigt snapshots require the libpng development package and pkg-config metadata");
     let mut build = cc::Build::new();
     build
-        .files(["src/tigt.c", "src/input.c"])
+        .files(["src/tigt.c", "src/input.c", "src/snapshot.c"])
         .include("include")
         .std("c11")
         .define("_XOPEN_SOURCE", "700")
         .define("_DEFAULT_SOURCE", None)
         .flag_if_supported("-pthread");
+    for path in &png.include_paths {
+        build.include(path);
+    }
+    for (name, value) in &png.defines {
+        build.define(name, value.as_deref());
+    }
     if let Some((_, library)) = &curses {
         for path in &library.include_paths {
             build.include(path);
         }
         for (name, value) in &library.defines {
-            build.define(name, value.as_deref());
+            // tigt selects XSI/POSIX.1-2008 above; ncurses may advertise an older level.
+            if name != "_XOPEN_SOURCE" {
+                build.define(name, value.as_deref());
+            }
         }
     }
     build.compile("tigt");
 
-    // Emit curses metadata after the static tigt archive for Unix linker ordering.
+    // Emit native dependencies after the static tigt archive for Unix linker ordering.
+    pkg_config::Config::new()
+        .probe("libpng")
+        .expect("the selected libpng pkg-config package disappeared");
     if let Some((name, _)) = curses {
         pkg_config::Config::new()
             .probe(name)
@@ -54,7 +70,14 @@ fn main() {
     println!("cargo:rustc-link-lib=pthread");
     let include = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("include");
     println!("cargo:include={}", include.display());
-    for path in ["src/tigt.c", "src/input.c", "include/tigt.h", "build.rs"] {
+    for path in [
+        "src/tigt.c",
+        "src/input.c",
+        "src/snapshot.c",
+        "src/snapshot.h",
+        "include/tigt.h",
+        "build.rs",
+    ] {
         println!("cargo:rerun-if-changed={path}");
     }
 }

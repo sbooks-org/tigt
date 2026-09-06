@@ -16,8 +16,10 @@ mod ffi;
 mod input;
 #[cfg(feature = "keyboard")]
 pub mod keyboard;
+mod snapshot;
 
 pub use input::{InputDecoder, InputEvent, InputKey, InputKind, ModifierKey, Modifiers};
+pub use snapshot::{SnapshotConfig, SnapshotFormat, SnapshotSignal, SnapshotStatus};
 
 use input::{CallbackHandle, dispatch};
 use std::{

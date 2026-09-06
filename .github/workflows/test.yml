@@ -2,22 +2,29 @@
 # Copyright (C) 2026 Simplebooks Foundation
 # Copyright (C) 2026 Josh Rodd
 name: Test
-on: [push, pull_request]
+# Hosted cross-private-repository access is optional; local Docker is the default.
+on: workflow_dispatch
 permissions:
   contents: read
 jobs:
-  test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  linux:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install Linux curses
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libncurses-dev pkg-config
-      - name: Build C consumer
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build --parallel 2
-      - name: Test Rust, C ABI, PTY and bitmap reconstruction
-        run: cargo test --workspace --all-features
+        with:
+          path: tigt
+      - uses: actions/checkout@v4
+        with:
+          repository: sbooks-org/tigt-gfxreader
+          path: tigt-gfxreader
+          fetch-depth: 0
+          # Set a contents-read token for this repository before hosted runs.
+          token: ${{ secrets.ANALYZER_READ_TOKEN || github.token }}
+      - name: Build Linux test image
+        run: docker build -t tigt-ci tigt/ci
+      - name: Test both projects without container credentials
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE/tigt:/source/tigt:ro" \
+            -v "$GITHUB_WORKSPACE/tigt-gfxreader:/source/tigt-gfxreader:ro" \
+            tigt-ci

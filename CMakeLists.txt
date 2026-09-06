@@ -9,24 +9,27 @@ if(NOT UNIX)
 endif()
 find_package(Curses REQUIRED)
 find_package(Threads REQUIRED)
+find_package(PNG REQUIRED)
 add_library(tigt::curses INTERFACE IMPORTED)
 set_target_properties(tigt::curses PROPERTIES
     INTERFACE_LINK_LIBRARIES "${CURSES_LIBRARIES}"
     INTERFACE_INCLUDE_DIRECTORIES "${CURSES_INCLUDE_DIRS}")
-add_library(tigt src/tigt.c src/input.c)
+add_library(tigt src/tigt.c src/input.c src/snapshot.c)
 add_library(tigt::tigt ALIAS tigt)
 target_compile_features(tigt PUBLIC c_std_11)
 target_compile_definitions(tigt PRIVATE _XOPEN_SOURCE_EXTENDED=1)
 target_include_directories(tigt PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
-target_link_libraries(tigt PUBLIC tigt::curses Threads::Threads)
+target_link_libraries(tigt PUBLIC tigt::curses Threads::Threads PNG::PNG)
 set_target_properties(tigt PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION 2 POSITION_INDEPENDENT_CODE ON)
 
 option(TIGT_BUILD_EXAMPLES "Build standalone C consumer examples" ${PROJECT_IS_TOP_LEVEL})
 if(TIGT_BUILD_EXAMPLES)
     add_executable(tigt-demo examples/demo.c)
     target_link_libraries(tigt-demo PRIVATE tigt::tigt)
+    add_executable(tigt-snapshot examples/snapshot.c)
+    target_link_libraries(tigt-snapshot PRIVATE tigt::tigt)
 endif()
 
 include(GNUInstallDirs)

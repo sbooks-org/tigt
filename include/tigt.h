@@ -164,6 +164,85 @@ uint32_t tigt_cp437_codepoint(uint8_t character);
  * Init/shutdown reset it to all zeroes; suspend/resume preserve it. */
 int tigt_set_overscan(const tigt_overscan *overscan);
 int tigt_get_overscan(tigt_overscan *overscan);
+
+typedef enum {
+    TIGT_SNAPSHOT_PNG = 0,
+    TIGT_SNAPSHOT_UTF8 = 1,
+    TIGT_SNAPSHOT_ASCII = 2,
+    TIGT_SNAPSHOT_CP437 = 3,
+    TIGT_SNAPSHOT_ANSI = 4,
+    TIGT_SNAPSHOT_CELLS = 5,
+    TIGT_SNAPSHOT_ATTRIBUTES = 6,
+} tigt_snapshot_format;
+
+/* Copy the native frame and overscan under the frame mutex, then synchronously
+ * encode to a borrowed writable fd; never closes it. May run on a producer or
+ * callback thread, including concurrently with shutdown. An inactive session
+ * or missing frame returns BUSY. Invalid format/fd returns ARGUMENT, allocation
+ * or I/O failure SYSTEM. A blocking fd can block this calling thread.
+ * The caller must serialize access to the fd and its duplicates until return.
+ * On macOS, SIGPIPE suppression is temporarily set on the shared open-file
+ * description and restored afterwards; the process signal disposition is untouched.
+ *
+ * PNG is RGB, without overscan borders or host scaling. Bitmap dimensions are
+ * width/pixel_width by 200, sampling the first backing pixel of each logical
+ * pixel and ignoring its high byte. Text uses the caller-supplied CP437 font,
+ * width columns*8, height rows*font_height; UNDERLINE and CURSOR draw the bottom
+ * scanline in foreground. Missing font or an unmappable glyph returns ARGUMENT.
+ *
+ * UTF8/ASCII/CP437 are text-only, one newline per row, trailing U+0020 cells
+ * trimmed. ASCII and CP437 replace unrepresentable codepoints with '?'; CP437
+ * uses display glyph mapping, canonical space 0x20. ANSI is text-only UTF-8,
+ * trailing spaces trimmed, with explicit 24-bit SGR colors/underline, reset
+ * and newline after every row, no cursor positioning; CURSOR projects to underline.
+ *
+ * CELLS is text-only raw row-major pairs: CP437 glyph, then fg|(bg<<4).
+ * Colors use nearest standard IBM16 RGB by squared distance, ties to the lower
+ * index. This projection is lossy: no original hardware attributes are stored.
+ * ATTRIBUTES is lossless text metadata JSON (bitmap metadata omits cells):
+ * {schema_version:1,kind:"text"|"bitmap",
+ *  dimensions:{width,height,pixel_width},
+ *  overscan:{color,left,right,top,bottom},
+ *  columns,rows,cells:[{codepoint,foreground,background,flags,
+ *                      legacy:{glyph,attribute}}]}.
+ * All numeric values are decimal integers; cells are row-major. columns/rows
+ * and cells exist only for text, whose dimensions are cells and pixel_width=1.
+ * Bitmap dimensions are logical pixels; RGB fields retain submitted values. */
+int tigt_snapshot_write_fd(int fd, uint32_t format);
+
+/* Copy 256 glyphs, each height bytes, MSB-left, width 8, height 1..32.
+ * NULL with height 0 clears; other invalid combinations return ARGUMENT.
+ * Requires an active session. Font survives suspend, not shutdown or new init.
+ * The application owns font licensing; tigt supplies no font or ROM. */
+int tigt_snapshot_set_font(const uint8_t *font, uint16_t height);
+
+/* Opt-in asynchronous snapshots on SIGUSR1 or SIGUSR2. Copies path; accepts
+ * regular files (created mode 0600 if absent) and existing named FIFOs, not
+ * symlinks or other file kinds. Only a default signal disposition can be taken;
+ * existing handlers or SIG_IGN return BUSY. No signal is installed normally.
+ * Signal handler only flags work; repeated signals may coalesce. A worker
+ * writes outside signal context. Regular files are truncated for each request.
+ * FIFO opens are nonblocking: no reader fails immediately, a stalled reader
+ * fails within 250ms; failures can leave partial output. SIGPIPE is not raised
+ * by snapshot writes. Disable/shutdown joins this worker, restores the prior
+ * disposition unless the application replaced ours, and frees the copied path.
+ *
+ * signal_number=0 disables (format/path ignored), even when inactive. Otherwise
+ * requires an active session and a valid format/path. Configuration is serialized
+ * internally; like other lifecycle calls it must not run inside a signal handler.
+ * Suspend preserves configuration; requests while suspended complete with BUSY.
+ * Serialize application sigaction changes with configure/disable/shutdown.
+ * At init only, TIGT_SNAPSHOT_PATH opts in, TIGT_SNAPSHOT_FORMAT selects
+ * png/utf8/ascii/cp437/ansi/cells/attributes (default png), and
+ * TIGT_SNAPSHOT_SIGNAL selects USR1/USR2 (default USR1). Invalid opt-in settings
+ * fail init rather than silently disabling capture. */
+int tigt_snapshot_configure(int signal_number, uint32_t format, const char *path);
+
+/* Last asynchronous completion, including failures. Sequence starts at zero
+ * on init, increments once per completed request; initial result is OK.
+ * Disable/shutdown preserve status until a new init. Both pointers required.
+ * Synchronous write_fd calls do not affect this status. */
+int tigt_snapshot_status(uint64_t *sequence, int *result);
 #ifdef __cplusplus
 }
 #endif
