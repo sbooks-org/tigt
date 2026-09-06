@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: MIT-0
+# Copyright (C) 2026 Simplebooks Foundation
+# Copyright (C) 2026 Josh Rodd
+
+[package]
+name = "tigt"
+version = "0.1.0"
+edition = "2024"
+description = "tty-in-glass-tty: terminal rendering and transport-neutral input"
+license = "MIT-0"
+repository = "https://github.com/sbooks-org/tigt"
+links = "tigt"
+build = "build.rs"
+
+[workspace]
+members = [".", "crates/gfxreader"]
+resolver = "3"
+
+[lib]
+path = "rust/lib.rs"
+
+[features]
+default = []
+keyboard = ["dep:pc-xt-keyboard"]
+
+[dependencies]
+pc-xt-keyboard = { git = "https://github.com/sbooks-org/terminal-to-pc-keyboard", rev = "6cbbec1265f7c869955f707d7e2867de0832d9c5", optional = true, default-features = false }
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
+
+[[example]]
+name = "demo"
+path = "examples/demo.rs"
+
+[[example]]
+name = "keyboard"
+path = "examples/keyboard.rs"
+required-features = ["keyboard"]

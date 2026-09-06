@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: MIT-0
+# Copyright (C) 2026 Simplebooks Foundation
+# Copyright (C) 2026 Josh Rodd
+name: Test
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux curses
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libncurses-dev pkg-config
+      - name: Build C consumer
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug && cmake --build build --parallel 2
+      - name: Test Rust, C ABI, PTY and bitmap reconstruction
+        run: cargo test --workspace --all-features

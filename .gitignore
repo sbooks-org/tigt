@@ -1,0 +1,7 @@
+/target/
+/build*/
+/dist/
+.DS_Store
+*.pty
+*.rom
+*.img
