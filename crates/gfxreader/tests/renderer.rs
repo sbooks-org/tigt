@@ -11,6 +11,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
+use tigt_gfxreader::terminal::{Terminal, COLS};
 use tigt_gfxreader::{analyze, Options};
 
 const PAIRS: [(usize, usize); 13] = [
@@ -165,6 +166,35 @@ impl Fixture {
         expected_frame: Option<&[u8]>,
         font: &[u8],
     ) -> Vec<u8> {
+        let mut acknowledged = false;
+        let bytes = self.capture_observing(name, arguments, |bytes, master| {
+            if !acknowledged {
+                if let Some(expected) = expected_frame {
+                    if let Ok(analysis) = analyze(bytes, font, &options()) {
+                        if analysis.report.success && analysis.rgba == expected {
+                            master
+                                .write_all(CONTROLS)
+                                .map_err(|error| error.to_string())?;
+                            acknowledged = true;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        });
+        assert!(
+            expected_frame.is_none() || acknowledged,
+            "{name}: frame was never acknowledged"
+        );
+        bytes
+    }
+
+    fn capture_observing(
+        &self,
+        name: &str,
+        arguments: &[&str],
+        mut observe: impl FnMut(&[u8], &mut File) -> Result<(), String>,
+    ) -> Vec<u8> {
         let (mut master_fd, mut slave_fd) = (-1, -1);
         let mut size = libc::winsize {
             ws_row: 80,
@@ -214,8 +244,6 @@ impl Fixture {
             .expect("launching compiled C fixture in its own PTY");
         let mut child = ChildGuard(child);
         let mut bytes = Vec::new();
-        let mut acknowledged = false;
-        let mut analyzed_bytes = 0;
         let deadline = Instant::now() + Duration::from_secs(30);
         let result = (|| -> Result<ExitStatus, String> {
             let mut buffer = [0u8; 65536];
@@ -248,21 +276,9 @@ impl Fixture {
                     }
                     continue;
                 }
-                // Decode only after draining the PTY, not once per tiny curses
-                // write. A quiet pipe is not success: every pixel must match.
-                if !acknowledged && analyzed_bytes != bytes.len() {
-                    analyzed_bytes = bytes.len();
-                    if let Some(expected) = expected_frame {
-                        if let Ok(analysis) = analyze(&bytes, font, &options()) {
-                            if analysis.report.success && analysis.rgba == expected {
-                                master
-                                    .write_all(CONTROLS)
-                                    .map_err(|error| format!("writing controls: {error}"))?;
-                                acknowledged = true;
-                            }
-                        }
-                    }
-                }
+                // Observe only after draining the PTY. A quiet pipe alone is
+                // not success: consumers acknowledge exact frames.
+                observe(&bytes, &mut master)?;
             }
             loop {
                 if let Some(status) = child.0.try_wait().map_err(|error| error.to_string())? {
@@ -283,10 +299,6 @@ impl Fixture {
             "{name}: fixture exited {status}; transcript: {}\n{}",
             output.display(),
             String::from_utf8_lossy(&bytes)
-        );
-        assert!(
-            expected_frame.is_none() || acknowledged,
-            "{name}: frame was never acknowledged"
         );
         bytes
     }
@@ -503,6 +515,87 @@ fn public_session_copies_frames_dispatches_controls_and_restores_terminal() {
         output.status.success(),
         "non-TTY initialization: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn resolved_text_matches(terminal: &Terminal, stage: usize) -> bool {
+    let (cells, source) = terminal.cells();
+    if source != "active_alternate" {
+        return false;
+    }
+    let glyphs = ['A', 'B', 'C', 'D', '☺', 'é', '─', '█'];
+    let colors = if stage == 0 {
+        ([0, 215, 0], [0, 0, 215])
+    } else {
+        ([215, 0, 0], [0, 215, 215])
+    };
+    let decorated = stage != 2;
+    for (index, cell) in cells.iter().enumerate() {
+        let row = index / COLS;
+        let column = index % COLS;
+        if row < 2 && column < 4 {
+            if cell.character != glyphs[row * 4 + column]
+                || cell.style.colors() != colors
+                || cell.style.underline != (decorated && row == 0 && column == 0)
+                || cell.style.blink
+            {
+                return false;
+            }
+        } else if cell.character != ' ' || cell.style.colors().1 != [0; 3] {
+            // Metadata must not introduce border cells or shift the content.
+            // Returning from bitmap must also erase its larger footprint.
+            return false;
+        }
+    }
+    let cursor = terminal.cursor();
+    cursor.visible == decorated
+        && (!decorated || (cursor.column == 1 && cursor.row == 0 && !cursor.blinking))
+}
+
+#[test]
+fn public_resolved_text_preserves_rgb_flags_transitions_and_nonvisual_overscan() {
+    let fixture = Fixture::build("session_fixture", true, false);
+    let font = synthetic_font();
+    let blue = expected_pixels(&font, 1, 1);
+    let mut stage = 0;
+    let mut visible_since = None;
+    fixture.capture_observing("resolved-text", &["--text-tests"], |bytes, master| {
+        if stage == 5 {
+            return Ok(());
+        }
+        let terminal = Terminal::replay(bytes);
+        if !terminal.errors.is_empty() {
+            return Err(format!("text stage {stage}: {:?}", terminal.errors));
+        }
+        let matches = if stage == 3 {
+            !terminal.cursor().visible
+                && analyze(bytes, &font, &options())
+                    .is_ok_and(|analysis| analysis.report.success && analysis.rgba == blue)
+        } else {
+            resolved_text_matches(&terminal, stage)
+        };
+        if !matches {
+            if visible_since.is_some() {
+                return Err("resolved native cursor/text changed without a new frame".into());
+            }
+            return Ok(());
+        }
+        if stage == 0 {
+            // A submitted visible native cursor must remain steady, not acquire
+            // the old library-generated blink phases while its frame is idle.
+            let since = visible_since.get_or_insert_with(Instant::now);
+            if since.elapsed() < Duration::from_millis(750) {
+                return Ok(());
+            }
+        }
+        master.write_all(b"n").map_err(|error| error.to_string())?;
+        stage += 1;
+        visible_since = None;
+        Ok(())
+    });
+    assert_eq!(
+        stage, 5,
+        "not all resolved text/bitmap frames were observed"
     );
 }
 

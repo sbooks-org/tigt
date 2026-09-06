@@ -2,6 +2,10 @@
  * Copyright (C) 2026 Simplebooks Foundation
  * Copyright (C) 2026 Josh Rodd
  */
+#ifndef _XOPEN_SOURCE
+#define _XOPEN_SOURCE 700
+#endif
+
 #include "tigt.h"
 
 #include <curses.h>
@@ -18,48 +22,24 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#include <wchar.h>
 
-#define MDA_COLUMNS 80
-#define MDA_ROWS 25
-#define MDA_CELL_COUNT (MDA_COLUMNS * MDA_ROWS)
-#define MDA_VRAM_SIZE 0x1000
-#define MDA_CRTC_REGISTER_COUNT 32
-#define MDA_CURSOR_HALF_PERIOD_NS 160590000ULL
-#define MDA_TEXT_HALF_PERIOD_NS 321180000ULL
-#define CGA_CURSOR_HALF_PERIOD_NS 133511348ULL
-#define CGA_TEXT_HALF_PERIOD_NS 267022696ULL
-#define MDA_INTENSE_REVERSE_PAIR 1
-#define CGA_VRAM_SIZE 0x4000
-#define CGA_640X200_COLUMNS 320
-#define CGA_640X200_ROWS 67
-#define TERMINAL_MAX_CELLS (CGA_640X200_COLUMNS * CGA_640X200_ROWS)
-
-enum {
-    MDA_CRTC_MAX_SCANLINE_ADDR = 9,
-    MDA_CRTC_CURSOR_START = 10,
-    MDA_CRTC_CURSOR_END = 11,
-    MDA_CRTC_START_ADDR_HIGH = 12,
-    MDA_CRTC_START_ADDR_LOW = 13,
-    MDA_CRTC_CURSOR_ADDR_HIGH = 14,
-    MDA_CRTC_CURSOR_ADDR_LOW = 15,
-    MDA_MODE_VIDEO_ENABLE = 1 << 3,
-    MDA_MODE_BLINK = 1 << 5
-};
+#define TERMINAL_MAX_COLUMNS 320
+#define TERMINAL_MAX_ROWS 128
+#define TERMINAL_MAX_CELLS 21440
 
 static pthread_mutex_t renderer_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t renderer_thread;
 static pthread_t input_thread;
-static uint8_t renderer_vram[MDA_VRAM_SIZE];
-static uint8_t renderer_crtc[MDA_CRTC_REGISTER_COUNT];
-static uint8_t renderer_mode;
-static uint8_t renderer_cga_vram[CGA_VRAM_SIZE];
+static tigt_text_cell renderer_text_cells[TERMINAL_MAX_CELLS];
+static uint16_t renderer_text_columns;
+static uint16_t renderer_text_rows;
+static tigt_overscan renderer_overscan;
 static uint32_t renderer_bitmap_pixels[640 * 200];
 static uint8_t renderer_bitmap_indices[640 * 200];
 static uint16_t renderer_bitmap_width;
 static uint8_t renderer_bitmap_pixel_width;
 static bool renderer_bitmap_valid;
-static bool renderer_is_cga;
-static uint64_t renderer_cga_frame;
 static bool renderer_has_frame;
 static bool renderer_active;
 static atomic_bool renderer_running;
@@ -76,7 +56,6 @@ static bool terminal_modes_saved;
 static bool terminal_keyboard_enabled;
 static uint64_t renderer_frame_serial;
 static uint64_t rendered_frame_serial;
-static bool terminal_bright_background_available;
 static bool terminal_default_colors_available;
 typedef enum {
     TERMINAL_PALETTE_INVALID,
@@ -98,19 +77,10 @@ static uint16_t rendered_columns;
 static uint16_t rendered_rows;
 static bool rendered_cells_valid;
 static bool cga_pair_initialized[136];
-static int terminal_cursor_shape = -1;
+static bool terminal_cursor_style_valid;
 static bool terminal_cursor_visible;
 static bool terminal_cursor_position_valid;
 static uint16_t terminal_cursor_position;
-static uint64_t pending_cga_blank_frame;
-
-static uint64_t
-monotonic_nanoseconds(void)
-{
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    return ((uint64_t) now.tv_sec * 1000000000ULL) + now.tv_nsec;
-}
 
 static const uint16_t cp437_extended[128] = {
     0x00c7, 0x00fc, 0x00e9, 0x00e2, 0x00e4, 0x00e0, 0x00e5, 0x00e7, 0x00ea, 0x00eb, 0x00e8, 0x00ef, 0x00ee, 0x00ec, 0x00c4, 0x00c5,
@@ -123,8 +93,8 @@ static const uint16_t cp437_extended[128] = {
     0x2261, 0x00b1, 0x2265, 0x2264, 0x2320, 0x2321, 0x00f7, 0x2248, 0x00b0, 0x2219, 0x00b7, 0x221a, 0x207f, 0x00b2, 0x25a0, 0x00a0
 };
 
-static uint32_t
-cp437_codepoint(uint8_t character)
+uint32_t
+tigt_cp437_codepoint(uint8_t character)
 {
     static const uint16_t controls[32] = {
         0x0020, 0x263a, 0x263b, 0x2661, 0x2662, 0x2667, 0x2664, 0x2022,
@@ -145,17 +115,14 @@ cp437_codepoint(uint8_t character)
 }
 
 static const char *
-cp437_utf8(uint8_t character, char output[8])
+codepoint_utf8(uint32_t codepoint, char output[8])
 {
-    if (character == 1) {
-        memcpy(output, "\xe2\x98\xba\xef\xb8\x8e", 7);
+    if (codepoint == 0x263a || codepoint == 0x203c) {
+        /* Keep the existing CP437 glyphs in text, rather than emoji, style. */
+        memcpy(output, codepoint == 0x263a ? "\xe2\x98\xba\xef\xb8\x8e" :
+                                          "\xe2\x80\xbc\xef\xb8\x8e", 7);
         return output;
     }
-    if (character == 19) {
-        memcpy(output, "\xe2\x80\xbc\xef\xb8\x8e", 7);
-        return output;
-    }
-    const uint32_t codepoint = cp437_codepoint(character);
 
     if (codepoint < 0x80) {
         output[0] = (char) codepoint;
@@ -164,41 +131,21 @@ cp437_utf8(uint8_t character, char output[8])
         output[0] = (char) (0xc0 | (codepoint >> 6));
         output[1] = (char) (0x80 | (codepoint & 0x3f));
         output[2] = '\0';
-    } else {
+    } else if (codepoint < 0x10000) {
         output[0] = (char) (0xe0 | (codepoint >> 12));
         output[1] = (char) (0x80 | ((codepoint >> 6) & 0x3f));
         output[2] = (char) (0x80 | (codepoint & 0x3f));
         output[3] = '\0';
+    } else {
+        output[0] = (char) (0xf0 | (codepoint >> 18));
+        output[1] = (char) (0x80 | ((codepoint >> 12) & 0x3f));
+        output[2] = (char) (0x80 | ((codepoint >> 6) & 0x3f));
+        output[3] = (char) (0x80 | (codepoint & 0x3f));
+        output[4] = '\0';
     }
     return output;
 }
 
-static bool
-cell_is_black(uint8_t attribute)
-{
-    return attribute == 0x00 || attribute == 0x08 || attribute == 0x80 || attribute == 0x88;
-}
-
-static chtype
-cell_attributes(uint8_t attribute, bool blink_mode)
-{
-    const uint8_t foreground = attribute & 0x0f;
-    const uint8_t background = attribute >> 4;
-
-    if (cell_is_black(attribute))
-        return A_NORMAL;
-    if (foreground == 1)
-        return A_UNDERLINE;
-    if (foreground == 9)
-        return A_BOLD | A_UNDERLINE;
-    if (foreground >= 2 && foreground <= 7)
-        return A_NORMAL;
-    if (foreground >= 0x0a)
-        return A_BOLD;
-    if (background == 7 || background == 0x0f)
-        return A_REVERSE | ((background == 0x0f && !blink_mode) ? A_BOLD : A_NORMAL);
-    return foreground == 8 ? A_BOLD : A_NORMAL;
-}
 
 static const short cga_5153_xterm[16] = {
     16, 20, 40, 44, 160, 164, 136, 251,
@@ -218,15 +165,10 @@ select_terminal_palette(terminal_palette_t palette)
 }
 
 static chtype
-cga_cell_attributes(uint8_t attribute, bool blink_mode)
+text_cell_attributes(uint8_t foreground, uint8_t background)
 {
-    const uint8_t foreground = attribute & 0x0f;
-    uint8_t background = attribute >> 4;
-
     select_terminal_palette(TERMINAL_PALETTE_TEXT);
 
-    if (blink_mode)
-        background &= 0x07;
     if (has_colors()) {
         /* chtype stores only eight pair bits, even when COLOR_PAIRS is larger.
            Share each unordered color pair and reverse it when necessary. */
@@ -241,7 +183,8 @@ cga_cell_attributes(uint8_t attribute, bool blink_mode)
 
         if (pair < COLOR_PAIRS) {
             if (!cga_pair_initialized[pair - 2]) {
-                init_pair(pair, terminal_foreground, terminal_background);
+                if (init_pair(pair, terminal_foreground, terminal_background) == ERR)
+                    return foreground >= 8 ? A_BOLD : A_NORMAL;
                 cga_pair_initialized[pair - 2] = true;
             }
             return COLOR_PAIR(pair) | (foreground > background ? A_REVERSE : A_NORMAL) |
@@ -353,59 +296,26 @@ cga_rendered_color_index(uint32_t color)
     return closest;
 }
 
-static const char *
-cursor_glyph(uint8_t cursor_start, uint8_t cursor_end, uint8_t cursor_height, uint8_t cell_height)
-{
-    if (cursor_height == cell_height)
-        return NULL;
-    if (cursor_end < cursor_start || cursor_end < cell_height - 3)
-        return NULL;
-    if (cursor_height == 1 && cursor_start == cell_height - 2)
-        return "_";
-
-    switch (cursor_height) {
-        case 1:
-        case 2:
-            return "\xe2\x96\x81";
-        case 3:
-        case 4:
-            return "\xe2\x96\x82";
-        case 5:
-        case 6:
-            return "\xe2\x96\x83";
-        case 7:
-            return "\xe2\x96\x84";
-        case 8:
-        case 9:
-            return "\xe2\x96\x85";
-        case 10:
-        case 11:
-            return "\xe2\x96\x86";
-        case 12:
-        case 13:
-            return "\xe2\x96\x87";
-        default:
-            return NULL;
-    }
-}
 
 
 static bool
-set_cursor(bool visible, bool block)
+set_cursor(bool visible)
 {
     bool changed = false;
 
-    if (visible && terminal_cursor_shape != block) {
-        fputs(block ? "\033[2 q" : "\033[4 q", stdout);
-        fflush(stdout);
-        terminal_cursor_shape = block;
-        changed = true;
-    }
     if (visible != terminal_cursor_visible) {
         curs_set(visible ? 1 : 0);
         terminal_cursor_visible = visible;
         changed = true;
     }
+    if (visible && (!terminal_cursor_style_valid || changed)) {
+        /* Set the steady style after cnorm, which can alter cursor blinking. */
+        fputs("\033[?12l\033[4 q", stdout);
+        terminal_cursor_style_valid = true;
+        changed = true;
+    }
+    if (changed)
+        fflush(stdout);
     return changed;
 }
 static void
@@ -527,7 +437,7 @@ render_bitmap_graphics(const uint32_t *pixels, uint16_t width, uint16_t height,
     }
 
     terminal_cursor_position_valid = false;
-    changed |= set_cursor(false, false);
+    changed |= set_cursor(false);
     if (changed)
         refresh();
     rendered_cells_valid = true;
@@ -535,129 +445,34 @@ render_bitmap_graphics(const uint32_t *pixels, uint16_t width, uint16_t height,
 
 
 static void
-render_mda(void)
+render_text(const tigt_text_cell *cells, uint16_t columns, uint16_t rows)
 {
-    /* Only the renderer thread owns this snapshot; keep it off small pthread stacks. */
-    static uint32_t bitmap_pixels[640 * 200];
-    uint16_t bitmap_width;
-    uint8_t bitmap_pixel_width;
-    bool bitmap_valid;
-    uint8_t vram[CGA_VRAM_SIZE];
-    uint8_t crtc[MDA_CRTC_REGISTER_COUNT];
-    uint8_t mode;
-    bool is_cga;
-    uint64_t cga_frame;
-    const uint64_t now = monotonic_nanoseconds();
+    bool changed = false;
+    uint16_t cursor_position = UINT16_MAX;
 
-
-    pthread_mutex_lock(&renderer_mutex);
-    if (!renderer_has_frame) {
-        pthread_mutex_unlock(&renderer_mutex);
-        return;
-    }
-    const uint64_t frame_serial = renderer_frame_serial;
-    if (renderer_bitmap_valid && rendered_cells_valid && frame_serial == rendered_frame_serial) {
-        pthread_mutex_unlock(&renderer_mutex);
-        return;
-    }
-    is_cga = renderer_is_cga;
-    cga_frame = renderer_cga_frame;
-    bitmap_valid = renderer_bitmap_valid;
-    bitmap_width = renderer_bitmap_width;
-    bitmap_pixel_width = renderer_bitmap_pixel_width;
-    if (bitmap_valid)
-        memcpy(bitmap_pixels, renderer_bitmap_pixels, bitmap_width * 200 * sizeof(*bitmap_pixels));
-    if (!bitmap_valid) {
-        memcpy(vram, is_cga ? renderer_cga_vram : renderer_vram, is_cga ? CGA_VRAM_SIZE : MDA_VRAM_SIZE);
-        memcpy(crtc, renderer_crtc, sizeof(crtc));
-    }
-    mode = renderer_mode;
-    pthread_mutex_unlock(&renderer_mutex);
-    if (bitmap_valid) {
-        render_bitmap_graphics(bitmap_pixels, bitmap_width, 200, bitmap_pixel_width, true);
-        rendered_frame_serial = frame_serial;
-        return;
-    }
-
-    const uint16_t columns = is_cga ? crtc[1] : MDA_COLUMNS;
-    const uint16_t rows = is_cga ? crtc[6] : MDA_ROWS;
-    const uint16_t cell_count = columns * rows;
-    const uint16_t address_mask = is_cga ? 0x3fff : 0x0fff;
-    const bool text_mode = !is_cga || (mode & (1 << 1)) == 0;
-    const uint64_t cursor_half_period = is_cga ? CGA_CURSOR_HALF_PERIOD_NS : MDA_CURSOR_HALF_PERIOD_NS;
-    const uint64_t text_half_period = is_cga ? CGA_TEXT_HALF_PERIOD_NS : MDA_TEXT_HALF_PERIOD_NS;
-    const bool cursor_blink_visible = (now / cursor_half_period) % 2 == 0;
-    const bool text_blink_visible = (now / text_half_period) % 2 == 0;
-    const uint16_t start = ((uint16_t) crtc[MDA_CRTC_START_ADDR_HIGH] << 8) | crtc[MDA_CRTC_START_ADDR_LOW];
-    const uint16_t cursor = (((uint16_t) crtc[MDA_CRTC_CURSOR_ADDR_HIGH] << 8) | crtc[MDA_CRTC_CURSOR_ADDR_LOW]) & address_mask;
-    const uint8_t cursor_start = crtc[MDA_CRTC_CURSOR_START] & 0x1f;
-    const uint8_t cursor_end = crtc[MDA_CRTC_CURSOR_END] & 0x1f;
-    const uint8_t cell_height = (crtc[MDA_CRTC_MAX_SCANLINE_ADDR] & 0x1f) + 1;
-    const uint8_t cursor_height = cursor_end >= cursor_start ? cursor_end - cursor_start + 1 :
-                                  cell_height - cursor_start + cursor_end + 1;
-    const bool cursor_disabled = (crtc[MDA_CRTC_CURSOR_START] & 0x60) == 0x20;
-    const bool cursor_in_display = cursor >= start && cursor < start + cell_count;
-    const bool display_enabled = text_mode && (mode & MDA_MODE_VIDEO_ENABLE) != 0;
-    if (columns == 0 || rows == 0 || cell_count > TERMINAL_MAX_CELLS)
-        return;
     select_terminal_palette(TERMINAL_PALETTE_TEXT);
-
-    if (is_cga && !display_enabled && rendered_cells_valid) {
-        if (pending_cga_blank_frame == 0)
-            pending_cga_blank_frame = cga_frame;
-        if (cga_frame < pending_cga_blank_frame + 2)
-            return;
-    } else
-        pending_cga_blank_frame = 0;
     if (!rendered_cells_valid || rendered_columns != columns || rendered_rows != rows) {
         erase();
         rendered_cells_valid = false;
         rendered_columns = columns;
         rendered_rows = rows;
+        changed = true;
     }
-    const bool show_cursor = display_enabled && cursor_blink_visible && !cursor_disabled &&
-                             cursor_height && cursor_height <= cell_height && cursor_in_display;
-    const bool full_cell_cursor = show_cursor && cursor_height == cell_height;
-    const uint8_t cursor_character = display_enabled ? vram[(cursor * 2) & address_mask] : ' ';
-    const bool cursor_over_underscore = cursor_character == '_';
-    const bool cursor_over_blank = cursor_character == 0 || cursor_character == ' ' || cursor_character == 0xff;
-    const char *const software_cursor_glyph = show_cursor && !full_cell_cursor &&
-                                                  (cursor_over_underscore || cursor_over_blank) ?
-                                                  cursor_glyph(cursor_start, cursor_end, cursor_height, cell_height) :
-                                                  NULL;
-    const bool software_cursor = full_cell_cursor || software_cursor_glyph != NULL;
-    const bool blink_mode = (mode & MDA_MODE_BLINK) != 0;
-
-    bool changed = false;
 
     for (uint16_t row = 0; row < rows; row++) {
         for (uint16_t column = 0; column < columns; column++) {
-            char utf8[8];
-            const uint16_t address = (start + row * columns + column) & address_mask;
-            const uint8_t attribute = display_enabled ? vram[((address * 2) + 1) & address_mask] : 0x07;
-            const bool blinking_cell = blink_mode && (attribute & 0x80) != 0;
-            const bool black_cell = !is_cga && cell_is_black(attribute);
-            const uint8_t character = black_cell ? ' ' : (display_enabled ? vram[(address * 2) & address_mask] : ' ');
-            const bool cursor_cell = software_cursor && address == cursor;
-            const bool underscore_cursor = cursor_cell && cursor_height == 1 &&
-                                           cursor_start == cell_height - 2 && character == '_';
-            const size_t cell_index = row * columns + column;
+            const size_t cell_index = (size_t) row * columns + column;
+            const tigt_text_cell *source = &cells[cell_index];
+            const uint8_t foreground = cga_rendered_color_index(source->foreground);
+            const uint8_t background = cga_rendered_color_index(source->background);
             terminal_cell_t cell = {
-                .style = display_enabled && !black_cell ?
-                             (is_cga ? cga_cell_attributes(attribute, blink_mode) :
-                                       cell_attributes(attribute, blink_mode)) :
-                             A_NORMAL
+                .style = text_cell_attributes(foreground, background) |
+                         ((source->flags & TIGT_TEXT_UNDERLINE) != 0 ? A_UNDERLINE : A_NORMAL)
             };
-            const char *const glyph = cursor_cell && software_cursor_glyph != NULL ?
-                                          (underscore_cursor ? "\xe2\x96\x81" : software_cursor_glyph) :
-                                          cp437_utf8(character, utf8);
 
-            if (full_cell_cursor && cursor_cell)
-                cell.style = A_NORMAL | A_REVERSE | A_INVIS;
-            if (blinking_cell && !text_blink_visible && !cursor_cell)
-                cell.style |= A_INVIS;
-            strcpy(cell.glyph, glyph);
-
+            codepoint_utf8(source->codepoint, cell.glyph);
+            if ((source->flags & TIGT_TEXT_CURSOR) != 0)
+                cursor_position = (uint16_t) cell_index;
             if (!rendered_cells_valid || cell.style != rendered_cells[cell_index].style ||
                 strcmp(cell.glyph, rendered_cells[cell_index].glyph) != 0) {
                 attrset(cell.style);
@@ -669,20 +484,73 @@ render_mda(void)
         }
     }
 
-    if (display_enabled && !cursor_disabled && cursor_in_display) {
-        const uint16_t cursor_position = cursor - start;
+    bool show_cursor = cursor_position != UINT16_MAX;
 
-        if (!terminal_cursor_position_valid || cursor_position != terminal_cursor_position) {
-            move(cursor_position / columns, cursor_position % columns);
+    if (show_cursor && (changed || !terminal_cursor_position_valid ||
+                        cursor_position != terminal_cursor_position)) {
+        /* Drawing cells also moves curses' cursor, even if its target is fixed. */
+        if (move(cursor_position / columns, cursor_position % columns) == ERR) {
+            show_cursor = false;
+        } else {
             terminal_cursor_position = cursor_position;
             terminal_cursor_position_valid = true;
             changed = true;
         }
     }
-    changed |= set_cursor(show_cursor && !software_cursor, cursor_height > 7);
-    if (changed)
+    if (!show_cursor)
+        terminal_cursor_position_valid = false;
+    if (changed) {
         refresh();
+        /* refresh can emit cnorm: restore a steady style after its output. */
+        terminal_cursor_style_valid = false;
+    }
+    set_cursor(show_cursor);
     rendered_cells_valid = true;
+}
+
+static void
+render_frame(void)
+{
+    /* Only the renderer thread owns this snapshot; keep it off small pthread stacks. */
+    static union {
+        uint32_t bitmap_pixels[640 * 200];
+        tigt_text_cell text_cells[TERMINAL_MAX_CELLS];
+    } snapshot;
+    uint16_t bitmap_width;
+    uint8_t bitmap_pixel_width;
+    uint16_t columns;
+    uint16_t rows;
+    bool bitmap_valid;
+
+    pthread_mutex_lock(&renderer_mutex);
+    if (!renderer_has_frame) {
+        pthread_mutex_unlock(&renderer_mutex);
+        return;
+    }
+    const uint64_t frame_serial = renderer_frame_serial;
+
+    if (rendered_cells_valid && frame_serial == rendered_frame_serial) {
+        pthread_mutex_unlock(&renderer_mutex);
+        return;
+    }
+    bitmap_valid = renderer_bitmap_valid;
+    bitmap_width = renderer_bitmap_width;
+    bitmap_pixel_width = renderer_bitmap_pixel_width;
+    columns = renderer_text_columns;
+    rows = renderer_text_rows;
+    if (bitmap_valid)
+        memcpy(snapshot.bitmap_pixels, renderer_bitmap_pixels,
+               (size_t) bitmap_width * 200 * sizeof(*snapshot.bitmap_pixels));
+    else
+        memcpy(snapshot.text_cells, renderer_text_cells,
+               (size_t) columns * rows * sizeof(*snapshot.text_cells));
+    pthread_mutex_unlock(&renderer_mutex);
+
+    if (bitmap_valid)
+        render_bitmap_graphics(snapshot.bitmap_pixels, bitmap_width, 200, bitmap_pixel_width, true);
+    else
+        render_text(snapshot.text_cells, columns, rows);
+    rendered_frame_serial = frame_serial;
 }
 
 
@@ -728,7 +596,7 @@ renderer_main(void *unused)
 
     (void) unused;
     while (atomic_load_explicit(&renderer_running, memory_order_relaxed)) {
-        render_mda();
+        render_frame();
         nanosleep(&interval, NULL);
     }
     return NULL;
@@ -814,17 +682,11 @@ tigt_resume(void)
     terminal_palette = TERMINAL_PALETTE_INVALID;
     memset(cga_pair_initialized, 0, sizeof(cga_pair_initialized));
     terminal_default_colors_available = false;
-    terminal_bright_background_available = false;
-    terminal_cursor_shape = -1;
+    terminal_cursor_style_valid = false;
     terminal_cursor_visible = false;
     terminal_cursor_position_valid = false;
-    pending_cga_blank_frame = 0;
-    if (has_colors() && start_color() == OK) {
+    if (has_colors() && start_color() == OK)
         terminal_default_colors_available = use_default_colors() == OK;
-        if (terminal_default_colors_available && COLORS >= 16 &&
-            init_pair(MDA_INTENSE_REVERSE_PAIR, COLOR_WHITE + 8, -1) == OK)
-            terminal_bright_background_available = true;
-    }
     if (renderer_config.on_input != NULL) {
         renderer_input = tigt_input_create(renderer_config.on_input, renderer_config.user);
         if (renderer_input == NULL) {
@@ -883,7 +745,7 @@ tigt_init(const tigt_config *config)
     renderer_config = *config;
     renderer_has_frame = false;
     renderer_bitmap_valid = false;
-    renderer_cga_frame = 0;
+    memset(&renderer_overscan, 0, sizeof(renderer_overscan));
     renderer_frame_serial = 0;
     rendered_frame_serial = 0;
     renderer_initialized = true;
@@ -905,6 +767,7 @@ tigt_shutdown(void)
     renderer_initialized = false;
     renderer_has_frame = false;
     renderer_bitmap_valid = false;
+    memset(&renderer_overscan, 0, sizeof(renderer_overscan));
     memset(&renderer_config, 0, sizeof(renderer_config));
 }
 
@@ -923,7 +786,6 @@ tigt_present_bitmap(const uint32_t *pixels, uint16_t width, uint16_t height,
     renderer_bitmap_width = width;
     renderer_bitmap_pixel_width = pixel_width;
     renderer_bitmap_valid = true;
-    renderer_is_cga = false;
     renderer_has_frame = true;
     renderer_frame_serial++;
     pthread_mutex_unlock(&renderer_mutex);
@@ -931,50 +793,75 @@ tigt_present_bitmap(const uint32_t *pixels, uint16_t width, uint16_t height,
 }
 
 int
-tigt_present_mda(const uint8_t *vram, const uint8_t *crtc, uint8_t mode)
+tigt_present_text(const tigt_text_cell *cells, uint16_t columns, uint16_t rows,
+                  uint16_t stride)
 {
-    if (vram == NULL || crtc == NULL)
+    bool cursor_present = false;
+
+    if (cells == NULL || columns == 0 || columns > TERMINAL_MAX_COLUMNS ||
+        rows == 0 || rows > TERMINAL_MAX_ROWS || stride < columns ||
+        (size_t) columns * rows > TERMINAL_MAX_CELLS)
         return TIGT_ERROR_ARGUMENT;
     if (!renderer_active)
         return TIGT_ERROR_BUSY;
-    pthread_mutex_lock(&renderer_mutex);
-    memcpy(renderer_vram, vram, sizeof(renderer_vram));
-    memcpy(renderer_crtc, crtc, sizeof(renderer_crtc));
-    renderer_mode = mode;
-    renderer_is_cga = false;
-    renderer_bitmap_valid = false;
-    renderer_has_frame = true;
-    renderer_frame_serial++;
-    pthread_mutex_unlock(&renderer_mutex);
-    return TIGT_OK;
-}
+    for (uint16_t row = 0; row < rows; row++) {
+        for (uint16_t column = 0; column < columns; column++) {
+            const tigt_text_cell *cell = &cells[(size_t) row * stride + column];
 
-int
-tigt_present_cga(const uint8_t *vram, const uint8_t *crtc, uint8_t mode,
-                 int source_y, const uint32_t *pixels, uint16_t stride)
-{
-    if (vram == NULL || crtc == NULL || source_y < 0)
-        return TIGT_ERROR_ARGUMENT;
-    if ((mode & (1 << 1)) != 0 && pixels != NULL) {
-        if (stride < 640 ||
-            (size_t) source_y > ((size_t) PTRDIFF_MAX / sizeof(*pixels) - ((size_t) 199 * stride + 640)) / stride)
-            return TIGT_ERROR_ARGUMENT;
-        return tigt_present_bitmap(pixels + (size_t) source_y * stride, 640, 200, stride,
-                                   (mode & (1 << 4)) != 0 ? 1 : 2);
+            if ((cell->foreground & 0xff000000u) != 0 ||
+                (cell->background & 0xff000000u) != 0 ||
+                (cell->flags & ~(TIGT_TEXT_UNDERLINE | TIGT_TEXT_CURSOR)) != 0 ||
+                cell->codepoint > 0x10ffff ||
+                (cell->codepoint >= 0xd800 && cell->codepoint <= 0xdfff) ||
+                cell->codepoint < 0x20 ||
+                (cell->codepoint >= 0x7f && cell->codepoint <= 0x9f) ||
+                wcwidth((wchar_t) cell->codepoint) != 1)
+                return TIGT_ERROR_ARGUMENT;
+            if ((cell->flags & TIGT_TEXT_CURSOR) != 0) {
+                if (cursor_present)
+                    return TIGT_ERROR_ARGUMENT;
+                cursor_present = true;
+            }
+        }
     }
-    if (crtc[1] == 0 || crtc[6] == 0 || (size_t) crtc[1] * crtc[6] > TERMINAL_MAX_CELLS)
+
+    pthread_mutex_lock(&renderer_mutex);
+    for (uint16_t row = 0; row < rows; row++)
+        memcpy(renderer_text_cells + (size_t) row * columns, cells + (size_t) row * stride,
+               columns * sizeof(*cells));
+    renderer_text_columns = columns;
+    renderer_text_rows = rows;
+    renderer_bitmap_valid = false;
+    renderer_has_frame = true;
+    renderer_frame_serial++;
+    pthread_mutex_unlock(&renderer_mutex);
+    return TIGT_OK;
+}
+
+int
+tigt_set_overscan(const tigt_overscan *overscan)
+{
+    if (overscan == NULL)
+        return TIGT_ERROR_ARGUMENT;
+    if (!renderer_active)
+        return TIGT_ERROR_BUSY;
+    if ((overscan->color & 0xff000000u) != 0)
+        return TIGT_ERROR_ARGUMENT;
+    pthread_mutex_lock(&renderer_mutex);
+    renderer_overscan = *overscan;
+    pthread_mutex_unlock(&renderer_mutex);
+    return TIGT_OK;
+}
+
+int
+tigt_get_overscan(tigt_overscan *overscan)
+{
+    if (overscan == NULL)
         return TIGT_ERROR_ARGUMENT;
     if (!renderer_active)
         return TIGT_ERROR_BUSY;
     pthread_mutex_lock(&renderer_mutex);
-    memcpy(renderer_cga_vram, vram, sizeof(renderer_cga_vram));
-    renderer_bitmap_valid = false;
-    memcpy(renderer_crtc, crtc, sizeof(renderer_crtc));
-    renderer_mode = mode;
-    renderer_is_cga = true;
-    renderer_cga_frame++;
-    renderer_has_frame = true;
-    renderer_frame_serial++;
+    *overscan = renderer_overscan;
     pthread_mutex_unlock(&renderer_mutex);
     return TIGT_OK;
 }

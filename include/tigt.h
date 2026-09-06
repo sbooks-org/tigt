@@ -9,15 +9,12 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#define TIGT_ABI_VERSION 1u
+#define TIGT_ABI_VERSION 2u
 #define TIGT_OK 0
 #define TIGT_ERROR_ARGUMENT -1
 #define TIGT_ERROR_TERMINAL -2
 #define TIGT_ERROR_BUSY -3
 #define TIGT_ERROR_SYSTEM -4
-#define TIGT_MDA_VRAM_SIZE 4096u
-#define TIGT_CGA_VRAM_SIZE 16384u
-#define TIGT_CRTC_SIZE 32u
 typedef enum {
     TIGT_PRESS = 0,
     TIGT_REPEAT = 1,
@@ -110,17 +107,63 @@ int tigt_init(const tigt_config *config);
 int tigt_resume(void);
 void tigt_suspend(void);
 void tigt_shutdown(void);
+typedef struct {
+    uint32_t codepoint;
+    uint32_t foreground;
+    uint32_t background;
+    uint32_t flags;
+} tigt_text_cell;
+
+enum {
+    TIGT_TEXT_UNDERLINE = 1u << 0,
+    TIGT_TEXT_CURSOR = 1u << 1,
+};
+
+typedef struct {
+    uint32_t color;
+    uint16_t left;
+    uint16_t right;
+    uint16_t top;
+    uint16_t bottom;
+} tigt_overscan;
+
 /* Frame submissions copy input and may run on a producer thread. Do not race
- * lifecycle operations. RGB is 0x00RRGGBB; stride is in pixels. Width320/640,
- * height200, pixel_width1/2 (backing pixels per terminal logical pixel).
+ * lifecycle operations. Submissions and overscan access require an active,
+ * unsuspended session (otherwise TIGT_ERROR_BUSY). Invalid arguments return
+ * TIGT_ERROR_ARGUMENT without changing the stored frame or metadata.
+ *
+ * RGB values use 0x00RRGGBB. Text and overscan require a zero high byte;
+ * bitmap pixels ignore the high byte for compatibility with native buffers.
+ * Rendered colours are quantized to the existing 16-colour PC display palette,
+ * then approximated by the terminal's available colours.
+ *
+ * Bitmap stride is in pixels. Width320/640, height200, pixel_width1/2
+ * (backing pixels per terminal logical pixel). The existing bitmap policy
+ * uses terminal defaults for black/white when its frame palette permits.
  * 160x200 can be expanded horizontally by the caller, as for PCjr video. */
 int tigt_present_bitmap(const uint32_t *pixels, uint16_t width, uint16_t height,
                         uint16_t stride, uint8_t pixel_width);
-/* Optional MDA/CGA convenience frontends: buffers must have the sizes above.
- * These decode hardware-format text cells; they have no emulator dependency. */
-int tigt_present_mda(const uint8_t *vram, const uint8_t *crtc, uint8_t mode);
-int tigt_present_cga(const uint8_t *vram, const uint8_t *crtc, uint8_t mode,
-                     int source_y, const uint32_t *pixels, uint16_t stride);
+/* Text stride is in cells and must be >= columns. Columns1..320, rows1..128,
+ * with at most 21440 visible cells; stride padding is ignored. Each codepoint
+ * must be a Unicode scalar occupying exactly one terminal column according
+ * to wcwidth in the session's LC_CTYPE locale: controls, nonspacing combining
+ * marks, zero-width and wide characters are rejected. Colours are explicit RGB.
+ * Only the flags above are accepted. At most one cell may carry CURSOR,
+ * meaning a currently visible cursor; tigt shows a steady terminal underline
+ * cursor there, with no host-generated blink. Callers resolve display enable,
+ * text/cursor blink and hardware attributes before submitting. */
+int tigt_present_text(const tigt_text_cell *cells, uint16_t columns, uint16_t rows,
+                      uint16_t stride);
+/* CP437 display glyphs, including graphical control characters and the house
+ * at 0x7f. The blank display characters 0x00 and 0xff map to U+0020. */
+uint32_t tigt_cp437_codepoint(uint8_t character);
+/* Stored metadata only: overscan is not drawn. Dimensions are native backing
+ * pixels BEFORE host vertical line doubling; color uses the RGB format above.
+ * Set/get copy under the frame mutex. Metadata is independent of bitmap/text
+ * submissions: callers serialize metadata and frames when ordering matters.
+ * Init/shutdown reset it to all zeroes; suspend/resume preserve it. */
+int tigt_set_overscan(const tigt_overscan *overscan);
+int tigt_get_overscan(tigt_overscan *overscan);
 #ifdef __cplusplus
 }
 #endif

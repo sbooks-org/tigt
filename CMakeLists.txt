@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Simplebooks Foundation
 # Copyright (C) 2026 Josh Rodd
 cmake_minimum_required(VERSION 3.20)
-project(tigt VERSION 0.1.0 DESCRIPTION "tty-in-glass-tty" LANGUAGES C)
+project(tigt VERSION 0.2.0 DESCRIPTION "tty-in-glass-tty" LANGUAGES C)
 
 if(NOT UNIX)
     message(FATAL_ERROR "tigt currently requires POSIX terminals and curses")
@@ -21,7 +21,7 @@ target_include_directories(tigt PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
 target_link_libraries(tigt PUBLIC tigt::curses Threads::Threads)
-set_target_properties(tigt PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION 0 POSITION_INDEPENDENT_CODE ON)
+set_target_properties(tigt PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION 2 POSITION_INDEPENDENT_CODE ON)
 
 option(TIGT_BUILD_EXAMPLES "Build standalone C consumer examples" ${PROJECT_IS_TOP_LEVEL})
 if(TIGT_BUILD_EXAMPLES)
@@ -41,7 +41,7 @@ configure_package_config_file(cmake/tigtConfig.cmake.in
     ${CMAKE_CURRENT_BINARY_DIR}/tigtConfig.cmake
     INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/tigt)
 write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/tigtConfigVersion.cmake
-    VERSION ${PROJECT_VERSION} COMPATIBILITY SameMajorVersion)
+    VERSION ${PROJECT_VERSION} COMPATIBILITY SameMinorVersion)
 install(EXPORT tigtTargets NAMESPACE tigt:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/tigt)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/tigtConfig.cmake
     ${CMAKE_CURRENT_BINARY_DIR}/tigtConfigVersion.cmake

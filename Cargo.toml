@@ -4,7 +4,7 @@
 
 [package]
 name = "tigt"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "tty-in-glass-tty: terminal rendering and transport-neutral input"
 license = "MIT-0"

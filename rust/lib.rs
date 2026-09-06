@@ -28,10 +28,56 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-pub const ABI_VERSION: u32 = 1;
-pub const MDA_VRAM_SIZE: usize = 4096;
-pub const CGA_VRAM_SIZE: usize = 16384;
-pub const CRTC_SIZE: usize = 32;
+pub const ABI_VERSION: u32 = 2;
+pub const TEXT_MAX_COLUMNS: u16 = 320;
+pub const TEXT_MAX_ROWS: u16 = 128;
+pub const TEXT_MAX_CELLS: usize = 21440;
+pub const TEXT_UNDERLINE: u32 = 1;
+pub const TEXT_CURSOR: u32 = 2;
+
+/// A resolved single-column Unicode cell. Colors are `0x00RRGGBB`.
+///
+/// The renderer rejects controls, invalid scalars, and characters whose width
+/// is not one in the active terminal locale, as well as unknown flag bits.
+/// [`TEXT_CURSOR`] requests a currently visible, steady cursor; the producer
+/// resolves blink phases. At most one cell per frame may carry this flag.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextCell {
+    pub codepoint: u32,
+    pub foreground: u32,
+    pub background: u32,
+    pub flags: u32,
+}
+
+impl TextCell {
+    pub const fn new(character: char, foreground: u32, background: u32) -> Self {
+        Self {
+            codepoint: character as u32,
+            foreground,
+            background,
+            flags: 0,
+        }
+    }
+}
+
+/// Stored border metadata, not currently rendered. Dimensions are native
+/// backing pixels, before any host vertical line doubling.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Overscan {
+    pub color: u32,
+    pub left: u16,
+    pub right: u16,
+    pub top: u16,
+    pub bottom: u16,
+}
+
+/// Maps a hardware CP437 byte to Unicode, including its control-area glyphs.
+pub fn cp437_codepoint(character: u8) -> char {
+    char::from_u32(unsafe { ffi::tigt_cp437_codepoint(character) })
+        .expect("tigt CP437 table contains Unicode scalars")
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
@@ -185,7 +231,7 @@ impl Session {
         check_status(unsafe { ffi::tigt_resume() })
     }
 
-    /// Copies a 320x200 or 640x200 RGB frame. Colors are `0x00RRGGBB`;
+    /// Copies a 320x200 or 640x200 RGB frame. The high color byte is ignored;
     /// stride is in pixels and `pixel_width` is 1 or 2 backing pixels per
     /// logical terminal pixel. Padding after the last row is not required.
     pub fn present_bitmap(
@@ -200,49 +246,45 @@ impl Session {
         if !matches!(width, 320 | 640) || height != 200 || !matches!(pixel_width, 1 | 2) {
             return Err(Error::Argument);
         }
-        validate_pixels(pixels, width as usize, height as usize, stride as usize, 0)?;
+        validate_frame_length(pixels, width as usize, height as usize, stride as usize)?;
         // Dimensions and every read row are within pixels; C copies them now.
         check_status(unsafe {
             ffi::tigt_present_bitmap(pixels.as_ptr(), width, height, stride, pixel_width)
         })
     }
 
-    /// Copies hardware-format MDA VRAM and CRTC registers. Slices must contain
-    /// at least MDA_VRAM_SIZE and CRTC_SIZE bytes respectively.
-    pub fn present_mda(&self, vram: &[u8], crtc: &[u8], mode: u8) -> Result<(), Error> {
-        self.input_status()?;
-        validate_text(vram, crtc, MDA_VRAM_SIZE)?;
-        check_status(unsafe { ffi::tigt_present_mda(vram.as_ptr(), crtc.as_ptr(), mode) })
-    }
-
-    /// Copies CGA text state or an already-decoded RGB graphics frame.
+    /// Copies a resolved text frame without allocating a staging buffer.
     ///
-    /// VRAM and CRTC slices must always contain CGA_VRAM_SIZE and CRTC_SIZE
-    /// bytes. With mode bit 1 set and Some(pixels), C displays 640x200 pixels
-    /// beginning at source_y, with stride >= 640; mode bit 4 chooses single
-    /// rather than doubled logical pixels. Otherwise pixels/source_y/stride
-    /// are unused and C displays the hardware text/blank transition state.
-    pub fn present_cga(
+    /// Stride is in cells; padding after the last row is not required. Dimensions
+    /// must be nonzero and within [`TEXT_MAX_COLUMNS`], [`TEXT_MAX_ROWS`], and
+    /// [`TEXT_MAX_CELLS`]. RGB is quantized to the renderer's 16-color palette.
+    pub fn present_text(
         &self,
-        vram: &[u8],
-        crtc: &[u8],
-        mode: u8,
-        source_y: usize,
-        pixels: Option<&[u32]>,
+        cells: &[TextCell],
+        columns: u16,
+        rows: u16,
         stride: u16,
     ) -> Result<(), Error> {
         self.input_status()?;
-        validate_text(vram, crtc, CGA_VRAM_SIZE)?;
-        let pixels = if let Some(pixels) = pixels.filter(|_| mode & 2 != 0) {
-            let offset = validate_pixels(pixels, 640, 200, stride as usize, source_y)?;
-            // Slice first and pass source_y=0, avoiding C int-offset overflow.
-            pixels[offset..].as_ptr()
-        } else {
-            ptr::null()
-        };
-        check_status(unsafe {
-            ffi::tigt_present_cga(vram.as_ptr(), crtc.as_ptr(), mode, 0, pixels, stride)
-        })
+        validate_text(cells, columns, rows, stride)?;
+        check_status(unsafe { ffi::tigt_present_text(cells.as_ptr(), columns, rows, stride) })
+    }
+
+    /// Copies metadata independently of the current frame. The caller must
+    /// serialize this with submissions when they represent one logical update.
+    /// Suspension preserves metadata; a new session starts with zero borders.
+    pub fn set_overscan(&self, overscan: &Overscan) -> Result<(), Error> {
+        self.input_status()?;
+        check_status(unsafe { ffi::tigt_set_overscan(overscan) })
+    }
+
+    /// Reads the stored metadata. Like submissions, this requires an active
+    /// session; reading while suspended returns [`Error::Busy`].
+    pub fn overscan(&self) -> Result<Overscan, Error> {
+        self.input_status()?;
+        let mut overscan = Overscan::default();
+        check_status(unsafe { ffi::tigt_get_overscan(&mut overscan) })?;
+        Ok(overscan)
     }
 }
 
@@ -254,34 +296,33 @@ impl Drop for Session {
     }
 }
 
-fn validate_text(vram: &[u8], crtc: &[u8], vram_size: usize) -> Result<(), Error> {
-    if vram.len() < vram_size || crtc.len() < CRTC_SIZE {
-        Err(Error::Argument)
-    } else {
-        Ok(())
+fn validate_text(cells: &[TextCell], columns: u16, rows: u16, stride: u16) -> Result<(), Error> {
+    if columns > TEXT_MAX_COLUMNS
+        || rows > TEXT_MAX_ROWS
+        || usize::from(columns) * usize::from(rows) > TEXT_MAX_CELLS
+    {
+        return Err(Error::Argument);
     }
+    validate_frame_length(cells, columns as usize, rows as usize, stride as usize)
 }
 
-fn validate_pixels(
-    pixels: &[u32],
+fn validate_frame_length<T>(
+    elements: &[T],
     width: usize,
     height: usize,
     stride: usize,
-    source_y: usize,
-) -> Result<usize, Error> {
+) -> Result<(), Error> {
     if stride < width || width == 0 || height == 0 {
         return Err(Error::Argument);
     }
-    let offset = source_y.checked_mul(stride).ok_or(Error::Argument)?;
     let end = (height - 1)
         .checked_mul(stride)
-        .and_then(|rows| offset.checked_add(rows))
         .and_then(|last| last.checked_add(width))
         .ok_or(Error::Argument)?;
-    if pixels.len() < end {
+    if elements.len() < end {
         Err(Error::Argument)
     } else {
-        Ok(offset)
+        Ok(())
     }
 }
 
@@ -291,19 +332,44 @@ mod tests {
 
     #[test]
     fn padded_frame_requires_last_row_pixels_but_not_last_row_padding() {
-        let pixels = vec![0; 3 * 672 + 640];
-        assert_eq!(validate_pixels(&pixels, 640, 2, 672, 2), Ok(1344));
+        let pixels = vec![0; 672 + 640];
+        assert_eq!(validate_frame_length(&pixels, 640, 2, 672), Ok(()));
         assert_eq!(
-            validate_pixels(&pixels[..pixels.len() - 1], 640, 2, 672, 2),
+            validate_frame_length(&pixels[..pixels.len() - 1], 640, 2, 672),
             Err(Error::Argument)
         );
     }
 
     #[test]
-    fn huge_source_offset_cannot_wrap_to_a_small_valid_buffer() {
-        assert_eq!(
-            validate_pixels(&[0; 640], 640, 200, 640, usize::MAX),
-            Err(Error::Argument)
-        );
+    fn text_slices_enforce_stride_and_frame_capacity() {
+        let cell = TextCell::new('A', 0xffffff, 0);
+        let cells = vec![cell; TEXT_MAX_CELLS];
+        assert_eq!(validate_text(&cells, 320, 67, 320), Ok(()));
+        assert_eq!(validate_text(&cells, 167, 128, 167), Ok(()));
+        for (columns, rows, stride) in [
+            (0, 1, 1),
+            (1, 0, 1),
+            (321, 1, 321),
+            (1, 129, 1),
+            (320, 68, 320),
+            (168, 128, 168),
+            (80, 25, 79),
+        ] {
+            assert_eq!(
+                validate_text(&cells, columns, rows, stride),
+                Err(Error::Argument)
+            );
+        }
+        assert_eq!(validate_text(&cells[..84], 4, 2, 80), Ok(()));
+        assert_eq!(validate_text(&cells[..83], 4, 2, 80), Err(Error::Argument));
+        assert_eq!(validate_text(&[], 1, 1, 1), Err(Error::Argument));
+    }
+
+    #[test]
+    fn cp437_preserves_control_glyphs_and_extended_characters() {
+        assert_eq!(cp437_codepoint(1), '☺');
+        assert_eq!(cp437_codepoint(0x7f), '⌂');
+        assert_eq!(cp437_codepoint(0x82), 'é');
+        assert_eq!(cp437_codepoint(0xdb), '█');
     }
 }

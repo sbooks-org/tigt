@@ -21,6 +21,7 @@ static bool done;
 static unsigned controls[2][3];
 static volatile sig_atomic_t signals_seen;
 static uint32_t pixels[648 * 200];
+static unsigned acknowledged_stage;
 
 static void signal_seen(int number)
 {
@@ -32,6 +33,11 @@ static void on_input(const tigt_input_event *event, void *user)
 {
     assert(user == controls);
     pthread_mutex_lock(&lock);
+    if (event->key.kind == TIGT_KEY_CHAR && event->key.character == 'n' &&
+        event->kind == TIGT_PRESS) {
+        acknowledged_stage++;
+        pthread_cond_signal(&ready);
+    }
     if (event->key.kind == TIGT_KEY_CHAR && event->modifiers == TIGT_MOD_CONTROL &&
         (event->key.character == 'c' || event->key.character == 'z')) {
         assert(event->kind <= TIGT_RELEASE);
@@ -66,18 +72,130 @@ static void check_termios(const struct termios *expected)
 
 static void check_invalid_frames(void)
 {
-    uint8_t vram[TIGT_CGA_VRAM_SIZE] = { 0 };
-    uint8_t crtc[TIGT_CRTC_SIZE] = { 0 };
+    tigt_text_cell cell = { 'A', 0xffffff, 0, 0 };
     assert(tigt_present_bitmap(NULL, 640, 200, 640, 2) == TIGT_ERROR_ARGUMENT);
     assert(tigt_present_bitmap(pixels, 160, 200, 640, 1) == TIGT_ERROR_ARGUMENT);
     assert(tigt_present_bitmap(pixels, 640, 199, 640, 2) == TIGT_ERROR_ARGUMENT);
     assert(tigt_present_bitmap(pixels, 640, 200, 639, 2) == TIGT_ERROR_ARGUMENT);
     assert(tigt_present_bitmap(pixels, 640, 200, 640, 0) == TIGT_ERROR_ARGUMENT);
     assert(tigt_present_bitmap(pixels, 640, 200, 640, 3) == TIGT_ERROR_ARGUMENT);
-    assert(tigt_present_mda(NULL, crtc, 8) == TIGT_ERROR_ARGUMENT);
-    assert(tigt_present_mda(vram, NULL, 8) == TIGT_ERROR_ARGUMENT);
-    assert(tigt_present_cga(NULL, crtc, 8, 0, NULL, 0) == TIGT_ERROR_ARGUMENT);
-    assert(tigt_present_cga(vram, NULL, 8, 0, NULL, 0) == TIGT_ERROR_ARGUMENT);
+    assert(tigt_present_text(NULL, 1, 1, 1) == TIGT_ERROR_ARGUMENT);
+    assert(tigt_present_text(&cell, 0, 1, 1) == TIGT_ERROR_ARGUMENT);
+    assert(tigt_present_text(&cell, 1, 0, 1) == TIGT_ERROR_ARGUMENT);
+    assert(tigt_present_text(&cell, 321, 1, 321) == TIGT_ERROR_ARGUMENT);
+    assert(tigt_present_text(&cell, 1, 129, 1) == TIGT_ERROR_ARGUMENT);
+    assert(tigt_present_text(&cell, 320, 68, 320) == TIGT_ERROR_ARGUMENT);
+    assert(tigt_present_text(&cell, 2, 1, 1) == TIGT_ERROR_ARGUMENT);
+    const uint32_t invalid_codepoints[] = { 0, 10, 0x7f, 0x9f, 0xd800, 0x110000, 0x301, 0x4e00 };
+    for (unsigned i = 0; i < sizeof(invalid_codepoints) / sizeof(invalid_codepoints[0]); i++) {
+        cell.codepoint = invalid_codepoints[i];
+        assert(tigt_present_text(&cell, 1, 1, 1) == TIGT_ERROR_ARGUMENT);
+    }
+    cell.codepoint = 'A';
+    cell.flags = 4;
+    assert(tigt_present_text(&cell, 1, 1, 1) == TIGT_ERROR_ARGUMENT);
+    cell.flags = 0;
+    cell.foreground = 0x1000000;
+    assert(tigt_present_text(&cell, 1, 1, 1) == TIGT_ERROR_ARGUMENT);
+    cell.foreground = 0;
+    cell.background = 0x1000000;
+    assert(tigt_present_text(&cell, 1, 1, 1) == TIGT_ERROR_ARGUMENT);
+    tigt_text_cell cursors[2] = { { 'A', 0, 0, TIGT_TEXT_CURSOR }, { 'B', 0, 0, TIGT_TEXT_CURSOR } };
+    assert(tigt_present_text(cursors, 2, 1, 2) == TIGT_ERROR_ARGUMENT);
+    assert(tigt_set_overscan(NULL) == TIGT_ERROR_ARGUMENT);
+    assert(tigt_get_overscan(NULL) == TIGT_ERROR_ARGUMENT);
+    tigt_overscan invalid_border = { 0x1000000, 0, 0, 0, 0 };
+    assert(tigt_set_overscan(&invalid_border) == TIGT_ERROR_ARGUMENT);
+}
+
+static void check_overscan(const tigt_overscan *expected)
+{
+    tigt_overscan actual;
+    assert(tigt_get_overscan(&actual) == TIGT_OK);
+    assert(actual.color == expected->color && actual.left == expected->left &&
+           actual.right == expected->right && actual.top == expected->top &&
+           actual.bottom == expected->bottom);
+    /* Getter output is caller-owned; modifying it cannot alter stored state. */
+    memset(&actual, 0xff, sizeof(actual));
+    assert(tigt_get_overscan(&actual) == TIGT_OK);
+    assert(actual.color == expected->color && actual.left == expected->left &&
+           actual.right == expected->right && actual.top == expected->top &&
+           actual.bottom == expected->bottom);
+}
+
+static void wait_for_stage(unsigned stage)
+{
+    struct timespec deadline;
+    assert(clock_gettime(CLOCK_REALTIME, &deadline) == 0);
+    deadline.tv_sec += 20;
+    pthread_mutex_lock(&lock);
+    while (acknowledged_stage < stage) {
+        int result = pthread_cond_timedwait(&ready, &lock, &deadline);
+        if (result == ETIMEDOUT)
+            fprintf(stderr, "PTY driver did not acknowledge text stage %u\n", stage);
+        assert(result == 0);
+    }
+    assert(acknowledged_stage == stage);
+    pthread_mutex_unlock(&lock);
+}
+
+static int check_resolved_text(const tigt_config *config, const struct termios *original)
+{
+    const tigt_overscan zero = { 0 };
+    tigt_overscan border = { 0xf34ef3, 9, 17, 3, 11 };
+    tigt_overscan copy = border;
+    check_overscan(&zero);
+    assert(tigt_set_overscan(&copy) == TIGT_OK);
+    memset(&copy, 0, sizeof(copy));
+    check_overscan(&border);
+    tigt_suspend();
+    check_termios(original);
+    assert(tigt_set_overscan(&zero) == TIGT_ERROR_BUSY);
+    assert(tigt_get_overscan(&copy) == TIGT_ERROR_BUSY);
+    const tigt_text_cell blank = { ' ', 0, 0, 0 };
+    assert(tigt_present_text(&blank, 1, 1, 1) == TIGT_ERROR_BUSY);
+    assert(tigt_resume() == TIGT_OK);
+    check_overscan(&border);
+
+    /* Each step is acknowledged only after the PTY consumer sees its complete
+       frame. Padding is deliberately invalid and not part of the text frame. */
+    const uint32_t glyphs[8] = { 'A', 'B', 'C', 'D', 0x263a, 0xe9, 0x2500, 0x2588 };
+    for (unsigned stage = 0; stage < 5; stage++) {
+        if (stage == 1) {
+            border = (tigt_overscan) { 0x4ef3f3, 23, 1, 15, 5 };
+            assert(tigt_set_overscan(&border) == TIGT_OK);
+        }
+        if (stage == 3) {
+            for (unsigned i = 0; i < sizeof(pixels) / sizeof(pixels[0]); i++)
+                pixels[i] = 0x0000c4;
+            assert(tigt_present_bitmap(pixels, 640, 200, 648, 2) == TIGT_OK);
+            memset(pixels, 0xff, sizeof(pixels));
+        } else {
+            tigt_text_cell cells[10];
+            memset(cells, 0xff, sizeof(cells));
+            for (unsigned i = 0; i < 8; i++) {
+                cells[i / 4 * 6 + i % 4] = (tigt_text_cell) {
+                    glyphs[i], stage == 0 ? 0x00c400 : 0xc40000,
+                    stage == 0 ? 0x0000c4 : 0x00c4c4,
+                    stage == 2 ? 0 : i == 0 ? TIGT_TEXT_UNDERLINE : i == 1 ? TIGT_TEXT_CURSOR : 0
+                };
+            }
+            assert(tigt_present_text(cells, 4, 2, 6) == TIGT_OK);
+            memset(cells, 0, sizeof(cells));
+        }
+        check_overscan(&border);
+        wait_for_stage(stage + 1);
+    }
+    tigt_shutdown();
+    check_termios(original);
+    assert(tigt_get_overscan(&copy) == TIGT_ERROR_BUSY);
+    assert(tigt_set_overscan(&zero) == TIGT_ERROR_BUSY);
+    assert(tigt_init(config) == TIGT_OK);
+    check_overscan(&zero);
+    tigt_shutdown();
+    check_termios(original);
+    puts("PASS resolved text colors, flags, transitions, copy and overscan lifecycle");
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -99,6 +217,8 @@ int main(int argc, char **argv)
     assert(tigt_init(&config) == TIGT_OK);
     assert(tigt_init(&config) == TIGT_ERROR_BUSY);
     check_invalid_frames();
+    if (argc == 2 && strcmp(argv[1], "--text-tests") == 0)
+        return check_resolved_text(&config, &original);
     tigt_suspend();
     check_termios(&original);
     assert(tigt_resume() == TIGT_OK);
@@ -112,7 +232,8 @@ int main(int argc, char **argv)
             const unsigned value = (code * 37u + row * 19u) ^ (code << (row % 3));
             const uint8_t bits = code == 0 ? 0 : code == 127 ? 255 : value & 255;
             const bool ink = (bits & (0x80 >> (x / 2 % 8))) != 0;
-            pixels[y * 648 + x] = x >= 640 ? 0xffffff : ink ? 0xc4c4c4 : 0;
+            /* Native bitmap producers may supply opaque ARGB: alpha is ignored. */
+            pixels[y * 648 + x] = 0xff000000u | (x >= 640 ? 0xffffff : ink ? 0xc4c4c4 : 0);
         }
     }
     assert(tigt_present_bitmap(pixels, 640, 200, 648, 2) == TIGT_OK);

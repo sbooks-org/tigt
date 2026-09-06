@@ -10,7 +10,7 @@
 
 use std::{fmt::Write, thread, time::Duration};
 use tigt::keyboard::mapper::{PcEvent, PcKeyboard};
-use tigt::{CRTC_SIZE, InputDecoder, MDA_VRAM_SIZE, Session};
+use tigt::{InputDecoder, Session, TextCell};
 
 fn append_scan_bytes(bytes: &mut Vec<u8>, events: impl IntoIterator<Item = PcEvent>) {
     for event in events {
@@ -22,11 +22,9 @@ fn append_scan_bytes(bytes: &mut Vec<u8>, events: impl IntoIterator<Item = PcEve
     }
 }
 
-fn write_line(vram: &mut [u8], row: usize, text: &str) {
-    for (column, byte) in text.bytes().take(80).enumerate() {
-        let offset = (row * 80 + column) * 2;
-        vram[offset] = byte;
-        vram[offset + 1] = 0x07;
+fn write_line(cells: &mut [TextCell], row: usize, text: &str) {
+    for (column, character) in text.chars().take(80).enumerate() {
+        cells[row * 80 + column] = TextCell::new(character, 0xc4c4c4, 0);
     }
 }
 
@@ -49,32 +47,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         write!(&mut hex, "{byte:02x} ")?;
     }
 
-    let mut vram = [0_u8; MDA_VRAM_SIZE];
-    for cell in vram.chunks_exact_mut(2) {
-        cell.copy_from_slice(&[b' ', 0x07]);
-    }
-    let mut crtc = [0_u8; CRTC_SIZE];
-    crtc[1] = 80;
-    crtc[6] = 25;
-    crtc[9] = 13;
-    crtc[10] = 0x20; // Disable cursor for this static demonstration.
-    write_line(&mut vram, 0, "tigt + optional pc-xt-keyboard adapter");
+    let mut cells = [TextCell::new(' ', 0xc4c4c4, 0); 80 * 25];
+    write_line(&mut cells, 0, "tigt + optional pc-xt-keyboard adapter");
     write_line(
-        &mut vram,
+        &mut cells,
         2,
         "Input decoded before opening the output-only terminal:",
     );
     write_line(
-        &mut vram,
+        &mut cells,
         3,
         "A, Ctrl+C, Ctrl+Left; release all at end of batch",
     );
-    write_line(&mut vram, 5, "PC/XT Set 1 make/break bytes:");
+    write_line(&mut cells, 5, "PC/XT Set 1 make/break bytes:");
     for (row, chunk) in hex.as_bytes().chunks(78).enumerate() {
-        write_line(&mut vram, 6 + row, std::str::from_utf8(chunk)?);
+        write_line(&mut cells, 6 + row, std::str::from_utf8(chunk)?);
     }
     let session = Session::new()?;
-    session.present_mda(&vram, &crtc, 0x08)?;
+    session.present_text(&cells, 80, 25, 80)?;
     thread::sleep(Duration::from_secs(2));
     drop(session);
     println!("PC/XT scan bytes: {}", hex.trim_end());

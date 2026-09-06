@@ -63,6 +63,8 @@ pub struct Style {
     pub foreground: Color,
     pub background: Color,
     pub bold: bool,
+    pub underline: bool,
+    pub blink: bool,
     pub inverse: bool,
     pub invisible: bool,
 }
@@ -73,6 +75,8 @@ impl Default for Style {
             foreground: Color::DefaultForeground,
             background: Color::DefaultBackground,
             bold: false,
+            underline: false,
+            blink: false,
             inverse: false,
             invisible: false,
         }
@@ -137,6 +141,14 @@ impl Screen {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Cursor {
+    pub column: usize,
+    pub row: usize,
+    pub visible: bool,
+    pub blinking: bool,
+}
+
 pub struct Terminal {
     screen: Screen,
     primary: Option<Screen>,
@@ -144,6 +156,8 @@ pub struct Terminal {
     style: Style,
     autowrap: bool,
     origin: bool,
+    cursor_visible: bool,
+    cursor_blinking: bool,
     pub errors: Vec<String>,
 }
 
@@ -156,6 +170,8 @@ impl Terminal {
             style: Style::default(),
             autowrap: true,
             origin: false,
+            cursor_visible: true,
+            cursor_blinking: true,
             errors: Vec::new(),
         };
         let mut parser = vte::Parser::new();
@@ -179,6 +195,16 @@ impl Terminal {
                 "primary"
             },
         )
+    }
+
+    /// Current terminal cursor, including native visibility and blink control.
+    pub fn cursor(&self) -> Cursor {
+        Cursor {
+            column: self.screen.x,
+            row: self.screen.y,
+            visible: self.cursor_visible,
+            blinking: self.cursor_blinking,
+        }
     }
 
     fn scroll_up(&mut self, count: usize) {
@@ -223,6 +249,10 @@ impl Terminal {
                 0 => self.style = Style::default(),
                 1 => self.style.bold = true,
                 22 => self.style.bold = false,
+                4 | 21 => self.style.underline = true,
+                24 => self.style.underline = false,
+                5 | 6 => self.style.blink = true,
+                25 => self.style.blink = false,
                 7 => self.style.inverse = true,
                 27 => self.style.inverse = false,
                 8 => self.style.invisible = true,
@@ -277,7 +307,7 @@ impl Terminal {
                     }
                 }
                 // These attributes do not change sextant coverage or its flat colors.
-                2..=6 | 9 | 21 | 23..=26 | 29 | 53 | 55 => {}
+                2 | 3 | 9 | 23 | 26 | 29 | 53 | 55 => {}
                 _ => self.errors.push(format!("unsupported SGR attribute {p}")),
             }
             i += 1;
@@ -424,7 +454,9 @@ impl Perform for Terminal {
                             (self.screen.x, self.screen.y, self.style) = self.screen.saved;
                         }
                     }
-                    1 | 12 | 25 | 1000..=1007 | 1015 | 2004 | 2026 => {}
+                    12 => self.cursor_blinking = set,
+                    25 => self.cursor_visible = set,
+                    1 | 1000..=1007 | 1015 | 2004 | 2026 => {}
                     n => self
                         .errors
                         .push(format!("unsupported private terminal mode {n}")),
@@ -434,6 +466,7 @@ impl Perform for Terminal {
         }
         if !intermediates.is_empty() {
             if action == 'q' && intermediates == b" " {
+                self.cursor_blinking = matches!(first, 0 | 1 | 3 | 5);
                 return;
             } // Cursor shape.
               // Kitty keyboard protocol controls alter input encoding, not the screen.

@@ -41,15 +41,15 @@ unsafe extern "C" {
         stride: u16,
         pixel_width: u8,
     ) -> c_int;
-    pub(crate) fn tigt_present_mda(vram: *const u8, crtc: *const u8, mode: u8) -> c_int;
-    pub(crate) fn tigt_present_cga(
-        vram: *const u8,
-        crtc: *const u8,
-        mode: u8,
-        source_y: c_int,
-        pixels: *const u32,
+    pub(crate) fn tigt_present_text(
+        cells: *const crate::TextCell,
+        columns: u16,
+        rows: u16,
         stride: u16,
     ) -> c_int;
+    pub(crate) fn tigt_cp437_codepoint(character: u8) -> u32;
+    pub(crate) fn tigt_set_overscan(overscan: *const crate::Overscan) -> c_int;
+    pub(crate) fn tigt_get_overscan(overscan: *mut crate::Overscan) -> c_int;
     pub(crate) fn tigt_input_create(
         callback: Option<InputCallback>,
         user: *mut c_void,

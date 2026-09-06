@@ -20,24 +20,6 @@ static uint32_t pixels[640 * 201];
 
 enum policy { NEITHER, INTENSE, NORMAL, EXPLICIT };
 
-static void check_text_attributes(void)
-{
-    /* The existing text contract remains exact, including overflow boundaries. */
-    for (unsigned attribute = 0; attribute < 256; attribute++) {
-        chtype style = cga_cell_attributes(attribute, false);
-        short actual_fg, actual_bg;
-        assert(!(style & (A_STANDOUT | A_BOLD | A_INVIS)));
-        assert(PAIR_NUMBER(style) > 0 && PAIR_NUMBER(style) <= 255);
-        assert(pair_content(PAIR_NUMBER(style), &actual_fg, &actual_bg) == OK);
-        if (style & A_REVERSE) {
-            short swap = actual_fg;
-            actual_fg = actual_bg;
-            actual_bg = swap;
-        }
-        assert(actual_fg == cga_5153_xterm[attribute & 15]);
-        assert(actual_bg == cga_5153_xterm[attribute >> 4]);
-    }
-}
 
 static unsigned glyph_mask(wchar_t ch)
 {
@@ -123,11 +105,6 @@ static void check_transition(unsigned ink, unsigned rare, enum policy themed)
     pixels[199 * 640 + 639] = rgb[0];
     render_bitmap_graphics(pixels, 640, 200, 2, true);
     check_masks(ink, 0, themed);
-    /* Shared pair definitions must survive text -> unchanged bitmap -> text. */
-    check_text_attributes();
-    render_bitmap_graphics(pixels, 640, 200, 2, true);
-    check_masks(ink, 0, themed);
-    check_text_attributes();
 }
 
 static void check_policy(void)
@@ -149,7 +126,6 @@ static void check_policy(void)
                 expected[bit] = (0x13 >> bit) & 1 ? fg : bg;
             check_cell(1 + fg, bg, expected, EXPLICIT);
         }
-    check_text_attributes();
 
     /* Neither is also thematic for black, but not for other colors. */
     for (unsigned fg = 0; fg < 16; fg++) {
@@ -188,7 +164,6 @@ static void check_policy(void)
         memset(expected, ink, sizeof(expected));
         check_cell(0, 0, expected, ink == 15 ? INTENSE : NORMAL);
     }
-    check_text_attributes();
 }
 
 static void synthetic_font(uint8_t font[128][8])
@@ -256,7 +231,6 @@ int main(int argc, char **argv)
     terminal_default_colors_available = use_default_colors() == OK;
     assert(terminal_default_colors_available && COLORS >= 256);
     assert(LINES >= 67 && COLS >= 320);
-    check_text_attributes();
     if (policy_tests) {
         check_policy();
     } else {
