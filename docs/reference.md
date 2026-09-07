@@ -39,6 +39,16 @@ At most one cell may have the cursor flag. It means a currently visible steady u
 
 Text colours use the same 16-colour approximation, but do not reinterpret the producer's attributes as hardware mode bits. Native snapshots retain the original resolved RGB and flags.
 
+## Display technology
+
+`tigt_set_display_technology(technology)` / `Session::set_display_technology(DisplayTechnology)` select an optional terminal presentation policy. C accepts `TIGT_DISPLAY_GENERIC=0` or `TIGT_DISPLAY_MDA=1`; Rust exposes `DisplayTechnology::{Generic,Mda}`. This additive API does not change the ABI version or any frame/configuration layout.
+
+Generic is the new-session default and honors the resolved cursor immediately. MDA hides only the initial terminal cursor until an accepted text submission contains visible output: distinct resolved foreground/background RGB plus a nonblank, non-whitespace glyph or an underline. Whitespace, nonbreaking spaces and the empty braille pattern are blank; an underline can make a blank visible. Cursor flags alone and equal-colour POST RAM fills do not count.
+
+The latch observes every accepted submission, not just frames sampled by the renderer. After first output, clearing the display does not hide subsequent cursors. Bitmap submissions neither release nor reset the latch. Native snapshots always retain the exact source cursor flags, coordinates and attributes.
+
+Set the hint before submitting that technology's frame, and serialize hints with submissions when ordering matters. An actual technology change resets the latch and redraws the retained frame even without another submission; a repeated identical hint does nothing. The hint and latch survive suspend/resume; shutdown/init reset them to Generic. Setting requires an active session (`BUSY` otherwise); unsupported C values return `ARGUMENT` without altering state.
+
 ## Overscan
 
 `tigt_overscan` / `Overscan` has `color` and `left`, `right`, `top`, `bottom` dimensions in native backing pixels before host vertical line doubling. `tigt_set_overscan` / `Session::set_overscan` copy metadata; `tigt_get_overscan` / `Session::overscan` retrieve it.

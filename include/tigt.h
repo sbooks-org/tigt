@@ -119,6 +119,11 @@ enum {
     TIGT_TEXT_CURSOR = 1u << 1,
 };
 
+enum {
+    TIGT_DISPLAY_GENERIC = 0,
+    TIGT_DISPLAY_MDA = 1,
+};
+
 typedef struct {
     uint32_t color;
     uint16_t left;
@@ -128,9 +133,9 @@ typedef struct {
 } tigt_overscan;
 
 /* Frame submissions copy input and may run on a producer thread. Do not race
- * lifecycle operations. Submissions and overscan access require an active,
- * unsuspended session (otherwise TIGT_ERROR_BUSY). Invalid arguments return
- * TIGT_ERROR_ARGUMENT without changing the stored frame or metadata.
+ * lifecycle operations. Submissions, display technology and overscan access
+ * require an active, unsuspended session (otherwise TIGT_ERROR_BUSY). Invalid
+ * arguments return TIGT_ERROR_ARGUMENT without changing stored state.
  *
  * RGB values use 0x00RRGGBB. Text and overscan require a zero high byte;
  * bitmap pixels ignore the high byte for compatibility with native buffers.
@@ -151,12 +156,27 @@ int tigt_present_bitmap(const uint32_t *pixels, uint16_t width, uint16_t height,
  * Only the flags above are accepted. At most one cell may carry CURSOR,
  * meaning a currently visible cursor; tigt shows a steady terminal underline
  * cursor there, with no host-generated blink. Callers resolve display enable,
- * text/cursor blink and hardware attributes before submitting. */
+ * text/cursor blink and hardware attributes before submitting. MDA technology
+ * can suppress only the initial rendered cursor; native snapshots are unchanged. */
 int tigt_present_text(const tigt_text_cell *cells, uint16_t columns, uint16_t rows,
                       uint16_t stride);
 /* CP437 display glyphs, including graphical control characters and the house
  * at 0x7f. The blank display characters 0x00 and 0xff map to U+0020. */
 uint32_t tigt_cp437_codepoint(uint8_t character);
+/* Select a terminal presentation policy, not a hardware decoder. Generic (the
+ * initial default) honors every submitted cursor. MDA hides the terminal cursor
+ * until a submitted text cell has distinct resolved foreground/background RGB
+ * and a nonblank, non-whitespace glyph or UNDERLINE. CURSOR alone is not output.
+ * Every accepted text submission participates, even if never rendered. Once
+ * output appears, clearing the screen does not rearm suppression. Bitmap frames
+ * neither release nor rearm it. Native frame contents/flags are never changed.
+ *
+ * Repeating the same hint is a no-op. An actual technology change resets the
+ * latch and schedules the current frame for redraw, even without a new frame.
+ * Set before submitting the new technology's frame; serialize with submissions
+ * when ordering matters. Suspend/resume preserve the hint and latch;
+ * init/shutdown reset to Generic. Unsupported values return ARGUMENT. */
+int tigt_set_display_technology(uint32_t technology);
 /* Stored metadata only: overscan is not drawn. Dimensions are native backing
  * pixels BEFORE host vertical line doubling; color uses the RGB format above.
  * Set/get copy under the frame mutex. Metadata is independent of bitmap/text

@@ -176,8 +176,36 @@ static void synthetic_font(uint8_t font[128][8])
         }
 }
 
+static int check_unsampled_output(void)
+{
+    const tigt_config config = { .abi_version = TIGT_ABI_VERSION };
+    assert(tigt_init(&config) == TIGT_OK);
+    /* Hold sampling, not submission: a transient output frame must release the
+     * cursor even when the terminal only ever receives the subsequent clear. */
+    atomic_store_explicit(&renderer_running, false, memory_order_relaxed);
+    assert(pthread_join(renderer_thread, NULL) == 0);
+    renderer_thread_created = false;
+    assert(tigt_set_display_technology(TIGT_DISPLAY_MDA) == TIGT_OK);
+    tigt_text_cell cells[4] = {
+        { 'X', 0xaaaaaa, 0, 0 }, { ' ', 0xaaaaaa, 0, 0 },
+        { ' ', 0xaaaaaa, 0, 0 }, { ' ', 0xaaaaaa, 0, TIGT_TEXT_CURSOR }
+    };
+    assert(tigt_present_text(cells, 4, 1, 4) == TIGT_OK);
+    cells[0].codepoint = ' ';
+    assert(tigt_present_text(cells, 4, 1, 4) == TIGT_OK);
+    assert(tigt_set_display_technology(TIGT_DISPLAY_MDA) == TIGT_OK);
+    render_frame();
+    /* Output-only mode leaves canonical stdin intact. The driver responds only
+     * after observing blank cells and the released cursor at column three. */
+    assert(getchar() == 'n');
+    tigt_shutdown();
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && strcmp(argv[1], "--unsampled-output") == 0)
+        return check_unsampled_output();
     const char *rom_path = NULL;
     unsigned long font_offset = 0xfa6e;
     unsigned argument = 1;

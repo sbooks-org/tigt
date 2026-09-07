@@ -198,6 +198,81 @@ static int check_resolved_text(const tigt_config *config, const struct termios *
     return 0;
 }
 
+static int check_display_technology(const tigt_config *config, const struct termios *original,
+                                    const char *directory)
+{
+    for (unsigned stage = 0; stage < 17; stage++) {
+        if (stage == 4 || stage == 7) {
+            tigt_suspend();
+            check_termios(original);
+            assert(tigt_set_display_technology(TIGT_DISPLAY_GENERIC) == TIGT_ERROR_BUSY);
+            assert(tigt_resume() == TIGT_OK);
+        }
+        if (stage == 15 || stage == 16) {
+            tigt_shutdown();
+            check_termios(original);
+            assert(tigt_set_display_technology(TIGT_DISPLAY_MDA) == TIGT_ERROR_BUSY);
+            assert(tigt_init(config) == TIGT_OK);
+        }
+        if (stage == 9 || stage == 13)
+            assert(tigt_set_display_technology(TIGT_DISPLAY_GENERIC) == TIGT_OK);
+        if (stage != 0 && stage != 15)
+            assert(tigt_set_display_technology(TIGT_DISPLAY_MDA) == TIGT_OK);
+        if (stage == 2) {
+            assert(tigt_set_display_technology(UINT32_MAX) == TIGT_ERROR_ARGUMENT);
+            const tigt_text_cell rejected[] = {
+                { 'X', 0xaaaaaa, 0, TIGT_TEXT_CURSOR },
+                { 'Y', 0xaaaaaa, 0, TIGT_TEXT_CURSOR }
+            };
+            assert(tigt_present_text(rejected, 2, 1, 2) == TIGT_ERROR_ARGUMENT);
+        }
+        if (stage == 3 || stage == 8)
+            assert(tigt_present_bitmap(pixels, 640, 200, 648, 2) == TIGT_OK);
+
+        /* Technology-only stages must redraw the retained cursor, with no new
+         * frame to disguise a missed invalidation. Other stages carry a unique
+         * invisible glyph so the PTY driver can acknowledge actual rendering. */
+        if (stage != 1 && stage != 12 && stage != 13) {
+            tigt_text_cell cells[10];
+            for (unsigned i = 0; i < 10; i++)
+                cells[i] = (tigt_text_cell) { ' ', 0xaaaaaa, 0, 0 };
+            cells[0] = (tigt_text_cell) { 'a' + stage, 0, 0, 0 };
+            /* Visible padding must never count as first output. */
+            cells[4] = cells[5] = (tigt_text_cell) { 'X', 0xaaaaaa, 0, 0 };
+            if (stage == 2) {
+                for (unsigned column = 0; column < 4; column++)
+                    cells[6 + column] = (tigt_text_cell) { 'A', 0, 0, 0 };
+            }
+            if (stage == 3) {
+                const uint32_t blanks[] = { 0x00a0, 0x2002, 0x202f, 0x2800 };
+                for (unsigned column = 0; column < 4; column++)
+                    cells[6 + column].codepoint = blanks[column];
+            }
+            if (stage == 5)
+                cells[6].codepoint = 'X';
+            if (stage == 10 || stage == 11) {
+                cells[6].flags = TIGT_TEXT_UNDERLINE;
+                if (stage == 10)
+                    cells[6].foreground = 0;
+            }
+            cells[6 + stage % 4].flags |= TIGT_TEXT_CURSOR;
+            assert(tigt_present_text(cells, 4, 2, 6) == TIGT_OK);
+            memset(cells, 0, sizeof(cells));
+        }
+        char path[1024];
+        assert(snprintf(path, sizeof(path), "%s/display-%u.json", directory, stage) <
+               (int) sizeof(path));
+        FILE *snapshot = fopen(path, "wb");
+        assert(snapshot != NULL);
+        assert(tigt_snapshot_write_fd(fileno(snapshot), TIGT_SNAPSHOT_ATTRIBUTES) == TIGT_OK);
+        assert(fclose(snapshot) == 0);
+        wait_for_stage(stage + 1);
+    }
+    tigt_shutdown();
+    check_termios(original);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     const tigt_config config = { TIGT_ABI_VERSION, on_input, controls };
@@ -219,6 +294,8 @@ int main(int argc, char **argv)
     check_invalid_frames();
     if (argc == 2 && strcmp(argv[1], "--text-tests") == 0)
         return check_resolved_text(&config, &original);
+    if (argc == 3 && strcmp(argv[1], "--display-tests") == 0)
+        return check_display_technology(&config, &original, argv[2]);
     tigt_suspend();
     check_termios(&original);
     assert(tigt_resume() == TIGT_OK);

@@ -37,12 +37,25 @@ pub const TEXT_MAX_CELLS: usize = 21440;
 pub const TEXT_UNDERLINE: u32 = 1;
 pub const TEXT_CURSOR: u32 = 2;
 
+/// Terminal presentation policy; this does not decode hardware video memory.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DisplayTechnology {
+    /// Honor the submitted cursor immediately.
+    #[default]
+    Generic = 0,
+    /// Hide the initial cursor until visibly nonblank text has been submitted.
+    Mda = 1,
+}
+
 /// A resolved single-column Unicode cell. Colors are `0x00RRGGBB`.
 ///
 /// The renderer rejects controls, invalid scalars, and characters whose width
 /// is not one in the active terminal locale, as well as unknown flag bits.
 /// [`TEXT_CURSOR`] requests a currently visible, steady cursor; the producer
 /// resolves blink phases. At most one cell per frame may carry this flag.
+/// [`DisplayTechnology::Mda`] can suppress its initial terminal presentation;
+/// native snapshots retain the original flag.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TextCell {
@@ -270,6 +283,23 @@ impl Session {
         self.input_status()?;
         validate_text(cells, columns, rows, stride)?;
         check_status(unsafe { ffi::tigt_present_text(cells.as_ptr(), columns, rows, stride) })
+    }
+
+    /// Selects the display policy for an active session, before its next frame.
+    ///
+    /// MDA hides the initial terminal cursor until an accepted text submission
+    /// contains distinct resolved foreground/background RGB and a nonblank,
+    /// non-whitespace glyph or underline. Cursor flags alone do not release it.
+    /// Every submission counts, even if the renderer skips that frame. Clearing
+    /// after output, bitmap frames and repeated hints do not rearm suppression.
+    /// Native snapshots are never modified.
+    ///
+    /// An actual change resets the latch and redraws the retained frame.
+    /// Suspend/resume preserve both policy and latch; new sessions use Generic.
+    /// Like frame submission, this returns [`Error::Busy`] while suspended.
+    pub fn set_display_technology(&self, technology: DisplayTechnology) -> Result<(), Error> {
+        self.input_status()?;
+        check_status(unsafe { ffi::tigt_set_display_technology(technology as u32) })
     }
 
     /// Copies metadata independently of the current frame. The caller must

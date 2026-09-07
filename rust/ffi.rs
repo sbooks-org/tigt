@@ -48,6 +48,7 @@ unsafe extern "C" {
         stride: u16,
     ) -> c_int;
     pub(crate) fn tigt_cp437_codepoint(character: u8) -> u32;
+    pub(crate) fn tigt_set_display_technology(technology: u32) -> c_int;
     pub(crate) fn tigt_set_overscan(overscan: *const crate::Overscan) -> c_int;
     pub(crate) fn tigt_get_overscan(overscan: *mut crate::Overscan) -> c_int;
     pub(crate) fn tigt_snapshot_write_fd(fd: c_int, format: u32) -> c_int;

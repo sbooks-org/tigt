@@ -144,6 +144,10 @@ Its [usage guide](https://github.com/sbooks-org/tigt-gfxreader) documents direct
 
 Native snapshots and terminal reconstructions intentionally need not have identical RGB: the terminal uses a finite palette and can apply the user's default foreground/background. Compare against the documented terminal palette policy, not an assumption of lossless display transport.
 
+Display technology can also intentionally change cursor presentation. With `TIGT_DISPLAY_MDA` / `DisplayTechnology::Mda`, initial cursor wandering is hidden in terminal output until the first visibly nonblank text submission. Equal foreground/background RAM fills and un-underlined blanks do not release suppression; an underlined blank with distinct colours does. A cursor flag alone is not first output. Every accepted text submission is observed, including frames too short-lived for the renderer to sample. Later clears and suspend/resume preserve the released latch; only a real technology change or a new session resets it.
+
+Native PNG, ANSI and attributes snapshots keep the original cursor flags and attributes even while the terminal cursor is suppressed. Use attributes captures for source cursor coordinates and terminal replay for what the user actually saw; do not interpret that initial difference as source corruption. Repeating the same technology hint before every frame is safe and does not reset the latch.
+
 ## Test strategy
 
 ```sh

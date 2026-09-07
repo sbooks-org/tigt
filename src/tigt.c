@@ -24,6 +24,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <wchar.h>
+#include <wctype.h>
 
 #define TERMINAL_MAX_COLUMNS 320
 #define TERMINAL_MAX_ROWS 128
@@ -36,6 +37,8 @@ static tigt_text_cell renderer_text_cells[TERMINAL_MAX_CELLS];
 static uint16_t renderer_text_columns;
 static uint16_t renderer_text_rows;
 static tigt_overscan renderer_overscan;
+static uint32_t renderer_display_technology;
+static bool renderer_text_output_seen;
 static uint32_t renderer_bitmap_pixels[640 * 200];
 static uint8_t renderer_bitmap_indices[640 * 200];
 static uint16_t renderer_bitmap_width;
@@ -446,7 +449,7 @@ render_bitmap_graphics(const uint32_t *pixels, uint16_t width, uint16_t height,
 
 
 static void
-render_text(const tigt_text_cell *cells, uint16_t columns, uint16_t rows)
+render_text(const tigt_text_cell *cells, uint16_t columns, uint16_t rows, bool cursor_allowed)
 {
     bool changed = false;
     uint16_t cursor_position = UINT16_MAX;
@@ -485,7 +488,7 @@ render_text(const tigt_text_cell *cells, uint16_t columns, uint16_t rows)
         }
     }
 
-    bool show_cursor = cursor_position != UINT16_MAX;
+    bool show_cursor = cursor_allowed && cursor_position != UINT16_MAX;
 
     if (show_cursor && (changed || !terminal_cursor_position_valid ||
                         cursor_position != terminal_cursor_position)) {
@@ -552,6 +555,8 @@ render_frame(void)
         return;
     }
     const uint64_t frame_serial = renderer_frame_serial;
+    const bool cursor_allowed = renderer_display_technology != TIGT_DISPLAY_MDA ||
+                                renderer_text_output_seen;
     copy_native_frame(&snapshot);
     pthread_mutex_unlock(&renderer_mutex);
 
@@ -559,7 +564,7 @@ render_frame(void)
         render_bitmap_graphics(snapshot.content.pixels, snapshot.width, snapshot.height,
                                snapshot.pixel_width, true);
     else
-        render_text(snapshot.content.cells, snapshot.width, snapshot.height);
+        render_text(snapshot.content.cells, snapshot.width, snapshot.height, cursor_allowed);
     rendered_frame_serial = frame_serial;
 }
 
@@ -764,6 +769,8 @@ tigt_init(const tigt_config *config)
     renderer_has_frame = false;
     renderer_bitmap_valid = false;
     memset(&renderer_overscan, 0, sizeof(renderer_overscan));
+    renderer_display_technology = TIGT_DISPLAY_GENERIC;
+    renderer_text_output_seen = false;
     renderer_frame_serial = 0;
     rendered_frame_serial = 0;
     renderer_initialized = true;
@@ -793,6 +800,8 @@ tigt_shutdown(void)
     renderer_has_frame = false;
     renderer_bitmap_valid = false;
     memset(&renderer_overscan, 0, sizeof(renderer_overscan));
+    renderer_display_technology = TIGT_DISPLAY_GENERIC;
+    renderer_text_output_seen = false;
     memset(&renderer_config, 0, sizeof(renderer_config));
     pthread_mutex_unlock(&renderer_mutex);
 }
@@ -820,6 +829,19 @@ tigt_present_bitmap(const uint32_t *pixels, uint16_t width, uint16_t height,
     renderer_frame_serial++;
     pthread_mutex_unlock(&renderer_mutex);
     return TIGT_OK;
+}
+
+/* Test resolved source cells, not sampled terminal frames or the cursor itself.
+ * Nonbreaking spaces and the empty braille pattern are blank but not iswspace
+ * in every supported locale. Underlining any blank can still make it visible. */
+static bool
+text_cell_has_output(const tigt_text_cell *cell)
+{
+    return cell->foreground != cell->background &&
+           ((cell->flags & TIGT_TEXT_UNDERLINE) != 0 ||
+            (!iswspace((wint_t) cell->codepoint) &&
+             cell->codepoint != 0x00a0 && cell->codepoint != 0x2007 &&
+             cell->codepoint != 0x202f && cell->codepoint != 0x2800));
 }
 
 int
@@ -860,14 +882,42 @@ tigt_present_text(const tigt_text_cell *cells, uint16_t columns, uint16_t rows,
         pthread_mutex_unlock(&renderer_mutex);
         return TIGT_ERROR_BUSY;
     }
-    for (uint16_t row = 0; row < rows; row++)
-        memcpy(renderer_text_cells + (size_t) row * columns, cells + (size_t) row * stride,
-               columns * sizeof(*cells));
+    for (uint16_t row = 0; row < rows; row++) {
+        tigt_text_cell *destination = renderer_text_cells + (size_t) row * columns;
+        memcpy(destination, cells + (size_t) row * stride, columns * sizeof(*cells));
+        if (renderer_display_technology == TIGT_DISPLAY_MDA && !renderer_text_output_seen) {
+            for (uint16_t column = 0; column < columns; column++) {
+                if (text_cell_has_output(&destination[column])) {
+                    renderer_text_output_seen = true;
+                    break;
+                }
+            }
+        }
+    }
     renderer_text_columns = columns;
     renderer_text_rows = rows;
     renderer_bitmap_valid = false;
     renderer_has_frame = true;
     renderer_frame_serial++;
+    pthread_mutex_unlock(&renderer_mutex);
+    return TIGT_OK;
+}
+
+int
+tigt_set_display_technology(uint32_t technology)
+{
+    if (technology != TIGT_DISPLAY_GENERIC && technology != TIGT_DISPLAY_MDA)
+        return TIGT_ERROR_ARGUMENT;
+    pthread_mutex_lock(&renderer_mutex);
+    if (!renderer_active) {
+        pthread_mutex_unlock(&renderer_mutex);
+        return TIGT_ERROR_BUSY;
+    }
+    if (renderer_display_technology != technology) {
+        renderer_display_technology = technology;
+        renderer_text_output_seen = false;
+        renderer_frame_serial++;
+    }
     pthread_mutex_unlock(&renderer_mutex);
     return TIGT_OK;
 }

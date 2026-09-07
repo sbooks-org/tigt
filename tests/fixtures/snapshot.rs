@@ -16,8 +16,8 @@ use std::{
     time::{Duration, Instant},
 };
 use tigt::{
-    Error, Overscan, Session, SnapshotConfig, SnapshotFormat, SnapshotSignal, TEXT_CURSOR,
-    TEXT_UNDERLINE, TextCell,
+    DisplayTechnology, Error, InputKey, InputKind, Overscan, Session, SnapshotConfig,
+    SnapshotFormat, SnapshotSignal, TEXT_CURSOR, TEXT_UNDERLINE, TextCell,
 };
 
 const FORMATS: [(SnapshotFormat, &str); 7] = [
@@ -434,7 +434,105 @@ fn environment_opt_in(directory: &Path) {
     }
 }
 
+fn display_technology(directory: &Path) {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let start = || {
+        let sender = sender.clone();
+        Session::with_input(move |event| {
+            if event.key == InputKey::Char('n') && event.kind == InputKind::Press {
+                sender.send(()).unwrap();
+            }
+        })
+        .unwrap()
+    };
+    let mut session = start();
+    for stage in 0..17 {
+        if stage == 4 || stage == 7 {
+            session.suspend();
+            assert_eq!(
+                session.set_display_technology(DisplayTechnology::Generic),
+                Err(Error::Busy)
+            );
+            session.resume().unwrap();
+        }
+        if stage == 15 || stage == 16 {
+            drop(session);
+            session = start();
+        }
+        if stage == 9 || stage == 13 {
+            session
+                .set_display_technology(DisplayTechnology::Generic)
+                .unwrap();
+        }
+        if stage != 0 && stage != 15 {
+            session
+                .set_display_technology(DisplayTechnology::Mda)
+                .unwrap();
+        }
+        if stage == 2 {
+            let mut rejected = [TextCell::new('X', 0xaaaaaa, 0); 2];
+            rejected[0].flags = TEXT_CURSOR;
+            rejected[1].flags = TEXT_CURSOR;
+            assert_eq!(
+                session.present_text(&rejected, 2, 1, 2),
+                Err(Error::Argument)
+            );
+        }
+        if stage == 3 || stage == 8 {
+            session
+                .present_bitmap(&vec![0; 640 * 200], 640, 200, 640, 2)
+                .unwrap();
+        }
+        if stage != 1 && stage != 12 && stage != 13 {
+            let mut cells = [TextCell::new(' ', 0xaaaaaa, 0); 10];
+            // Unique but invisible: observation can acknowledge the exact
+            // rendered stage without releasing the first-visible-output latch.
+            cells[0] = TextCell::new(char::from(b'a' + stage), 0, 0);
+            cells[4] = TextCell::new('X', 0xaaaaaa, 0);
+            cells[5] = cells[4]; // visible stride padding is not part of the frame
+            if stage == 2 {
+                cells[6..10].fill(TextCell::new('A', 0, 0));
+            }
+            if stage == 3 {
+                for (cell, character) in cells[6..10]
+                    .iter_mut()
+                    .zip(['\u{a0}', '\u{2002}', '\u{202f}', '\u{2800}'])
+                {
+                    cell.codepoint = character as u32;
+                }
+            }
+            if stage == 5 {
+                cells[6].codepoint = 'X' as u32;
+            }
+            if stage == 10 || stage == 11 {
+                cells[6].flags = TEXT_UNDERLINE;
+                if stage == 10 {
+                    cells[6].foreground = 0;
+                }
+            }
+            cells[6 + usize::from(stage % 4)].flags |= TEXT_CURSOR;
+            session.present_text(&cells, 4, 2, 6).unwrap();
+            cells.fill(TextCell::new(' ', 0, 0));
+        }
+        capture(
+            &session,
+            directory,
+            &format!("display-{stage}.json"),
+            SnapshotFormat::Attributes,
+        )
+        .unwrap();
+        receiver.recv_timeout(Duration::from_secs(20)).unwrap();
+    }
+}
+
 fn main() {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--display-tests")) {
+        let directory = std::env::args_os()
+            .nth(2)
+            .expect("display output directory");
+        display_technology(Path::new(&directory));
+        return;
+    }
     let directory = std::env::args_os()
         .nth(1)
         .expect("snapshot fixture OUTPUT_DIRECTORY");

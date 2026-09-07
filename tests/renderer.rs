@@ -602,6 +602,182 @@ fn public_resolved_text_preserves_rgb_flags_transitions_and_nonvisual_overscan()
     );
 }
 
+fn display_frame(stage: usize) -> [tigt::TextCell; 8] {
+    let source_stage = match stage {
+        1 => 0,
+        12 | 13 => 11,
+        _ => stage,
+    };
+    let mut cells = [tigt::TextCell::new(' ', 0xaaaaaa, 0); 8];
+    cells[0] = tigt::TextCell::new(char::from(b'a' + source_stage as u8), 0, 0);
+    match source_stage {
+        2 => cells[4..].fill(tigt::TextCell::new('A', 0, 0)),
+        3 => {
+            for (cell, character) in cells[4..]
+                .iter_mut()
+                .zip(['\u{a0}', '\u{2002}', '\u{202f}', '\u{2800}'])
+            {
+                cell.codepoint = character as u32;
+            }
+        }
+        5 => cells[4].codepoint = 'X' as u32,
+        10 | 11 => {
+            cells[4].flags = tigt::TEXT_UNDERLINE;
+            if source_stage == 10 {
+                cells[4].foreground = 0;
+            }
+        }
+        _ => {}
+    }
+    cells[4 + source_stage % 4].flags |= tigt::TEXT_CURSOR;
+    cells
+}
+
+fn check_display_consumer(fixture: &Fixture, program: &Path, name: &str) {
+    // These are observable policy transitions, not a timing-dependent sequence
+    // of sleeps: each new frame has an invisible marker and is acknowledged.
+    let cursor_visible = [
+        true, false, false, false, false, true, true, true, true, false, false, true, true, false,
+        false, true, false,
+    ];
+    let directory = fixture.path(name);
+    fs::create_dir(&directory).unwrap();
+    let mut stage = 0;
+    fixture.capture_program(
+        program,
+        name,
+        &["--display-tests", directory.to_str().unwrap()],
+        |bytes, master| {
+            if stage == cursor_visible.len() {
+                return Ok(());
+            }
+            let Ok(snapshot) = fs::read(directory.join(format!("display-{stage}.json"))) else {
+                return Ok(());
+            };
+            let Ok(snapshot) = serde_json::from_slice::<serde_json::Value>(&snapshot) else {
+                // The producer can still be writing this stage's snapshot.
+                return Ok(());
+            };
+            let expected = display_frame(stage);
+            let native = snapshot["cells"]
+                .as_array()
+                .ok_or("missing native text cells")?;
+            if native.len() != expected.len()
+                || native.iter().zip(expected).any(|(actual, expected)| {
+                    actual["codepoint"] != expected.codepoint
+                        || actual["foreground"] != expected.foreground
+                        || actual["background"] != expected.background
+                        || actual["flags"] != expected.flags
+                })
+            {
+                return Err(format!(
+                    "stage {stage}: display policy modified native snapshot"
+                ));
+            }
+            let terminal = Terminal::replay(bytes);
+            if !terminal.errors.is_empty() {
+                return Err(format!("display stage {stage}: {:?}", terminal.errors));
+            }
+            let (cells, source) = terminal.cells();
+            if source != "active_alternate" {
+                return Ok(());
+            }
+            for (index, expected) in expected.iter().enumerate() {
+                let actual = &cells[index / 4 * COLS + index % 4];
+                if actual.character as u32 != expected.codepoint
+                    || actual.style.underline != (expected.flags & tigt::TEXT_UNDERLINE != 0)
+                    || actual.style.blink
+                    || actual.style.colors().1 != [0; 3]
+                    // Plain-space foreground is not visible; curses can erase
+                    // those cells without emitting their foreground style.
+                    || (expected.codepoint != ' ' as u32
+                        && (actual.style.colors().0 == actual.style.colors().1)
+                            != (expected.foreground == expected.background))
+                {
+                    return Ok(());
+                }
+            }
+            let cursor = terminal.cursor();
+            let cursor_index = expected
+                .iter()
+                .position(|cell| cell.flags & tigt::TEXT_CURSOR != 0)
+                .unwrap();
+            if cursor.visible != cursor_visible[stage]
+                || (cursor.visible
+                    && (cursor.blinking || cursor.row != 1 || cursor.column != cursor_index % 4))
+            {
+                return Ok(());
+            }
+            master.write_all(b"n").map_err(|error| error.to_string())?;
+            stage += 1;
+            Ok(())
+        },
+    );
+    assert_eq!(
+        stage,
+        cursor_visible.len(),
+        "display transitions were not observed"
+    );
+}
+
+#[test]
+fn c_display_technology_suppresses_only_initial_mda_cursor_and_preserves_native_frames() {
+    let fixture = Fixture::build("session_fixture", true, false);
+    check_display_consumer(&fixture, &fixture.binary, "c-display-technology");
+}
+
+#[cfg(feature = "test-fixtures")]
+#[test]
+fn rust_display_technology_suppresses_only_initial_mda_cursor_and_preserves_native_frames() {
+    let directory = tempfile::Builder::new()
+        .prefix("tigt-display-")
+        .tempdir()
+        .unwrap();
+    let fixture = Fixture {
+        directory: Some(directory),
+        binary: PathBuf::from(env!("CARGO_BIN_EXE_tigt-snapshot-fixture")),
+    };
+    check_display_consumer(&fixture, &fixture.binary, "rust-display-technology");
+}
+
+#[test]
+fn mda_first_output_releases_cursor_even_when_that_frame_is_never_rendered() {
+    let fixture = Fixture::build("renderer_fixture", true, true);
+    let mut acknowledged = false;
+    fixture.capture_observing(
+        "unsampled-output",
+        &["--unsampled-output"],
+        |bytes, master| {
+            if acknowledged {
+                return Ok(());
+            }
+            let terminal = Terminal::replay(bytes);
+            if !terminal.errors.is_empty() {
+                return Err(format!("unsampled output: {:?}", terminal.errors));
+            }
+            let (cells, source) = terminal.cells();
+            let cursor = terminal.cursor();
+            if source == "active_alternate"
+                && cells.iter().all(|cell| cell.character == ' ')
+                && cursor.visible
+                && !cursor.blinking
+                && cursor.row == 0
+                && cursor.column == 3
+            {
+                master
+                    .write_all(b"n\n")
+                    .map_err(|error| error.to_string())?;
+                acknowledged = true;
+            }
+            Ok(())
+        },
+    );
+    assert!(
+        acknowledged,
+        "the unrendered first-output frame did not release the cursor"
+    );
+}
+
 #[test]
 fn public_incremental_parser_preserves_events_without_reserving_controls() {
     let fixture = Fixture::build("input_fixture", false, false);
