@@ -108,7 +108,9 @@ impl Fixture {
             command.arg(root.join("src/tigt.c"));
         }
         if renderer {
-            command.arg(root.join("src/snapshot.c"));
+            command
+                .arg(root.join("src/snapshot.c"))
+                .arg(root.join("src/video.c"));
             let png = pkg_config::Config::new()
                 .cargo_metadata(false)
                 .probe("libpng")
@@ -786,5 +788,59 @@ fn public_incremental_parser_preserves_events_without_reserving_controls() {
         output.status.success(),
         "parser fixture: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn register_adapter_presents_text_and_cga_graphics_through_public_c_api() {
+    let fixture = Fixture::build("video_fixture", true, false);
+    let green = [0, 215, 0, 255].repeat(320 * 200);
+    let red = rendered_rgb(4, 4, 0);
+    let mut stripes = Vec::with_capacity(640 * 200 * 4);
+    for _ in 0..200 {
+        for x in 0..640 {
+            stripes.extend_from_slice(if x % 8 == 0 { &red } else { &[0; 3] });
+            stripes.push(255);
+        }
+    }
+    let mut stage = 0;
+    fixture.capture_observing("register-video", &[], |bytes, master| {
+        if stage == 3 {
+            return Ok(());
+        }
+        let terminal = Terminal::replay(bytes);
+        if !terminal.errors.is_empty() {
+            return Err(format!(
+                "register video stage {stage}: {:?}",
+                terminal.errors
+            ));
+        }
+        let matches = if stage == 0 {
+            let (cells, source) = terminal.cells();
+            source == "active_alternate"
+                && cells[0].character == 'H'
+                && cells[1].character == 'i'
+                && cells[COLS].character == 'R'
+                && cells[0].style.colors() == ([255, 255, 95], [0, 0, 215])
+                && !terminal.cursor().visible
+        } else {
+            let mut dimensions = options();
+            if stage == 2 {
+                dimensions.width = 640;
+            }
+            let expected = if stage == 1 { &green } else { &stripes };
+            tigt_gfxreader::reconstruct(bytes, &dimensions).is_ok_and(|analysis| {
+                analysis.report.success && analysis.rgba.as_slice() == expected.as_slice()
+            })
+        };
+        if matches {
+            master.write_all(b"n").map_err(|error| error.to_string())?;
+            stage += 1;
+        }
+        Ok(())
+    });
+    assert_eq!(
+        stage, 3,
+        "text and both CGA graphics modes must reach the terminal"
     );
 }

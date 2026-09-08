@@ -29,6 +29,15 @@ pub(crate) struct Config {
     pub user: *mut c_void,
 }
 
+#[repr(C)]
+pub(crate) struct VideoFrame {
+    pub kind: u32,
+    pub width: u16,
+    pub height: u16,
+    pub cells: *const crate::TextCell,
+    pub pixels: *const u32,
+}
+
 unsafe extern "C" {
     pub(crate) fn tigt_init(config: *const Config) -> c_int;
     pub(crate) fn tigt_resume() -> c_int;
@@ -66,4 +75,20 @@ unsafe extern "C" {
     pub(crate) fn tigt_input_feed(input: *mut c_void, bytes: *const u8, length: usize);
     pub(crate) fn tigt_input_flush(input: *mut c_void);
     pub(crate) fn tigt_input_destroy(input: *mut c_void);
+    pub(crate) fn tigt_video_create(adapter: u32) -> *mut c_void;
+    pub(crate) fn tigt_video_destroy(video: *mut c_void);
+    pub(crate) fn tigt_video_write(video: *mut c_void, port: u16, value: u8);
+    pub(crate) fn tigt_video_decode(
+        video: *mut c_void,
+        vram: *const u8,
+        length: usize,
+        blink_on: c_int,
+        frame: *mut VideoFrame,
+    ) -> c_int;
+    pub(crate) fn tigt_video_present(
+        video: *mut c_void,
+        vram: *const u8,
+        length: usize,
+        blink_on: c_int,
+    ) -> c_int;
 }

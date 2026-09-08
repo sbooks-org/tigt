@@ -30,7 +30,8 @@ Both repositories are currently private. Development tests require read access t
 
 - One active process-wide curses session; POSIX terminals.
 - Bitmap source frames: 320×200 or 640×200, with horizontal pixel duplication described explicitly. Logical snapshots can be 160×200, 320×200 or 640×200.
-- Text frames: resolved single-column Unicode cells and RGB colours, not CGA/MDA registers or VRAM.
+- Text frames: resolved single-column Unicode cells and RGB colours.
+- Optional register/VRAM adapter: headless MDA/CGA standard text and basic CGA graphics decoding; PCjr exposes CGA compatibility only. C `tigt_video.h` and Rust `tigt::video` need no terminal session for tests.
 - Overscan metadata is retained but not drawn.
 - Optional `keyboard` feature integrates the separate [terminal-to-pc-keyboard](https://github.com/sbooks-org/terminal-to-pc-keyboard) mapper.
 - Snapshot instrumentation is opt-in. No dump signal is installed by default.

@@ -17,6 +17,7 @@ mod input;
 #[cfg(feature = "keyboard")]
 pub mod keyboard;
 mod snapshot;
+pub mod video;
 
 pub use input::{InputDecoder, InputEvent, InputKey, InputKind, ModifierKey, Modifiers};
 pub use snapshot::{SnapshotConfig, SnapshotFormat, SnapshotSignal, SnapshotStatus};

@@ -128,6 +128,62 @@ Examples of logical geometry:
 
 For duplicated input, repeat each logical pixel twice horizontally; snapshots select the first sample in each group. The terminal renderer approximates colours and spatial detail, while native PNG snapshots retain source RGB samples.
 
+## Headless emulator tests
+
+Feed port writes and your emulator's VRAM directly to the optional video adapter. No `tigt_init`, `Session`, terminal, font ROM or locale setup is required to decode a frame.
+
+An ordinary C consumer can test a 40-column CGA display with a nonzero start address:
+
+```c
+#include <tigt_video.h>
+#include <assert.h>
+
+int main(void)
+{
+    uint8_t vram[16384] = {0};
+    vram[2] = 'O'; vram[3] = 0x0f;
+    vram[4] = 'K'; vram[5] = 0x0f;
+    tigt_video *video = tigt_video_create(TIGT_VIDEO_CGA);
+    assert(video != NULL);
+    tigt_video_write(video, 0x3d4, 1);
+    tigt_video_write(video, 0x3d5, 40);
+    tigt_video_write(video, 0x3d4, 13);
+    tigt_video_write(video, 0x3d5, 1);  /* start address is in words */
+    tigt_video_write(video, 0x3d8, 0x28);
+    tigt_video_frame frame;
+    assert(tigt_video_decode(video, vram, sizeof(vram), 1, &frame) == TIGT_OK);
+    assert(frame.kind == TIGT_VIDEO_TEXT && frame.width == 40 && frame.height == 25);
+    assert(frame.cells[0].codepoint == 'O' && frame.cells[1].codepoint == 'K');
+    tigt_video_destroy(video);
+    return 0;
+}
+```
+
+The same operation from Rust:
+
+```rust
+use tigt::video::{AdapterKind, Frame, VideoAdapter};
+
+fn main() -> Result<(), tigt::Error> {
+    let mut video = VideoAdapter::new(AdapterKind::Cga)?;
+    let mut vram = [0u8; 16384];
+    vram[2..6].copy_from_slice(&[b'O', 0x0f, b'K', 0x0f]);
+    for (port, value) in [(0x3d4, 1), (0x3d5, 40),
+                         (0x3d4, 13), (0x3d5, 1), (0x3d8, 0x28)] {
+        video.write(port, value);
+    }
+    let Frame::Text { cells, columns, rows } = video.decode(&vram, true)?
+        else { panic!("expected text"); };
+    assert_eq!((columns, rows), (40, 25));
+    assert_eq!((cells[0].codepoint, cells[1].codepoint), ('O' as u32, 'K' as u32));
+    Ok(())
+}
+```
+
+The returned frame borrows adapter-owned reusable storage, not VRAM. Use `tigt_video_present` or `video.present(&session, &vram, blink_on)` when terminal output is wanted; these submit through the existing renderer and snapshots. The caller controls blink phase, making assertions deterministic. The adapter has no cursor-register support.
+
+MDA accepts an entire 4 KiB aperture and 80×25 text. CGA accepts 16 KiB, 40/80×25 text, and standard 320×200 or 640×200 graphics. PCjr uses the same CGA-compatible ports and the caller-selected 16 KiB bank, not native PCjr extensions. See the [register/VRAM reference](reference.md#registervram-adapter) for addressing, palette and ownership details.
+
 ## Verify a development checkout
 
 ```sh

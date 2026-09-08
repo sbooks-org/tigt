@@ -1,6 +1,6 @@
 # tigt reference
 
-The installed `include/tigt.h` and Rust API documentation are the authoritative declarations. This guide describes the contracts and their interactions.
+The installed `include/tigt.h`, `include/tigt_video.h` and Rust API documentation are the authoritative declarations. This guide describes the contracts and their interactions.
 
 ## Lifecycle and ownership
 
@@ -35,7 +35,7 @@ A 160×200 logical image is supplied as a horizontally duplicated 320×200 sourc
 
 Columns1..320, rows1..128, at most21440 visible cells; stride is in cells and at least columns. Each codepoint must occupy exactly one column according to `wcwidth` in the active locale. Controls, wide characters and standalone combining marks are rejected. CP437 graphical control characters should be mapped through `tigt_cp437_codepoint` / `cp437_codepoint`, not submitted as control scalars.
 
-At most one cell may have the cursor flag. It means a currently visible steady underline cursor; the producer resolves hardware blink timing. The producer also resolves text blink, palette mapping, display enable and any hardware register interpretation. tigt has no CGA/MDA VRAM decoder.
+At most one cell may have the cursor flag. It means a currently visible steady underline cursor; the producer resolves hardware blink timing. Direct frame producers also resolve text blink, palette mapping, display enable and hardware register interpretation. The optional register/VRAM adapter below performs that conversion for a deliberately small MDA/CGA subset.
 
 Text colours use the same 16-colour approximation, but do not reinterpret the producer's attributes as hardware mode bits. Native snapshots retain the original resolved RGB and flags.
 
@@ -48,6 +48,41 @@ Generic is the new-session default and honors the resolved cursor immediately. M
 The latch observes every accepted submission, not just frames sampled by the renderer. After first output, clearing the display does not hide subsequent cursors. Bitmap submissions neither release nor reset the latch. Native snapshots always retain the exact source cursor flags, coordinates and attributes.
 
 Set the hint before submitting that technology's frame, and serialize hints with submissions when ordering matters. An actual technology change resets the latch and redraws the retained frame even without another submission; a repeated identical hint does nothing. The hint and latch survive suspend/resume; shutdown/init reset them to Generic. Setting requires an active session (`BUSY` otherwise); unsupported C values return `ARGUMENT` without altering state.
+
+## Register/VRAM adapter
+
+Include `tigt_video.h` in C, or use `tigt::video::{AdapterKind, VideoAdapter, Frame}` in Rust. The decoder is independent of terminal sessions: tests can inspect resolved cells or RGB pixels without curses initialization, a TTY, a font ROM or a locale. It is available with no Cargo features enabled.
+
+| C | Rust | Purpose |
+|---|---|---|
+| `tigt_video_create(adapter)` | `VideoAdapter::new(kind)` | Own register state and reusable frame storage. |
+| `tigt_video_write(video,port,value)` | `adapter.write(port,value)` | Feed relevant byte-sized output-port writes. |
+| `tigt_video_decode(video,vram,length,blink_on,&frame)` | `adapter.decode(vram,blink_on)` | Decode synchronously, without a terminal. |
+| `tigt_video_present(video,vram,length,blink_on)` | `adapter.present(&session,vram,blink_on)` | Decode, select display technology and submit to the existing renderer. |
+| `tigt_video_destroy(video)` | `Drop` | Release state and frame storage. |
+
+Adapters are `TIGT_VIDEO_MDA`, `TIGT_VIDEO_CGA`, `TIGT_VIDEO_PCJR` / `AdapterKind::{Mda,Cga,Pcjr}`. Each decoder is externally serialized in C; Rust uses mutable borrows. Presenting requires an active session and follows its lifecycle rules. Presentation does not change overscan metadata.
+
+### Supported registers and modes
+
+- MDA: mirrored CRTC index/data ports `3B0h..3B7h`, mode control `3B8h`.
+- CGA and the PCjr CGA-compatible view: mirrored index/data ports `3D0h..3D7h`, mode control `3D8h`, color select `3D9h`.
+- Only CRTC `01h` (displayed row width) and `0Ch/0Dh` (14-bit word start address) are tracked. Other writes are ignored. There is no register-read API, cursor emulation, timing, scrolling logic beyond start-address interpretation, or overscan.
+- Text is always 25 rows: MDA requires 80 columns; CGA/PCjr accepts 40 or 80, selected by CRTC `01h`. Mode bit 0's dot-clock effect is outside this decoder. Nonstandard widths return `ARGUMENT`.
+- Mode bit 3 controls video enable; disabled output is black. CGA/PCjr mode bit 1 selects graphics, and bit 4 selects 640×200 1bpp instead of 320×200 2bpp. Both standard graphics modes require CRTC `01h = 40`, use 80 bytes per scanline and MSB-left pixels.
+- Mode bit 5 enables text blink: bit 7 of a CGA attribute then selects blinking instead of a bright background. `blink_on` is the caller-selected visible phase; no clock or blink timer is created. MDA resolves normal/intense, blank, underline and reverse-video attributes; disabling MDA blink does not create CGA colors.
+- CGA 320×200 color selection: low four bits choose pixel 0, bit 4 selects intensity, bit 5 chooses green/red/brown versus cyan/magenta/white. Mode bit 2 overrides the latter choice with cyan/red/white. In 640×200 mode, the low four bits choose the foreground against black. No composite artifact colors are decoded.
+- PCjr offers this **CGA-compatible interface only**, not native gate-array or paging registers, programmable palettes, or additional video modes. The emulator supplies its selected 16 KiB bank.
+
+### Memory and frame ownership
+
+Pass the complete aperture beginning at its video-memory base: at least 4096 bytes for MDA, or 16384 for CGA/PCjr. The decoder does not own or intercept guest memory writes. Extra input bytes are ignored; the input is never retained. Text addresses wrap within that aperture. CGA graphics use odd/even 8 KiB banks, with start address and row offsets wrapping within each bank.
+
+`tigt_video_frame` is tagged `TIGT_VIDEO_TEXT` or `TIGT_VIDEO_BITMAP`. Width/height are cells for text, pixels for bitmaps. Its active `cells` or `pixels` pointer is contiguous; the other is NULL. Rust returns corresponding `Frame::Text` or `Frame::Bitmap` slices. Graphics are compact 320×200 or 640×200 RGB frames, presented with `pixel_width = 1`; there is no horizontal staging expansion.
+
+Decoded storage belongs to the adapter and is valid until its next decode/present or destruction. Rust enforces that lifetime. Input VRAM can be changed or released immediately after decoding. Storage grows only when necessary and is reused; there is no per-frame allocation once capacity is sufficient. Argument/allocation errors leave the C output descriptor unchanged.
+
+Creation starts with 80-column text, start address zero, video/blink disabled, color zero and CRTC index zero. Invalid C adapter kinds return NULL with `errno = EINVAL`; allocation failure returns NULL/`ENOMEM` or `SYSTEM` during decode. See [Getting started](getting-started.md#headless-emulator-tests) for a terminal-free consumer.
 
 ## Overscan
 

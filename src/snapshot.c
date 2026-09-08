@@ -10,6 +10,7 @@
 #endif
 
 #include "snapshot.h"
+#include "palette.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -209,18 +210,12 @@ cp437_glyph(uint32_t codepoint, uint8_t *glyph)
 static uint8_t
 ibm16_color(uint32_t color)
 {
-    static const uint32_t palette[16] = {
-        0x000000, 0x0000aa, 0x00aa00, 0x00aaaa,
-        0xaa0000, 0xaa00aa, 0xaa5500, 0xaaaaaa,
-        0x555555, 0x5555ff, 0x55ff55, 0x55ffff,
-        0xff5555, 0xff55ff, 0xffff55, 0xffffff
-    };
     uint32_t best_distance = UINT32_MAX;
     uint8_t best = 0;
     for (uint8_t index = 0; index < 16; index++) {
-        const int red = (int) ((color >> 16) & 255) - (int) ((palette[index] >> 16) & 255);
-        const int green = (int) ((color >> 8) & 255) - (int) ((palette[index] >> 8) & 255);
-        const int blue = (int) (color & 255) - (int) (palette[index] & 255);
+        const int red = (int) ((color >> 16) & 255) - (int) ((tigt_ibm16_palette[index] >> 16) & 255);
+        const int green = (int) ((color >> 8) & 255) - (int) ((tigt_ibm16_palette[index] >> 8) & 255);
+        const int blue = (int) (color & 255) - (int) (tigt_ibm16_palette[index] & 255);
         const uint32_t distance = red * red + green * green + blue * blue;
         if (distance < best_distance) {
             best_distance = distance;
