@@ -340,3 +340,133 @@ fn decoded_frame_does_not_borrow_or_retain_source_vram() {
     };
     assert_eq!(text(frame).0[0], TextCell::new('X', 0xaaaaaa, 0));
 }
+
+#[test]
+fn explicit_text_geometry_wraps_apertures_and_uses_twenty_cell_rows() {
+    for (kind, base, aperture) in [
+        (AdapterKind::Mda, 0x3b0, 4096),
+        (AdapterKind::Cga, 0x3d0, 16384),
+        (AdapterKind::Pcjr, 0x3d0, 16384),
+    ] {
+        let mut video = VideoAdapter::new(kind).unwrap();
+        let mut vram = vec![0; aperture + 2];
+        cell(&mut vram, aperture - 2, b'A', 0x07);
+        cell(&mut vram, 0, 0xc4, 0x07);
+        cell(&mut vram, 38, b'B', 0x0f);
+        cell(&mut vram, 116, b'Z', 0x07);
+        cell(&mut vram, 158, b'C', 0x07);
+        cell(&mut vram, aperture, b'!', 0x07); // Not part of the aperture.
+        let start = (aperture / 2 - 1) as u16;
+        crtc(&mut video, base, 0x0c, (start >> 8) as u8);
+        crtc(&mut video, base, 0x0d, start as u8);
+        video.write(base + 8, 0x08);
+
+        let (cells, columns, rows) = text(video.decode_text(&vram, 20, 3, true).unwrap());
+        assert_eq!((columns, rows), (20, 3));
+        assert_eq!(cells.len(), 60);
+        assert_eq!(cells[0], TextCell::new('A', 0xaaaaaa, 0));
+        assert_eq!(cells[1], TextCell::new('\u{2500}', 0xaaaaaa, 0));
+        assert_eq!(cells[20], TextCell::new('B', 0xffffff, 0));
+        assert_eq!(cells[59], TextCell::new('Z', 0xaaaaaa, 0));
+
+        // Explicit dimensions must not alter the old API's register geometry.
+        let (cells, columns, rows) = text(video.decode(&vram, true).unwrap());
+        assert_eq!((columns, rows), (80, 25));
+        assert_eq!(cells[80], TextCell::new('C', 0xaaaaaa, 0));
+        crtc(&mut video, base, 1, 20);
+        assert!(matches!(video.decode(&vram, true), Err(Error::Argument)));
+        assert_eq!(
+            text(video.decode_text(&vram, 20, 3, true).unwrap()).0[20],
+            TextCell::new('B', 0xffffff, 0)
+        );
+        assert!(matches!(video.decode(&vram, true), Err(Error::Argument)));
+    }
+}
+
+#[test]
+fn explicit_text_geometry_enforces_bounds_and_recovers_from_invalid_input() {
+    let mut video = VideoAdapter::new(AdapterKind::Cga).unwrap();
+    let mut vram = [0; 16384];
+    cell(&mut vram, 2, b'X', 0x1f);
+    crtc(&mut video, 0x3d4, 0x0d, 1);
+    video.write(0x3d8, 0x08);
+    // Maximum width and cell count; output wraps more than once through VRAM.
+    let last_address = ((1 + 21439) * 2) & 0x3fff;
+    cell(&mut vram, last_address, b'Z', 0x07);
+    let (cells, columns, rows) = text(video.decode_text(&vram, 320, 67, true).unwrap());
+    assert_eq!((columns, rows), (320, 67));
+    assert_eq!(cells.len(), 21440);
+    assert_eq!(cells[21439], TextCell::new('Z', 0xaaaaaa, 0));
+
+    for (columns, rows) in [(0, 3), (20, 0), (321, 1), (1, 129), (168, 128)] {
+        assert!(matches!(
+            video.decode_text(&vram, columns, rows, true),
+            Err(Error::Argument)
+        ));
+    }
+    assert!(matches!(
+        video.decode_text(&vram[..16383], 20, 3, true),
+        Err(Error::Argument)
+    ));
+    video.write(0x3d8, 0x0a);
+    assert!(matches!(
+        video.decode_text(&vram, 20, 3, true),
+        Err(Error::Argument)
+    ));
+    // The rejected text call must not switch graphics off or change CRTC width.
+    crtc(&mut video, 0x3d4, 1, 40);
+    vram[2] = 0x40;
+    assert_eq!(
+        &bitmap(video.decode(&vram, true).unwrap()).0[..4],
+        &[0x00aa00, 0, 0, 0]
+    );
+    cell(&mut vram, 2, b'X', 0x1f);
+    video.write(0x3d8, 0x08);
+    let (cells, columns, rows) = text(video.decode_text(&vram, 1, 128, true).unwrap());
+    assert_eq!((columns, rows), (1, 128));
+    assert_eq!(cells[0], TextCell::new('X', 0xffffff, 0x0000aa));
+
+    let mut mda = VideoAdapter::new(AdapterKind::Mda).unwrap();
+    mda.write(0x3b8, 0x0a); // MDA has no graphics-mode bit.
+    assert!(matches!(
+        mda.decode_text(&vram[..4095], 20, 3, true),
+        Err(Error::Argument)
+    ));
+    assert_eq!(
+        text(mda.decode_text(&vram[..4096], 20, 3, true).unwrap()).0[1],
+        TextCell::new('X', 0xffffff, 0)
+    );
+}
+
+#[test]
+fn explicit_text_frame_owns_decoded_cells_and_resolves_enable_and_blink() {
+    let mut video = VideoAdapter::new(AdapterKind::Cga).unwrap();
+    video.write(0x3d8, 0x28);
+    let frame = {
+        let mut vram = [0; 16384];
+        cell(&mut vram, 0, b'X', 0x9e);
+        let frame = video.decode_text(&vram, 20, 3, false).unwrap();
+        vram.fill(0);
+        frame
+    };
+    assert_eq!(text(frame).0[0], TextCell::new('X', 0x0000aa, 0x0000aa));
+
+    let mut vram = [0; 16384];
+    cell(&mut vram, 0, b'X', 0x9e);
+    assert_eq!(
+        text(video.decode_text(&vram, 20, 3, true).unwrap()).0[0],
+        TextCell::new('X', 0xffff55, 0x0000aa)
+    );
+    video.write(0x3d8, 0x20);
+    assert!(
+        text(video.decode_text(&vram, 20, 3, true).unwrap())
+            .0
+            .iter()
+            .all(|cell| *cell == TextCell::new(' ', 0, 0))
+    );
+    video.write(0x3d8, 0x08);
+    assert_eq!(
+        text(video.decode_text(&vram, 20, 3, false).unwrap()).0[0],
+        TextCell::new('X', 0xffff55, 0x5555ff)
+    );
+}

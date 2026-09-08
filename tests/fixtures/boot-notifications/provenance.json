@@ -1,0 +1,697 @@
+{
+  "format": "JSONL ordered int and frame events; frame repeat preserves every vsync; initial full VRAM plus lossless patches. No guest disk or ROM included. Scrolling JSONL fixtures are stored in deterministic gzip containers; compact_trace hashes describe the uncompressed original JSONL and gzip_trace hashes describe the stored container.",
+  "cases": [
+    {
+      "scenario": "dos100-xt",
+      "dos": "PC DOS 1.00",
+      "machine": "xt",
+      "machine_bios": "ibm5160_1501512_5000027 (1982-11-08)",
+      "video": "CGA",
+      "source_image": "DOS100RETAIL.IMG",
+      "source_image_sha256": "f93c8d8c659523b94c0ac31ebe1f65f6ca8902ac47a623eeb3842a90d5eea222",
+      "binary_sha256": "087c7e390d11b5193b85d2124b2d67963697cfe2c0e97299d435312fecaa36cd",
+      "counts": {
+        "int": 1106,
+        "frame": 1677
+      },
+      "endpoint": "Stable A> prompt; ordinary tty date/time input; host stop after exact owned process verification, not guest poweroff.",
+      "raw_trace": {
+        "sha256": "3e5394ab387bd480e7c17d7ed9bb496772b6e5d6371f02d18099d401c335801a",
+        "size": 55498580
+      },
+      "compact_trace": {
+        "sha256": "e2b7f615c2a346077aee135b885c64461f11e925c2ee0e631bd2b11656890512",
+        "size": 538366
+      },
+      "oracle": "Decoded captured VRAM/CRTC through pre-notification tigt, reviewed against actual captured terminal screen; not interrupt argument concatenation.",
+      "stdout_sha256": "0a1b654bb02f8fc601555dc40099e85cd15937321834ed85c993f437fee81477"
+    },
+    {
+      "scenario": "dos100-5150",
+      "dos": "PC DOS 1.00",
+      "machine": "5150",
+      "machine_bios": "ibm5150_5700671 (1981-10-19)",
+      "video": "CGA",
+      "source_image": "DOS100RETAIL.IMG",
+      "source_image_sha256": "f93c8d8c659523b94c0ac31ebe1f65f6ca8902ac47a623eeb3842a90d5eea222",
+      "binary_sha256": "087c7e390d11b5193b85d2124b2d67963697cfe2c0e97299d435312fecaa36cd",
+      "counts": {
+        "int": 476,
+        "frame": 1072
+      },
+      "endpoint": "Stable A> prompt; ordinary tty date/time input; host stop after exact owned process verification, not guest poweroff.",
+      "raw_trace": {
+        "sha256": "6b61ed8393f4eb0c4bfa77f65c59c403c2a0bc3d6487b889a65a0e797ff7f4a7",
+        "size": 35422934
+      },
+      "compact_trace": {
+        "sha256": "7673534eba5d8d54dc435779d4e93020a8142727b75cc075f1b952a0b1a8fbb6",
+        "size": 374421
+      },
+      "oracle": "Decoded captured VRAM/CRTC through pre-notification tigt, reviewed against actual captured terminal screen; not interrupt argument concatenation.",
+      "stdout_sha256": "0e937a000e5fb9e404a8596b1c40d66843f0aacf354ee217d901959ba9e687df"
+    },
+    {
+      "scenario": "dos210-xt",
+      "dos": "PC DOS 2.10",
+      "machine": "xt",
+      "machine_bios": "ibm5160_1501512_5000027 (1982-11-08)",
+      "video": "CGA",
+      "source_image": "DOS210_360K.IMG",
+      "source_image_sha256": "8064c0de9289d8be56a4567a1455ab0ae44a98ed76735a3837f062f71cad3e38",
+      "binary_sha256": "087c7e390d11b5193b85d2124b2d67963697cfe2c0e97299d435312fecaa36cd",
+      "counts": {
+        "int": 1512,
+        "frame": 1877
+      },
+      "endpoint": "Stable A> prompt; ordinary tty date/time input; host stop after exact owned process verification, not guest poweroff.",
+      "raw_trace": {
+        "sha256": "40ce1dc340c1e6c991588eb5c0769c4710af7fa3a525735df27fc4ae59b815e4",
+        "size": 62184588
+      },
+      "compact_trace": {
+        "sha256": "35eb0a34153efc8e131d90d4544b0d7285141d660ea4f4a17522be8f86c3caf3",
+        "size": 643100
+      },
+      "oracle": "Decoded captured VRAM/CRTC through pre-notification tigt, reviewed against actual captured terminal screen; not interrupt argument concatenation.",
+      "stdout_sha256": "4460d740f2300ab3503ddf096334d6da2e580ffd9321d7b0ef04cc4426503fa7"
+    },
+    {
+      "scenario": "dos210-5150",
+      "dos": "PC DOS 2.10",
+      "machine": "5150",
+      "machine_bios": "ibm5150_5700671 (1981-10-19)",
+      "video": "CGA",
+      "source_image": "DOS210_360K.IMG",
+      "source_image_sha256": "8064c0de9289d8be56a4567a1455ab0ae44a98ed76735a3837f062f71cad3e38",
+      "binary_sha256": "087c7e390d11b5193b85d2124b2d67963697cfe2c0e97299d435312fecaa36cd",
+      "counts": {
+        "int": 882,
+        "frame": 1245
+      },
+      "endpoint": "Stable A> prompt; ordinary tty date/time input; host stop after exact owned process verification, not guest poweroff.",
+      "raw_trace": {
+        "sha256": "78ae8b743394f596cdb74f4f1a1db63b78111545a50af98343a49180082348d2",
+        "size": 41219330
+      },
+      "compact_trace": {
+        "sha256": "42b945041b7e339411d2bcbc5c2f6b897a3bc61728cd09167b318c1ce2b6a339",
+        "size": 479384
+      },
+      "oracle": "Decoded captured VRAM/CRTC through pre-notification tigt, reviewed against actual captured terminal screen; not interrupt argument concatenation.",
+      "stdout_sha256": "6da908ccc8beb29ca133f3e2647e268b265b3ee29d6a4b50ceb1bc13b89c3242"
+    },
+    {
+      "dos": "PC DOS 1.00",
+      "machine": "xt",
+      "machine_bios": "ibm5160_1501512_5000027 (1982-11-08)",
+      "video": "CGA",
+      "source_image": "DOS100RETAIL.IMG",
+      "source_image_sha256": "f93c8d8c659523b94c0ac31ebe1f65f6ca8902ac47a623eeb3842a90d5eea222",
+      "scenario": "dos100-xt-scroll",
+      "binary_sha256": "c5b7b960558878dac6ad94886cd1f227611cdd1c98f2ba0007bc43f6e5d80a5f",
+      "counts": {
+        "int": 57837,
+        "frame": 4810
+      },
+      "endpoint": "DIR four times, literal CLS, DIR four times; fresh stable A> after every command; ordinary paced tty input; verified exact owned host stop, not guest poweroff.",
+      "raw_trace": {
+        "sha256": "3daea9d0d79b4af36408b5c531ef7a471d82c5819d344af9e26723b408b84923",
+        "size": 172346401
+      },
+      "compact_trace": {
+        "sha256": "b92d4482a3ef2b28af4513a6f9693a1d5bbbbeb37cb9eb4e22fc9ea0c754c2a9",
+        "size": 15487439
+      },
+      "oracle": "Real tigt Presenter replay with notifications disabled; identical ordered VRAM/CRTC snapshots and every repeated vsync. Reviewed against raw captured screens: every one of 38 distinct directory rows is witnessed in VRAM and occurs eight times in the glass transcript. No interrupt arguments used as output.",
+      "oracle_mode": "snapshot",
+      "stdout_sha256": "783702991995c921611135e63807f1a9da6dee4263386908b5da2e5afcfb8c1e",
+      "source_capture_directory": "/Users/josh/src/JoshRodd/86Box-contributions-2/work/boot-notifications/dos100-xt/capture",
+      "cls_outcome": "Unsupported: Bad command or file name; listing remains visible.",
+      "scroll_witness_policy": "Raw snapshots within 12 vsync frames retain display rows shifted upward 1..5 rows, ignoring the bottom two actively written rows; at least four matching nonblank rows required. Window permits observable intermediate BIOS copy states. Witness ranges do not overlap.",
+      "scroll_witnesses_by_stage": {
+        "1": 21,
+        "2": 40,
+        "3": 40,
+        "4": 40,
+        "5": 3,
+        "6": 40,
+        "7": 40,
+        "8": 40,
+        "9": 40
+      },
+      "stages": [
+        {
+          "label": "boot-prompt",
+          "command": null,
+          "seq": 2692,
+          "cursor": 402,
+          "command_started_seq": null,
+          "command_enter_seq": null,
+          "screen_sha256": "227628e2038cd2b60c0944eea7676e41cb677af18e0d774450467eab7cd3b2e3",
+          "snapshot_sha256": "4e899a5e7662b6742c9298588bd91000ee68f038086700a41759cfd082df87d3"
+        },
+        {
+          "label": "01-dir",
+          "command": "DIR",
+          "seq": 10069,
+          "cursor": 1922,
+          "command_started_seq": 2692,
+          "command_enter_seq": 2733,
+          "screen_sha256": "27e9c7631ed1bdb55d8a53a480428eb06cb9c483fc59323818321d7dc627fc65",
+          "snapshot_sha256": "51e5445f5fd6de61cb92561cbdd799ed781c94b48220a955f8e070ecb06a0410"
+        },
+        {
+          "label": "02-dir",
+          "command": "DIR",
+          "seq": 17508,
+          "cursor": 1922,
+          "command_started_seq": 10069,
+          "command_enter_seq": 10107,
+          "screen_sha256": "27e9c7631ed1bdb55d8a53a480428eb06cb9c483fc59323818321d7dc627fc65",
+          "snapshot_sha256": "548487d6c041b281ac9f587a62a0c1b79be67dc2938a734f31d5ad2c9970b421"
+        },
+        {
+          "label": "03-dir",
+          "command": "DIR",
+          "seq": 24959,
+          "cursor": 1922,
+          "command_started_seq": 17508,
+          "command_enter_seq": 17547,
+          "screen_sha256": "27e9c7631ed1bdb55d8a53a480428eb06cb9c483fc59323818321d7dc627fc65",
+          "snapshot_sha256": "81e81c98d391547595785df9ab1efa11fe0ae21c96157075796abb372fc9f599"
+        },
+        {
+          "label": "04-dir",
+          "command": "DIR",
+          "seq": 32412,
+          "cursor": 1922,
+          "command_started_seq": 24959,
+          "command_enter_seq": 24998,
+          "screen_sha256": "27e9c7631ed1bdb55d8a53a480428eb06cb9c483fc59323818321d7dc627fc65",
+          "snapshot_sha256": "cd23063299ad403df2a1a80ec7e9b38f7eb6bb766e3771b5f605fa5d8883703c"
+        },
+        {
+          "label": "05-cls",
+          "command": "CLS",
+          "seq": 32872,
+          "cursor": 1922,
+          "command_started_seq": 32412,
+          "command_enter_seq": 32451,
+          "screen_sha256": "49bcc4d5b9914416681dc15edbfa31f0a8c61bc6ea98130d3db7cb47c324cfd7",
+          "snapshot_sha256": "c9b46479fa4332f31cc1fdb93a90366e5475cf0ee283221ea679889d9f6245d1"
+        },
+        {
+          "label": "06-dir",
+          "command": "DIR",
+          "seq": 40325,
+          "cursor": 1922,
+          "command_started_seq": 32872,
+          "command_enter_seq": 32912,
+          "screen_sha256": "27e9c7631ed1bdb55d8a53a480428eb06cb9c483fc59323818321d7dc627fc65",
+          "snapshot_sha256": "180ccfa03f6eddd103ab50951ab98631bc895e1293ded5e0b90e2acfed651fbf"
+        },
+        {
+          "label": "07-dir",
+          "command": "DIR",
+          "seq": 47768,
+          "cursor": 1922,
+          "command_started_seq": 40325,
+          "command_enter_seq": 40365,
+          "screen_sha256": "27e9c7631ed1bdb55d8a53a480428eb06cb9c483fc59323818321d7dc627fc65",
+          "snapshot_sha256": "3b2ffcef034b9850bb1900cc817932326093087925da277a396fe0b6372f45c6"
+        },
+        {
+          "label": "08-dir",
+          "command": "DIR",
+          "seq": 55205,
+          "cursor": 1922,
+          "command_started_seq": 47768,
+          "command_enter_seq": 47806,
+          "screen_sha256": "27e9c7631ed1bdb55d8a53a480428eb06cb9c483fc59323818321d7dc627fc65",
+          "snapshot_sha256": "e7eb8a6871d3b597835436373abfbb2cbfafc96592535e1d509838f65fa7c3c4"
+        },
+        {
+          "label": "09-dir",
+          "command": "DIR",
+          "seq": 62644,
+          "cursor": 1922,
+          "command_started_seq": 55205,
+          "command_enter_seq": 55244,
+          "screen_sha256": "27e9c7631ed1bdb55d8a53a480428eb06cb9c483fc59323818321d7dc627fc65",
+          "snapshot_sha256": "662315cab9e89b0cc4c1e9185c2014a482e16950c21b27447c1a8ebe1713e073"
+        }
+      ],
+      "gzip_trace": {
+        "file": "dos100-xt-scroll.jsonl.gz",
+        "sha256": "f31e6374cdc3bd2f26bcb5cf697b96ada34cb74d425fcab334f26eac5a96d720",
+        "size": 1278816,
+        "uncompressed_sha256": "b92d4482a3ef2b28af4513a6f9693a1d5bbbbeb37cb9eb4e22fc9ea0c754c2a9"
+      }
+    },
+    {
+      "dos": "PC DOS 1.00",
+      "machine": "5150",
+      "machine_bios": "ibm5150_5700671 (1981-10-19)",
+      "video": "CGA",
+      "source_image": "DOS100RETAIL.IMG",
+      "source_image_sha256": "f93c8d8c659523b94c0ac31ebe1f65f6ca8902ac47a623eeb3842a90d5eea222",
+      "scenario": "dos100-5150-scroll",
+      "binary_sha256": "c5b7b960558878dac6ad94886cd1f227611cdd1c98f2ba0007bc43f6e5d80a5f",
+      "counts": {
+        "int": 57207,
+        "frame": 4171
+      },
+      "endpoint": "DIR four times, literal CLS, DIR four times; fresh stable A> after every command; ordinary paced tty input; verified exact owned host stop, not guest poweroff.",
+      "raw_trace": {
+        "sha256": "d4a0118f18b863538237147650dc76eca1297a397597ae53f104762899591da5",
+        "size": 151080435
+      },
+      "compact_trace": {
+        "sha256": "97ccb3bc79835ee1251ca059085c42f39625cc493cfff44b0ea9e20274fb6ad8",
+        "size": 15244381
+      },
+      "oracle": "Real tigt Presenter replay with notifications disabled; identical ordered VRAM/CRTC snapshots and every repeated vsync. Reviewed against raw captured screens: every one of 38 distinct directory rows is witnessed in VRAM and occurs eight times in the glass transcript. No interrupt arguments used as output.",
+      "oracle_mode": "snapshot",
+      "stdout_sha256": "93a4ce87cf631dabcb0ae12c0dd5c506ca305cba42e74878588f414ceeb5585d",
+      "source_capture_directory": "/Users/josh/src/JoshRodd/86Box-contributions-2/work/boot-notifications/dos100-5150/capture",
+      "cls_outcome": "Unsupported: Bad command or file name; listing remains visible.",
+      "scroll_witness_policy": "Raw snapshots within 12 vsync frames retain display rows shifted upward 1..5 rows, ignoring the bottom two actively written rows; at least four matching nonblank rows required. Window permits observable intermediate BIOS copy states. Witness ranges do not overlap.",
+      "scroll_witnesses_by_stage": {
+        "1": 21,
+        "2": 40,
+        "3": 40,
+        "4": 40,
+        "5": 3,
+        "6": 40,
+        "7": 40,
+        "8": 40,
+        "9": 40
+      },
+      "stages": [
+        {
+          "label": "boot-prompt",
+          "command": null,
+          "seq": 1456,
+          "cursor": 402,
+          "command_started_seq": null,
+          "command_enter_seq": null,
+          "screen_sha256": "227628e2038cd2b60c0944eea7676e41cb677af18e0d774450467eab7cd3b2e3",
+          "snapshot_sha256": "e6bc64079ba635fadfcc2b5f3ccc19916631ef4a6fa604c3d3a23bdb17333326"
+        },
+        {
+          "label": "01-dir",
+          "command": "DIR",
+          "seq": 8834,
+          "cursor": 1922,
+          "command_started_seq": 1456,
+          "command_enter_seq": 1498,
+          "screen_sha256": "27e9c7631ed1bdb55d8a53a480428eb06cb9c483fc59323818321d7dc627fc65",
+          "snapshot_sha256": "d7c1c7da9526b866de17c6737eedeffd85ef23c64a59f2f5c6b5c2e2b37eccc9"
+        },
+        {
+          "label": "02-dir",
+          "command": "DIR",
+          "seq": 16276,
+          "cursor": 1922,
+          "command_started_seq": 8834,
+          "command_enter_seq": 8873,
+          "screen_sha256": "27e9c7631ed1bdb55d8a53a480428eb06cb9c483fc59323818321d7dc627fc65",
+          "snapshot_sha256": "f2d5c2063555c70688e9f5be706ce238a10a17e19edbc454575dda85c8e5c31f"
+        },
+        {
+          "label": "03-dir",
+          "command": "DIR",
+          "seq": 23717,
+          "cursor": 1922,
+          "command_started_seq": 16276,
+          "command_enter_seq": 16317,
+          "screen_sha256": "27e9c7631ed1bdb55d8a53a480428eb06cb9c483fc59323818321d7dc627fc65",
+          "snapshot_sha256": "ca8a46aadc4fa602bba7870d340edc341bd6dba95af515b531c72852a58e764c"
+        },
+        {
+          "label": "04-dir",
+          "command": "DIR",
+          "seq": 31154,
+          "cursor": 1922,
+          "command_started_seq": 23717,
+          "command_enter_seq": 23756,
+          "screen_sha256": "27e9c7631ed1bdb55d8a53a480428eb06cb9c483fc59323818321d7dc627fc65",
+          "snapshot_sha256": "ae3464af7b0bcf7dca75895807ff82befae6e0b7648643de34e0c0487ef52e6e"
+        },
+        {
+          "label": "05-cls",
+          "command": "CLS",
+          "seq": 31616,
+          "cursor": 1922,
+          "command_started_seq": 31154,
+          "command_enter_seq": 31192,
+          "screen_sha256": "49bcc4d5b9914416681dc15edbfa31f0a8c61bc6ea98130d3db7cb47c324cfd7",
+          "snapshot_sha256": "1a867e618e2ba37e0051b6e701fd499e7e1398772ffd5e88a2e8768573d44b67"
+        },
+        {
+          "label": "06-dir",
+          "command": "DIR",
+          "seq": 39058,
+          "cursor": 1922,
+          "command_started_seq": 31616,
+          "command_enter_seq": 31655,
+          "screen_sha256": "27e9c7631ed1bdb55d8a53a480428eb06cb9c483fc59323818321d7dc627fc65",
+          "snapshot_sha256": "ef68298e952d378d2ab199845222046646db1b053c94d1d126596cc5c4c1cbb1"
+        },
+        {
+          "label": "07-dir",
+          "command": "DIR",
+          "seq": 46495,
+          "cursor": 1922,
+          "command_started_seq": 39058,
+          "command_enter_seq": 39095,
+          "screen_sha256": "27e9c7631ed1bdb55d8a53a480428eb06cb9c483fc59323818321d7dc627fc65",
+          "snapshot_sha256": "1db641d36c409ae820784ae414856261ad3a0d1a0b110b99158caeef07beeba1"
+        },
+        {
+          "label": "08-dir",
+          "command": "DIR",
+          "seq": 53934,
+          "cursor": 1922,
+          "command_started_seq": 46495,
+          "command_enter_seq": 46532,
+          "screen_sha256": "27e9c7631ed1bdb55d8a53a480428eb06cb9c483fc59323818321d7dc627fc65",
+          "snapshot_sha256": "e747e8a7c8e45a2dac134c098a30ba2696da2af8c75edcf7f931e633b434a559"
+        },
+        {
+          "label": "09-dir",
+          "command": "DIR",
+          "seq": 61374,
+          "cursor": 1922,
+          "command_started_seq": 53934,
+          "command_enter_seq": 53975,
+          "screen_sha256": "27e9c7631ed1bdb55d8a53a480428eb06cb9c483fc59323818321d7dc627fc65",
+          "snapshot_sha256": "30071b18d10fc316fda3355217d905382affc8326ca2ea39ad3f82ad1d5c703c"
+        }
+      ],
+      "gzip_trace": {
+        "file": "dos100-5150-scroll.jsonl.gz",
+        "sha256": "8d72a3c35e81e65cc9f7a5fb6279c36cf4b7ccef7350da18d29715536110c82c",
+        "size": 1267004,
+        "uncompressed_sha256": "97ccb3bc79835ee1251ca059085c42f39625cc493cfff44b0ea9e20274fb6ad8"
+      }
+    },
+    {
+      "dos": "PC DOS 2.10",
+      "machine": "xt",
+      "machine_bios": "ibm5160_1501512_5000027 (1982-11-08)",
+      "video": "CGA",
+      "source_image": "DOS210_360K.IMG",
+      "source_image_sha256": "8064c0de9289d8be56a4567a1455ab0ae44a98ed76735a3837f062f71cad3e38",
+      "scenario": "dos210-xt-scroll",
+      "binary_sha256": "c5b7b960558878dac6ad94886cd1f227611cdd1c98f2ba0007bc43f6e5d80a5f",
+      "counts": {
+        "int": 56680,
+        "frame": 5877
+      },
+      "endpoint": "DIR four times, literal CLS, DIR four times; fresh stable A> after every command; ordinary paced tty input; verified exact owned host stop, not guest poweroff.",
+      "raw_trace": {
+        "sha256": "b30824dd20429330d4409b42ee4cb158a1b261dc297c16e8a4bfb8aa49da2a22",
+        "size": 207129598
+      },
+      "compact_trace": {
+        "sha256": "34e555489c6ea696aa8624ef2e700a0f0428968f1c7404c94c20a53bd128637a",
+        "size": 15650584
+      },
+      "oracle": "Real tigt Presenter replay with notifications disabled; identical ordered VRAM/CRTC snapshots and every repeated vsync. Reviewed against raw captured screens: every one of 38 distinct directory rows is witnessed in VRAM and occurs eight times in the glass transcript. No interrupt arguments used as output.",
+      "oracle_mode": "snapshot",
+      "stdout_sha256": "16e6021bd04d922d8ebed6a124e2fa7748cf0236825a23120353ada6696bdeca",
+      "source_capture_directory": "/Users/josh/src/JoshRodd/86Box-contributions-2/work/boot-notifications/dos210-xt/capture",
+      "cls_outcome": "Observed clear: only A> remains on zero-based row 1, cursor 82.",
+      "scroll_witness_policy": "Raw snapshots within 12 vsync frames retain display rows shifted upward 1..5 rows, ignoring the bottom two actively written rows; at least four matching nonblank rows required. Window permits observable intermediate BIOS copy states. Witness ranges do not overlap.",
+      "scroll_witnesses_by_stage": {
+        "1": 30,
+        "2": 45,
+        "3": 45,
+        "4": 45,
+        "5": 1,
+        "6": 22,
+        "7": 45,
+        "8": 45,
+        "9": 45
+      },
+      "stages": [
+        {
+          "label": "boot-prompt",
+          "command": null,
+          "seq": 3298,
+          "cursor": 722,
+          "command_started_seq": null,
+          "command_enter_seq": null,
+          "screen_sha256": "4d91efe4ef756dfe6380d574ce9641e48a6c8a857ac47880a74626e4a1bb7105",
+          "snapshot_sha256": "a0e4d190bd537fc7566c646d5cbea6709cc2aae74cd7a385cfd8b7d39072c783"
+        },
+        {
+          "label": "01-dir",
+          "command": "DIR",
+          "seq": 10645,
+          "cursor": 1922,
+          "command_started_seq": 3298,
+          "command_enter_seq": 3337,
+          "screen_sha256": "4f79a1b25d9503219ebba8908b57606ec131affa6303e878154ed444d27c312e",
+          "snapshot_sha256": "9020a96b721656692a8a3ba6b945fa0e60c2a6c6eac1af2c9a60bf4c5d9069f5"
+        },
+        {
+          "label": "02-dir",
+          "command": "DIR",
+          "seq": 18048,
+          "cursor": 1922,
+          "command_started_seq": 10645,
+          "command_enter_seq": 10685,
+          "screen_sha256": "4f79a1b25d9503219ebba8908b57606ec131affa6303e878154ed444d27c312e",
+          "snapshot_sha256": "7d3d517724cd1cf6a785fbe309889b8a7f3baaca501db60381f92416def76046"
+        },
+        {
+          "label": "03-dir",
+          "command": "DIR",
+          "seq": 25436,
+          "cursor": 1922,
+          "command_started_seq": 18048,
+          "command_enter_seq": 18088,
+          "screen_sha256": "4f79a1b25d9503219ebba8908b57606ec131affa6303e878154ed444d27c312e",
+          "snapshot_sha256": "1d07fb01ea3504e00c171b3ea96d2366ede60801eab8130753053b145f61f874"
+        },
+        {
+          "label": "04-dir",
+          "command": "DIR",
+          "seq": 32824,
+          "cursor": 1922,
+          "command_started_seq": 25436,
+          "command_enter_seq": 25474,
+          "screen_sha256": "4f79a1b25d9503219ebba8908b57606ec131affa6303e878154ed444d27c312e",
+          "snapshot_sha256": "46031fe90de7f245c03ef7222b976bf3ad44afa0f3ab939336dc5ec55a95f557"
+        },
+        {
+          "label": "05-cls",
+          "command": "CLS",
+          "seq": 33018,
+          "cursor": 82,
+          "command_started_seq": 32824,
+          "command_enter_seq": 32865,
+          "screen_sha256": "c653b2609a390f82e2d094368b9a13db2abed97b8b4f2124f852f61fcf3d2c34",
+          "snapshot_sha256": "7a50d92b70cdea0f774763197dd2eda99d7f9db44bc18ad52eea526061f1493f"
+        },
+        {
+          "label": "06-dir",
+          "command": "DIR",
+          "seq": 40359,
+          "cursor": 1922,
+          "command_started_seq": 33018,
+          "command_enter_seq": 33059,
+          "screen_sha256": "4f79a1b25d9503219ebba8908b57606ec131affa6303e878154ed444d27c312e",
+          "snapshot_sha256": "e5b1f0514babe5e003dcba1b2aa0a7fd710654b8fcf9bf2ff54a1483ef224435"
+        },
+        {
+          "label": "07-dir",
+          "command": "DIR",
+          "seq": 47764,
+          "cursor": 1922,
+          "command_started_seq": 40359,
+          "command_enter_seq": 40400,
+          "screen_sha256": "4f79a1b25d9503219ebba8908b57606ec131affa6303e878154ed444d27c312e",
+          "snapshot_sha256": "2ee78e41efaaa12c14774a7eae73c19eba4b29d44d566e05d6c85fa22a0dc4a8"
+        },
+        {
+          "label": "08-dir",
+          "command": "DIR",
+          "seq": 55166,
+          "cursor": 1922,
+          "command_started_seq": 47764,
+          "command_enter_seq": 47802,
+          "screen_sha256": "4f79a1b25d9503219ebba8908b57606ec131affa6303e878154ed444d27c312e",
+          "snapshot_sha256": "79f14a34adc71fbef133629b632142774ee34d63b0d0c3112158167defcf4117"
+        },
+        {
+          "label": "09-dir",
+          "command": "DIR",
+          "seq": 62554,
+          "cursor": 1922,
+          "command_started_seq": 55166,
+          "command_enter_seq": 55204,
+          "screen_sha256": "4f79a1b25d9503219ebba8908b57606ec131affa6303e878154ed444d27c312e",
+          "snapshot_sha256": "f0ce6734bbaab5ffb9c1b0404b4ffd35b91666e92c63627847a6ed77df9d45f1"
+        }
+      ],
+      "gzip_trace": {
+        "file": "dos210-xt-scroll.jsonl.gz",
+        "sha256": "c01e64bb30cddd314bc34232b909238f6cc3b95258289343f6eddb91dd7db8c2",
+        "size": 1347027,
+        "uncompressed_sha256": "34e555489c6ea696aa8624ef2e700a0f0428968f1c7404c94c20a53bd128637a"
+      }
+    },
+    {
+      "dos": "PC DOS 2.10",
+      "machine": "5150",
+      "machine_bios": "ibm5150_5700671 (1981-10-19)",
+      "video": "CGA",
+      "source_image": "DOS210_360K.IMG",
+      "source_image_sha256": "8064c0de9289d8be56a4567a1455ab0ae44a98ed76735a3837f062f71cad3e38",
+      "scenario": "dos210-5150-scroll",
+      "binary_sha256": "c5b7b960558878dac6ad94886cd1f227611cdd1c98f2ba0007bc43f6e5d80a5f",
+      "counts": {
+        "int": 56050,
+        "frame": 5160
+      },
+      "endpoint": "DIR four times, literal CLS, DIR four times; fresh stable A> after every command; ordinary paced tty input; verified exact owned host stop, not guest poweroff.",
+      "raw_trace": {
+        "sha256": "7f8f7a9b21d339c941694150ff196f3aa25ac3f7999ff937ba6501b4aff8e2f2",
+        "size": 183354414
+      },
+      "compact_trace": {
+        "sha256": "df6ce9f4aeb5ca57b88955f55ca4d1e20cc37c2345bf1384dc0b287523611f0b",
+        "size": 15451861
+      },
+      "oracle": "Real tigt Presenter replay with notifications disabled; identical ordered VRAM/CRTC snapshots and every repeated vsync. Reviewed against raw captured screens: every one of 38 distinct directory rows is witnessed in VRAM and occurs eight times in the glass transcript. No interrupt arguments used as output.",
+      "oracle_mode": "snapshot",
+      "stdout_sha256": "6e409b50c1a85dd4d747dd86383d33e489cc792ed454ae9932700ed41ea56e0e",
+      "source_capture_directory": "/Users/josh/src/JoshRodd/86Box-contributions-2/work/boot-notifications/dos210-5150/capture",
+      "cls_outcome": "Observed clear: only A> remains on zero-based row 1, cursor 82.",
+      "scroll_witness_policy": "Raw snapshots within 12 vsync frames retain display rows shifted upward 1..5 rows, ignoring the bottom two actively written rows; at least four matching nonblank rows required. Window permits observable intermediate BIOS copy states. Witness ranges do not overlap.",
+      "scroll_witnesses_by_stage": {
+        "1": 30,
+        "2": 45,
+        "3": 45,
+        "4": 45,
+        "5": 1,
+        "6": 22,
+        "7": 45,
+        "8": 45,
+        "9": 45
+      },
+      "stages": [
+        {
+          "label": "boot-prompt",
+          "command": null,
+          "seq": 2035,
+          "cursor": 722,
+          "command_started_seq": null,
+          "command_enter_seq": null,
+          "screen_sha256": "69d591c77ae9a4e968a4fdc6b9d3ccd8da63e5a5acf972d0a83f4c53fbee6ed0",
+          "snapshot_sha256": "58addc7cdf9aaf5fba671da93539aceee907cd772524e4aba08ef25c0618d089"
+        },
+        {
+          "label": "01-dir",
+          "command": "DIR",
+          "seq": 9384,
+          "cursor": 1922,
+          "command_started_seq": 2035,
+          "command_enter_seq": 2075,
+          "screen_sha256": "4f79a1b25d9503219ebba8908b57606ec131affa6303e878154ed444d27c312e",
+          "snapshot_sha256": "765139b1d910445d4454403ee3ec94ee91c57d6612fd62f7f755e103db0c554b"
+        },
+        {
+          "label": "02-dir",
+          "command": "DIR",
+          "seq": 16759,
+          "cursor": 1922,
+          "command_started_seq": 9384,
+          "command_enter_seq": 9422,
+          "screen_sha256": "4f79a1b25d9503219ebba8908b57606ec131affa6303e878154ed444d27c312e",
+          "snapshot_sha256": "d208241f1b34fa5846cab15b284c7a1d82bccdd74edcb69376ecff685d00a463"
+        },
+        {
+          "label": "03-dir",
+          "command": "DIR",
+          "seq": 24134,
+          "cursor": 1922,
+          "command_started_seq": 16759,
+          "command_enter_seq": 16797,
+          "screen_sha256": "4f79a1b25d9503219ebba8908b57606ec131affa6303e878154ed444d27c312e",
+          "snapshot_sha256": "1705b83145afc6d65267947ee04a8dbff610c70a41deaa3b0a9224717830a409"
+        },
+        {
+          "label": "04-dir",
+          "command": "DIR",
+          "seq": 31534,
+          "cursor": 1922,
+          "command_started_seq": 24134,
+          "command_enter_seq": 24174,
+          "screen_sha256": "4f79a1b25d9503219ebba8908b57606ec131affa6303e878154ed444d27c312e",
+          "snapshot_sha256": "fa1883f65572ec4a6bd91c9bbc5e93c25fc6fd6fad081c95283b4b91021ee507"
+        },
+        {
+          "label": "05-cls",
+          "command": "CLS",
+          "seq": 31729,
+          "cursor": 82,
+          "command_started_seq": 31534,
+          "command_enter_seq": 31575,
+          "screen_sha256": "c653b2609a390f82e2d094368b9a13db2abed97b8b4f2124f852f61fcf3d2c34",
+          "snapshot_sha256": "8d178bccc250c96b62d0c7ea064137336dd1be752e2e3f756d5f02037c74814a"
+        },
+        {
+          "label": "06-dir",
+          "command": "DIR",
+          "seq": 39043,
+          "cursor": 1922,
+          "command_started_seq": 31729,
+          "command_enter_seq": 31768,
+          "screen_sha256": "4f79a1b25d9503219ebba8908b57606ec131affa6303e878154ed444d27c312e",
+          "snapshot_sha256": "f96292ee98adc7dcf0d90dea871fb153734ff01b996377764b95c285445142c5"
+        },
+        {
+          "label": "07-dir",
+          "command": "DIR",
+          "seq": 46418,
+          "cursor": 1922,
+          "command_started_seq": 39043,
+          "command_enter_seq": 39082,
+          "screen_sha256": "4f79a1b25d9503219ebba8908b57606ec131affa6303e878154ed444d27c312e",
+          "snapshot_sha256": "ee8692a17cfd734d01a057787bc50cffaa453d53080455be691cc04648efda8a"
+        },
+        {
+          "label": "08-dir",
+          "command": "DIR",
+          "seq": 53816,
+          "cursor": 1922,
+          "command_started_seq": 46418,
+          "command_enter_seq": 46456,
+          "screen_sha256": "4f79a1b25d9503219ebba8908b57606ec131affa6303e878154ed444d27c312e",
+          "snapshot_sha256": "92208f4a59fa820f8e704831df77d8eff6ed50b603d38c4f43db1a58b0dcbec4"
+        },
+        {
+          "label": "09-dir",
+          "command": "DIR",
+          "seq": 61207,
+          "cursor": 1922,
+          "command_started_seq": 53816,
+          "command_enter_seq": 53856,
+          "screen_sha256": "4f79a1b25d9503219ebba8908b57606ec131affa6303e878154ed444d27c312e",
+          "snapshot_sha256": "b9e5c0ff6deb419489f39b505e7333458d58dd1cd74d8d3850d415624e036a39"
+        }
+      ],
+      "gzip_trace": {
+        "file": "dos210-5150-scroll.jsonl.gz",
+        "sha256": "d85e8816f6c493d0ff0efdb9ea07d5ad593d3a57e832c05d843a6203d9c877c9",
+        "size": 1333413,
+        "uncompressed_sha256": "df6ce9f4aeb5ca57b88955f55ca4d1e20cc37c2345bf1384dc0b287523611f0b"
+      }
+    }
+  ]
+}

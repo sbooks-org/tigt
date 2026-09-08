@@ -16,6 +16,7 @@ mod ffi;
 mod input;
 #[cfg(feature = "keyboard")]
 pub mod keyboard;
+pub mod presenter;
 mod snapshot;
 pub mod video;
 

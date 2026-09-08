@@ -110,7 +110,8 @@ impl Fixture {
         if renderer {
             command
                 .arg(root.join("src/snapshot.c"))
-                .arg(root.join("src/video.c"));
+                .arg(root.join("src/video.c"))
+                .arg(root.join("src/presenter.c"));
             let png = pkg_config::Config::new()
                 .cargo_metadata(false)
                 .probe("libpng")
@@ -468,6 +469,18 @@ fn check_frame(capture: &[u8], font: &[u8], fg: usize, bg: usize) {
         );
     }
     assert_eq!(analysis.rgba.len(), expected.len());
+}
+
+#[test]
+fn output_presenter_preserves_glass_bytes_and_adaptive_transitions() {
+    let fixture = Fixture::build("presenter_fixture", true, false);
+    let output = Command::new(&fixture.binary).output().unwrap();
+    assert!(
+        output.status.success(),
+        "presenter fixture failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

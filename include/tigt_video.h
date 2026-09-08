@@ -58,6 +58,16 @@ void tigt_video_write(tigt_video *video, uint16_t port, uint8_t value);
  * errors leave the output frame unchanged. */
 int tigt_video_decode(tigt_video *video, const uint8_t *vram, size_t length,
                       int blink_on, tigt_video_frame *frame);
+/* Text-only decode with explicit geometry for this call, without changing CRTC
+ * state. Columns 1..320, rows 1..128, at most 21440 cells; graphics mode and
+ * invalid geometry/aperture return ARGUMENT. Uses the same full borrowed
+ * aperture, word start/wrap, attributes, video enable and blink as decode.
+ * Success returns an owned text frame of the supplied dimensions and row stride
+ * columns, with the same lifetime/reuse rules. Errors leave both the output
+ * descriptor and previously decoded storage unchanged. */
+int tigt_video_decode_text(tigt_video *video, const uint8_t *vram, size_t length,
+                           uint16_t columns, uint16_t rows, int blink_on,
+                           tigt_video_frame *frame);
 /* Decode, select MDA/Generic display technology, then submit through the native
  * text/bitmap API (bitmap pixel_width = 1). Does not alter overscan. Existing
  * session lifecycle and submission serialization rules apply; errors propagate. */

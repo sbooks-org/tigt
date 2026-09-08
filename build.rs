@@ -24,7 +24,13 @@ fn main() {
         .expect("tigt snapshots require the libpng development package and pkg-config metadata");
     let mut build = cc::Build::new();
     build
-        .files(["src/tigt.c", "src/input.c", "src/snapshot.c", "src/video.c"])
+        .files([
+            "src/tigt.c",
+            "src/input.c",
+            "src/snapshot.c",
+            "src/video.c",
+            "src/presenter.c",
+        ])
         .include("include")
         .std("c11")
         .define("_XOPEN_SOURCE", "700")
@@ -76,6 +82,8 @@ fn main() {
         "src/snapshot.c",
         "src/snapshot.h",
         "src/video.c",
+        "src/presenter.c",
+        "include/tigt_presenter.h",
         "src/palette.h",
         "include/tigt.h",
         "include/tigt_video.h",

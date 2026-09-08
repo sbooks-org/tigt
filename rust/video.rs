@@ -100,6 +100,45 @@ impl VideoAdapter {
         })
     }
 
+    /// Decodes text with explicit columns and rows without changing CRTC state.
+    ///
+    /// Accepts 1..=320 columns, 1..=128 rows and at most 21440 cells. Graphics
+    /// mode, invalid dimensions and incomplete apertures return [`Error::Argument`].
+    /// Start-address wrapping, attributes, video enable and blink match [`Self::decode`].
+    /// Source VRAM is borrowed only during the call; the returned frame borrows
+    /// the adapter's owned buffer and has a row stride equal to `columns`.
+    pub fn decode_text(
+        &mut self,
+        vram: &[u8],
+        columns: u16,
+        rows: u16,
+        blink_on: bool,
+    ) -> Result<Frame<'_>, Error> {
+        let mut frame = MaybeUninit::<ffi::VideoFrame>::uninit();
+        // C validates geometry and aperture before reading, and initializes
+        // the descriptor only on success. Neither input pointer is retained.
+        check_status(unsafe {
+            ffi::tigt_video_decode_text(
+                self.raw.as_ptr(),
+                vram.as_ptr(),
+                vram.len(),
+                columns,
+                rows,
+                i32::from(blink_on),
+                frame.as_mut_ptr(),
+            )
+        })?;
+        let frame = unsafe { frame.assume_init() };
+        let length = usize::from(frame.width) * usize::from(frame.height);
+        // Success guarantees a non-null aligned text buffer of width * height
+        // initialized cells. The dimensions fit isize; &mut self prevents reuse.
+        Ok(Frame::Text {
+            cells: unsafe { slice::from_raw_parts(frame.cells, length) },
+            columns: frame.width,
+            rows: frame.height,
+        })
+    }
+
     /// Decodes and submits to an active session, selecting MDA or generic display
     /// policy as appropriate. Bitmap pixels have width 1; overscan is unchanged.
     /// Session lifecycle and input callback errors propagate to the caller.

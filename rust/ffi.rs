@@ -85,6 +85,15 @@ unsafe extern "C" {
         blink_on: c_int,
         frame: *mut VideoFrame,
     ) -> c_int;
+    pub(crate) fn tigt_video_decode_text(
+        video: *mut c_void,
+        vram: *const u8,
+        length: usize,
+        columns: u16,
+        rows: u16,
+        blink_on: c_int,
+        frame: *mut VideoFrame,
+    ) -> c_int;
     pub(crate) fn tigt_video_present(
         video: *mut c_void,
         vram: *const u8,

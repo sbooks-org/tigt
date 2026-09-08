@@ -113,6 +113,68 @@ cargo run --example snapshot -- /tmp/tigt-snapshot.json
 
 The keyboard example demonstrates physical PC key press/release events, decoded independently of a display session. The snapshot example demonstrates instrumentation; see its printed process information and [the instrumentation guide](instrumentation.md).
 
+## Glass-TTY output without curses
+
+Use the additive presenter when you want a reconstructed stdout transcript rather than a curses session:
+
+```sh
+cargo run --example presenter
+cargo run --example presenter > transcript.txt
+```
+
+This example calls the real presenter with a simulated 20-column guest at 60 Hz, including unchanged vsyncs. It borrows stdout, does not read stdin or change terminal input modes, and never uses the alternate screen. No `Session` or `tigt_init` is needed.
+
+The Rust setup is:
+
+```rust
+use std::os::fd::AsFd;
+use tigt::{TextCell, presenter::{
+    Config, Cursor, Encoding, Frame, Mode, Presenter, RefreshRate, Reversibility,
+}};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let output = std::io::stdout();
+    let mut presenter = Presenter::new(output.as_fd(), Config {
+        mode: Mode::Glass,
+        encoding: Encoding::Locale,
+        reversibility: Reversibility::OneWay,
+    })?;
+    let mut cells = [TextCell::new(' ', 0xffffff, 0); 40];
+    cells[0] = TextCell::new('H', 0xffffff, 0);
+    cells[1] = TextCell::new('i', 0xffffff, 0);
+    let status = presenter.present(Frame {
+        cells: &cells,
+        columns: 20,
+        rows: 2,
+        stride: 20,
+        cursor: Cursor { column: 2, row: 0 },
+        refresh_rate: RefreshRate::Hz60,
+    })?;
+    // In an emulator, repeat present at EVERY guest vsync, including unchanged
+    // frames. Handle Pending, Fullscreen, and errors as described below.
+    let _ = status;
+    Ok(())
+}
+```
+
+Keep the fd owner alive until the presenter is dropped. Rust enforces that borrow; drop never closes the fd. Serialize other writers to the same destination and never share it with a live curses session. Frame slices need only survive `present`, which is synchronous and does not allocate a Rust staging copy.
+
+For a C consumer, include `<tigt_presenter.h>`, fill `tigt_presenter_config` with `TIGT_PRESENTER_ABI_VERSION`, the borrowed fd, mode, encoding and reversible flag, then call `tigt_presenter_create(&config, &presenter)`. Submit `tigt_presenter_frame` with the separate logical cursor, refresh cadence and `hints = 0` on every vsync; finish with `tigt_presenter_destroy(presenter)`.
+
+`Mode::Glass` works on a TTY or redirected fd and ignores host dimensions. The separate logical cursor is required even when the guest cursor is hidden: glass output does not draw or manipulate a visible cursor. Locale mode follows `LC_ALL`, `LC_CTYPE`, then `LANG`; UTF-8 locales produce UTF-8 and other locales degrade to ASCII. Convert raw CP437 with `cp437_codepoint`, including its space mapping for guest bytes `0x00` and `0xff`.
+
+Choose `Mode::Adaptive` only for a TTY destination. It starts in glass mode, then falls back to a clipped bottom guest-sized region on the **normal screen**, never the alternate screen. `Reversibility::OneWay` keeps that fallback; `Reversible` allows a guest clear followed by representable text to restore glass output after preparing/scrolling the region. A non-TTY adaptive destination is an error, not an automatic switch to glass.
+
+Handle `Status::Pending` by continuing normal vsync submissions. Unrepresentable text must persist for 100 ms: 5/6/7 elapsed intervals at 50/60/70 Hz after the first bad snapshot (6/7/8 bad observations total). Recovery cancels confirmation; cursor-up alone is not failure. Confirmed failure yields `Error::Unrepresentable` in pure glass or `Status::Fullscreen` in adaptive mode. Pure-glass failure is sticky until `reset`; the consumer decides recovery and must prepare its destination before resetting. The 70 Hz option reserves future cadence only, not VGA support.
+
+The [presenter reference](reference.md#glass-tty-and-adaptive-presentation) specifies exact BS/CR/NL/FF, overprinting, scrolling and clear rules. The frame's `hints` field stays zero. Vertical tabs, ISO-8859-1, cooked input and echo validation remain deferred.
+
+An observer of INT 21h console output, INT 10h video writes, or equivalent activity can now submit speculative output through `Presenter::notify` / `tigt_presenter_notify`, without intercepting or changing the guest call. Supply decoded display scalars, starting guest cursor and geometry, a nonzero operation ID, and boundaries after particular scalar offsets. For example, `ABCDE` followed by `FG` in a five-column guest is text `ABCDEFG` with a soft-wrap boundary at offset 5. Once matching screen evidence confirms that boundary, glass output continues the logical line without inserting NL. An explicit newline remains a separate boundary.
+
+The queue copies the payload and emits nothing until screen observations provide evidence. It supports partial matching and conservative resynchronization, bounded capacity, expiry, cancellation and counters. Handle `NotifyStatus::Dropped` as lost speculation, not failed output; continue normal vsync submissions. See the [queue contract](reference.md#queue-api-and-matching) for limits, ownership and mismatches. Notifications do not recover text that disappeared between snapshots.
+
+Run `cargo run --example notifications` to exercise the real queue with a simulated 20-column guest. The observed row wrap in `Hello, wrapped glass-TTY!` does not split the stdout line; a later explicit newline still terminates it.
+
 ## RGB bitmaps
 
 Pass pixels in `0x00RRGGBB` order. The high byte is ignored for bitmap input. Width is the backing-buffer width; stride is pixels between rows. Height is 200. `pixel_width` is 1 or 2 backing pixels per logical pixel.

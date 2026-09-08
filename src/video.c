@@ -80,9 +80,8 @@ tigt_video_write(tigt_video *video, uint16_t port, uint8_t value)
 
 static void
 decode_text(const tigt_video *video, const uint8_t *vram, bool blink_on,
-            tigt_text_cell *cells)
+            size_t count, tigt_text_cell *cells)
 {
-    const size_t count = (size_t) video->columns * 25;
     if (!(video->mode & 0x08)) {
         for (size_t i = 0; i < count; i++)
             cells[i] = (tigt_text_cell) { .codepoint = ' ' };
@@ -179,6 +178,35 @@ decode_bitmap(const tigt_video *video, const uint8_t *vram, uint16_t width,
     }
 }
 
+static int
+decode_frame(tigt_video *video, const uint8_t *vram, uint16_t width,
+             uint16_t height, bool graphics, bool blink_on, tigt_video_frame *frame)
+{
+    const size_t count = (size_t) width * height;
+    const size_t bytes = count * (graphics ? sizeof(uint32_t) : sizeof(tigt_text_cell));
+    if (bytes > video->capacity) {
+        void *buffer = realloc(video->buffer, bytes);
+        if (buffer == NULL) {
+            errno = ENOMEM;
+            return TIGT_ERROR_SYSTEM;
+        }
+        video->buffer = buffer;
+        video->capacity = bytes;
+    }
+    if (graphics)
+        decode_bitmap(video, vram, width, video->buffer);
+    else
+        decode_text(video, vram, blink_on, count, video->buffer);
+    *frame = (tigt_video_frame) {
+        .kind = graphics ? TIGT_VIDEO_BITMAP : TIGT_VIDEO_TEXT,
+        .width = width,
+        .height = height,
+        .cells = graphics ? NULL : video->buffer,
+        .pixels = graphics ? video->buffer : NULL
+    };
+    return TIGT_OK;
+}
+
 int
 tigt_video_decode(tigt_video *video, const uint8_t *vram, size_t length,
                   int blink_on, tigt_video_frame *frame)
@@ -194,29 +222,22 @@ tigt_video_decode(tigt_video *video, const uint8_t *vram, size_t length,
         return TIGT_ERROR_ARGUMENT;
     const uint16_t width = graphics ? ((video->mode & 0x10) ? 640 : 320) : video->columns;
     const uint16_t height = graphics ? 200 : 25;
-    const size_t bytes = (size_t) width * height *
-                         (graphics ? sizeof(uint32_t) : sizeof(tigt_text_cell));
-    if (bytes > video->capacity) {
-        void *buffer = realloc(video->buffer, bytes);
-        if (buffer == NULL) {
-            errno = ENOMEM;
-            return TIGT_ERROR_SYSTEM;
-        }
-        video->buffer = buffer;
-        video->capacity = bytes;
-    }
-    if (graphics)
-        decode_bitmap(video, vram, width, video->buffer);
-    else
-        decode_text(video, vram, blink_on != 0, video->buffer);
-    *frame = (tigt_video_frame) {
-        .kind = graphics ? TIGT_VIDEO_BITMAP : TIGT_VIDEO_TEXT,
-        .width = width,
-        .height = height,
-        .cells = graphics ? NULL : video->buffer,
-        .pixels = graphics ? video->buffer : NULL
-    };
-    return TIGT_OK;
+    return decode_frame(video, vram, width, height, graphics, blink_on != 0, frame);
+}
+
+int
+tigt_video_decode_text(tigt_video *video, const uint8_t *vram, size_t length,
+                       uint16_t columns, uint16_t rows, int blink_on,
+                       tigt_video_frame *frame)
+{
+    if (video == NULL || vram == NULL || frame == NULL ||
+        columns == 0 || columns > 320 || rows == 0 || rows > 128 ||
+        (size_t) columns * rows > 21440)
+        return TIGT_ERROR_ARGUMENT;
+    const bool mono = video->adapter == TIGT_VIDEO_MDA;
+    if (length < (mono ? 4096u : 16384u) || (!mono && (video->mode & 0x02)))
+        return TIGT_ERROR_ARGUMENT;
+    return decode_frame(video, vram, columns, rows, false, blink_on != 0, frame);
 }
 
 int
