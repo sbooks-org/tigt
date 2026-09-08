@@ -111,7 +111,7 @@ cargo run --example keyboard --features keyboard
 cargo run --example snapshot -- /tmp/tigt-snapshot.json
 ```
 
-The keyboard example demonstrates conversion to PC scan codes. The snapshot example demonstrates instrumentation; see its printed process information and [the instrumentation guide](instrumentation.md).
+The keyboard example demonstrates physical PC key press/release events, decoded independently of a display session. The snapshot example demonstrates instrumentation; see its printed process information and [the instrumentation guide](instrumentation.md).
 
 ## RGB bitmaps
 

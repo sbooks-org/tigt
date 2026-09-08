@@ -105,9 +105,11 @@ C decoder creation rejects a NULL callback. Feed/flush/destroy must be externall
 
 ## PC keyboard integration
 
-C consumers may include `tigt_keyboard.h` alongside the separate mapper's `pc_xt_keyboard.h`. `tigt_keyboard_handle` converts one semantic event to mapper input and returns the generated scan bytes. Link the mapper separately; the core tigt library does not require it.
+C consumers may include `tigt_keyboard.h` alongside the separate mapper's `pc_xt_keyboard.h`. `tigt_keyboard_handle` converts a semantic input event into `pc_xt_keyboard_v1_key_event` records: a physical PC key identity and a separate down/up flag. Supply `PC_XT_KEYBOARD_V1_EVENT_MAX_KEYS` slots; capacity and return count are in events, not bytes. Link the mapper separately; the core tigt library does not require it.
 
-Rust enables `keyboard` to expose event conversions and the mapper re-export. The mapper's PC policy remains separate from terminal transport decoding. Applications deliver the resulting bytes to their emulator or other consumer.
+Rust enables `keyboard` to expose event conversions and the mapper re-export. `PcEvent::Make(key)` / `Break(key)` expose `key.physical` before wire encoding. Ordinary identities use PC make-position numbering; enhanced Print Screen and Pause are distinct identities, not E0/E1 byte streams. Feed an emulator's existing host-key interface and let its emulated keyboard choose guest scan-code encoding. The mapper's separate byte API remains available to consumers that actually need wire bytes.
+
+Input decoding, keyboard mapping and monitor decoding have independent state. A live terminal session coordinates terminal ownership and input callbacks, but display technology never selects keyboard profile. Applications own the mapper and release policy; tigt does not instantiate a PC keyboard. Do not submit one input to both mapper output APIs: both consume the same held-key state.
 
 ## Snapshots
 
