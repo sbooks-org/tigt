@@ -27,7 +27,7 @@ test-fixtures = []
 
 [dependencies]
 libc = "0.2"
-pc-xt-keyboard = { git = "https://github.com/sbooks-org/terminal-to-pc-keyboard", rev = "6cbbec1265f7c869955f707d7e2867de0832d9c5", optional = true, default-features = false }
+pc-xt-keyboard = { git = "https://github.com/sbooks-org/terminal-to-pc-keyboard", rev = "a7dd8b7e40f98888558fbff2dc54659eaf1f4fce", optional = true, default-features = false }
 
 [build-dependencies]
 cc = "1"

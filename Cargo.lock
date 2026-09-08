@@ -271,7 +271,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "pc-xt-keyboard"
 version = "0.1.0"
-source = "git+https://github.com/sbooks-org/terminal-to-pc-keyboard?rev=6cbbec1265f7c869955f707d7e2867de0832d9c5#6cbbec1265f7c869955f707d7e2867de0832d9c5"
+source = "git+https://github.com/sbooks-org/terminal-to-pc-keyboard?rev=a7dd8b7e40f98888558fbff2dc54659eaf1f4fce#a7dd8b7e40f98888558fbff2dc54659eaf1f4fce"
 
 [[package]]
 name = "pkg-config"

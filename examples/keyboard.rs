@@ -12,13 +12,13 @@ use std::{fmt::Write, thread, time::Duration};
 use tigt::keyboard::mapper::{PcEvent, PcKeyboard};
 use tigt::{InputDecoder, Session, TextCell};
 
-fn append_scan_bytes(bytes: &mut Vec<u8>, events: impl IntoIterator<Item = PcEvent>) {
+fn append_keys(text: &mut String, events: impl IntoIterator<Item = PcEvent>) {
     for event in events {
-        let sequence = match event {
-            PcEvent::Make(key) => key.make,
-            PcEvent::Break(key) => key.break_sequence,
+        let (key, direction) = match event {
+            PcEvent::Make(key) => (key.physical, "down"),
+            PcEvent::Break(key) => (key.physical, "up"),
         };
-        bytes.extend_from_slice(sequence.bytes());
+        write!(text, "{key:03x}:{direction} ").unwrap();
     }
 }
 
@@ -30,10 +30,10 @@ fn write_line(cells: &mut [TextCell], row: usize, text: &str) {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut keyboard = PcKeyboard::default();
-    let mut bytes = Vec::new();
+    let mut keys = String::new();
     {
         let mut input = InputDecoder::new(|event| {
-            append_scan_bytes(&mut bytes, keyboard.handle(&event.into()));
+            append_keys(&mut keys, keyboard.handle(&event.into()));
         })?;
         // Plain A, Ctrl+C, then Ctrl+Left: Ctrl+C is data, not an exit request.
         input.feed(b"A\x03\x1b[1;5D")?;
@@ -41,11 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // Release anything still held by an explicit transition in the batch.
     // Legacy input without release reporting is decoded as synthetic taps.
-    append_scan_bytes(&mut bytes, keyboard.release_all());
-    let mut hex = String::new();
-    for byte in &bytes {
-        write!(&mut hex, "{byte:02x} ")?;
-    }
+    append_keys(&mut keys, keyboard.release_all());
 
     let mut cells = [TextCell::new(' ', 0xc4c4c4, 0); 80 * 25];
     write_line(&mut cells, 0, "tigt + optional pc-xt-keyboard adapter");
@@ -59,14 +55,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         3,
         "A, Ctrl+C, Ctrl+Left; release all at end of batch",
     );
-    write_line(&mut cells, 5, "PC/XT Set 1 make/break bytes:");
-    for (row, chunk) in hex.as_bytes().chunks(78).enumerate() {
+    write_line(
+        &mut cells,
+        5,
+        "Physical PC key transitions (not wire bytes):",
+    );
+    for (row, chunk) in keys.as_bytes().chunks(78).enumerate() {
         write_line(&mut cells, 6 + row, std::str::from_utf8(chunk)?);
     }
     let session = Session::new()?;
     session.present_text(&cells, 80, 25, 80)?;
     thread::sleep(Duration::from_secs(2));
     drop(session);
-    println!("PC/XT scan bytes: {}", hex.trim_end());
+    println!("Physical PC keys: {}", keys.trim_end());
     Ok(())
 }

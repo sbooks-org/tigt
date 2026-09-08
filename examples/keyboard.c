@@ -10,12 +10,12 @@
 
 static void emit(const tigt_input_event *event, void *mapper)
 {
-    uint8_t bytes[PC_XT_KEYBOARD_V1_EVENT_MAX_BYTES];
-    size_t count = tigt_keyboard_handle(mapper, event, bytes, sizeof(bytes));
+    pc_xt_keyboard_v1_key_event keys[PC_XT_KEYBOARD_V1_EVENT_MAX_KEYS];
+    size_t count = tigt_keyboard_handle(mapper, event, keys, PC_XT_KEYBOARD_V1_EVENT_MAX_KEYS);
     if (count == PC_XT_KEYBOARD_V1_ERROR)
         return;
     for (size_t i = 0; i < count; ++i)
-        printf("%02x ", bytes[i]);
+        printf("%03x:%s ", keys[i].key, keys[i].down ? "down" : "up");
 }
 
 int main(void)

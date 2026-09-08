@@ -15,11 +15,11 @@ extern "C" {
 /* Optional adapter: the application owns mapper and links pc-xt-keyboard.
  * Both version-1 semantic event ABIs use the same numeric discriminants.
  * Copy fields, not object representations: no aliasing/layout assumption.
- * Buffer capacity and mapper validity are checked by the mapper itself.
+ * Capacity is in physical key-event slots, not bytes. The mapper validates it.
  */
 static inline size_t
 tigt_keyboard_handle(void *mapper, const tigt_input_event *event,
-                     uint8_t *bytes, size_t capacity)
+                     pc_xt_keyboard_v1_key_event *events, size_t capacity)
 {
     pc_xt_keyboard_v1_input_event input;
 
@@ -31,7 +31,7 @@ tigt_keyboard_handle(void *mapper, const tigt_input_event *event,
     input.key.character = event->key.character;
     input.modifiers = event->modifiers;
     input.kind = event->kind;
-    return pc_xt_keyboard_v1_handle(mapper, &input, bytes, capacity);
+    return pc_xt_keyboard_v1_handle_events(mapper, &input, events, capacity);
 }
 
 #ifdef __cplusplus

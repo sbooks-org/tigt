@@ -95,25 +95,27 @@ mod tests {
     use crate::InputDecoder;
 
     #[test]
-    fn plain_and_control_input_generate_complete_set1_key_transitions() {
+    fn plain_and_control_input_generate_physical_key_transitions() {
         let mut keyboard = PcKeyboard::default();
-        let mut bytes = Vec::new();
+        let mut keys = Vec::new();
         {
             let mut decoder = InputDecoder::new(|event| {
                 for event in keyboard.handle(&event.into()) {
-                    let sequence = match event {
-                        PcEvent::Make(key) => key.make,
-                        PcEvent::Break(key) => key.break_sequence,
-                    };
-                    bytes.extend_from_slice(sequence.bytes());
+                    keys.push(match event {
+                        PcEvent::Make(key) => (key.physical, true),
+                        PcEvent::Break(key) => (key.physical, false),
+                    });
                 }
             })
             .unwrap();
             decoder.feed(b"a\x03").unwrap();
         }
-        assert_eq!(&bytes[..4], &[0x1e, 0x9e, 0x1d, 0x2e]);
+        assert_eq!(
+            &keys[..4],
+            &[(0x1e, true), (0x1e, false), (0x1d, true), (0x2e, true)]
+        );
         // Either release order is valid once the Ctrl+C make has been emitted.
-        bytes[4..].sort_unstable();
-        assert_eq!(&bytes[4..], &[0x9d, 0xae]);
+        keys[4..].sort_unstable();
+        assert_eq!(&keys[4..], &[(0x1d, false), (0x2e, false)]);
     }
 }
