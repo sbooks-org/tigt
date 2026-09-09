@@ -194,6 +194,26 @@ handle_csi_key(tigt_input *input, const char *parameters, uint8_t final)
 }
 
 static void
+handle_ss3_key(tigt_input *input, uint8_t final)
+{
+    switch (final) {
+        case 'A': case 'B': case 'C': case 'D': case 'F': case 'H':
+        case 'P': case 'Q': case 'S':
+            handle_csi_key(input, "", final);
+            break;
+        case 'E':
+            input_event(input, TIGT_KEY_KEYPAD_BEGIN, 0, 0, 0, TIGT_PRESS);
+            break;
+        case 'R':
+            /* CSI R reports cursor position; only SS3 R is the F3 key. */
+            input_event(input, TIGT_KEY_FUNCTION, 3, 0, 0, TIGT_PRESS);
+            break;
+        default:
+            break;
+    }
+}
+
+static void
 handle_plain_key(tigt_input *input, uint8_t byte)
 {
     if (input->utf8_remaining != 0) {
@@ -252,7 +272,7 @@ tigt_input_feed(tigt_input *input, const uint8_t *bytes, size_t length)
     for (size_t index = 0; index < length; index++) {
         const uint8_t byte = bytes[index];
 
-        if (input->sequence_length == 1 && byte != '[') {
+        if (input->sequence_length == 1 && byte != '[' && byte != 'O') {
             input->sequence_length = 0;
             input_tap(input, TIGT_KEY_ESCAPE, 0, 0);
         }
@@ -268,6 +288,9 @@ tigt_input_feed(tigt_input *input, const uint8_t *bytes, size_t length)
             handle_plain_key(input, byte);
         } else if (input->sequence_length == 1) {
             input->sequence[input->sequence_length++] = (char) byte;
+        } else if (input->sequence[1] == 'O') {
+            handle_ss3_key(input, byte);
+            input->sequence_length = 0;
         } else if (byte >= 0x40 && byte <= 0x7e) {
             input->sequence[input->sequence_length] = '\0';
             if (!input->discard_sequence) {

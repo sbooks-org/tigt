@@ -9,7 +9,8 @@ extern "C" {
 #define TIGT_ERROR_UNREPRESENTABLE -5
 #define TIGT_PRESENTER_PENDING 1
 #define TIGT_PRESENTER_FULLSCREEN 2
-#define TIGT_PRESENTER_NEEDS_CURSOR 4
+#define TIGT_PRESENTER_WOULD_BLOCK 4
+#define TIGT_PRESENTER_NEEDS_CURSOR 5
 #define TIGT_PRESENTER_LOCAL_ECHO_MAX 4096u
 
 enum { TIGT_PRESENT_GLASS = 0, TIGT_PRESENT_ADAPTIVE = 1 };
@@ -130,13 +131,13 @@ int tigt_presenter_forget_cursor(tigt_presenter *presenter);
  * an initialized glass baseline. Pipe input has no local echo to register.
  */
 int tigt_presenter_local_echo(tigt_presenter *presenter, const uint32_t *text, size_t length);
-/* Output-only, synchronous; submit once per vsync, including unchanged frames.
+/* Output-only; submit once per vsync, including unchanged frames.
  * The caller serializes all operations and owns the borrowed output fd. Never
  * share output with a live curses session. Adaptive mode requires a TTY fd.
  * No stdin reads, termios raw mode, alternate screen, or signal handlers.
  * Returned status: OK (glass), PENDING (confirmation, scroll, or disable hold),
- * NEEDS_CURSOR (observation), FULLSCREEN, or error. PENDING retains the current
- * presentation/input mode, including when already fullscreen.
+ * NEEDS_CURSOR (observation), FULLSCREEN, WOULD_BLOCK, or error. PENDING retains
+ * the current presentation/input mode, including when already fullscreen.
  * A copied row prefix/partial row followed by an untouched (possibly already
  * shifted) suffix, or uncleared exposed rows, holds the committed image/cursor/
  * echo/map for at most 500ms from first detection. Progress/idle observations
@@ -151,7 +152,8 @@ int tigt_presenter_local_echo(tigt_presenter *presenter, const uint32_t *text, s
  * retains the prior presentation under the same bounded 500ms scroll deadline.
  * All other disabled memory changes show hardware black immediately; raw text
  * is never painted while disabled. Enabled blank/CLS frames are not debounced.
- * UNREPRESENTABLE is sticky until reset; I/O errors are likewise terminal.
+ * UNREPRESENTABLE and hard I/O errors are sticky until reset. Ordinary output
+ * backpressure returns WOULD_BLOCK and retains a resumable transaction.
  * Destroy frees state, never closes the fd. Reset starts a new empty glass
  * baseline without emitting output; consumer must have prepared its destination.
  * Reversible adaptive recovery also needs 100ms of representable frontier
@@ -160,6 +162,36 @@ int tigt_presenter_local_echo(tigt_presenter *presenter, const uint32_t *text, s
  */
 int tigt_presenter_create(const tigt_presenter_config *config, tigt_presenter **output);
 int tigt_presenter_present(tigt_presenter *presenter, const tigt_presenter_frame *frame);
+/* Bounded output: requires O_NONBLOCK on the borrowed fd; does not change it.
+ * Each call attempts at most one write, never polls, sleeps, or retries EINTR.
+ * WOULD_BLOCK means that exact unwritten bytes and the pending frame are owned
+ * by the presenter. This includes short writes and EINTR, not just EAGAIN.
+ * Resume without resubmitting the frame; neither frame time nor notification
+ * matching advances on resume. Completion returns OK, PENDING, or FULLSCREEN.
+ * Input frame storage may be reused immediately after submission returns.
+ *
+ * There is one bounded transaction, not a frame queue. Until it completes,
+ * present (either variant), notify, cancel, observe_cursor, forget_cursor, and
+ * local_echo return BUSY without mutation. Resume without a pending transaction
+ * returns BUSY. Stats remain readable.
+ * Callers can service cancellation/suspension between attempts and wait for
+ * writability themselves. Reset/destroy discard pending output immediately,
+ * without writing or rolling back emitted bytes; prepare the destination before
+ * continuing after reset, especially if cancellation split an escape sequence.
+ *
+ * The original present API continues writing until complete on blocking fds.
+ * It also preserves a transaction on EAGAIN; set O_NONBLOCK before resuming.
+ * On platforms that ignore O_NONBLOCK for regular files, file writes may block.
+ */
+int tigt_presenter_present_nonblocking(tigt_presenter *presenter, const tigt_presenter_frame *frame);
+int tigt_presenter_resume(tigt_presenter *presenter);
+/* Nonzero if fullscreen is committed or a pending fullscreen transaction has
+ * emitted any bytes. Read after present/resume, including errors, before reset
+ * when deciding whether terminal restoration is needed. This is current state,
+ * not a historical latch; completed glass recovery and reset clear it.
+ * Performs no I/O. NULL returns zero. Caller still serializes access.
+ */
+int tigt_presenter_fullscreen_output_started(const tigt_presenter *presenter);
 int tigt_presenter_reset(tigt_presenter *presenter);
 void tigt_presenter_destroy(tigt_presenter *presenter);
 #ifdef __cplusplus

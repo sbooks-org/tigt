@@ -8,7 +8,7 @@ version = "0.2.0"
 edition = "2024"
 description = "tty-in-glass-tty: terminal rendering and transport-neutral input"
 license = "MIT-0"
-repository = "https://github.com/sbooks-org/tigt"
+repository = "ssh://git@github.com/sbooks-org/tigt.git"
 links = "tigt"
 build = "build.rs"
 
@@ -27,7 +27,7 @@ test-fixtures = []
 
 [dependencies]
 libc = "0.2"
-pc-xt-keyboard = { git = "https://github.com/sbooks-org/terminal-to-pc-keyboard", rev = "7cc775026fabc9b1443328935a71c84574255c0b", optional = true, default-features = false }
+pc-xt-keyboard = { git = "ssh://git@github.com/sbooks-org/terminal-to-pc-keyboard.git", rev = "d88bd182f24eb7567fba04585bc7e58419c649a1", optional = true, default-features = false }
 
 [build-dependencies]
 cc = "1"
