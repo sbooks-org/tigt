@@ -110,6 +110,43 @@ static void check_escape_and_modifier(void)
     tigt_input_destroy(input);
 }
 
+static void check_ss3(void)
+{
+    const struct {
+        char final;
+        uint32_t key, value;
+    } keys[] = {
+        { 'H', TIGT_KEY_HOME, 1 }, { 'F', TIGT_KEY_END, 1 },
+        { 'A', TIGT_KEY_UP, 1 }, { 'B', TIGT_KEY_DOWN, 1 },
+        { 'C', TIGT_KEY_RIGHT, 1 }, { 'D', TIGT_KEY_LEFT, 1 },
+        { 'E', TIGT_KEY_KEYPAD_BEGIN, 0 },
+        { 'P', TIGT_KEY_FUNCTION, 1 }, { 'Q', TIGT_KEY_FUNCTION, 2 },
+        { 'R', TIGT_KEY_FUNCTION, 3 }, { 'S', TIGT_KEY_FUNCTION, 4 }
+    };
+    for (size_t key = 0; key < sizeof(keys) / sizeof(keys[0]); key++) {
+        const uint8_t sequence[] = { '\033', 'O', (uint8_t) keys[key].final };
+        for (size_t split = 0; split <= sizeof(sequence); split++) {
+            struct events events = { 0 };
+            tigt_input *input = tigt_input_create(collect, &events);
+            assert(input != NULL);
+            tigt_input_feed(input, sequence, split);
+            if (split < sizeof(sequence))
+                assert(events.count == 0); /* No premature Escape or literal O. */
+            tigt_input_feed(input, sequence + split, sizeof(sequence) - split);
+            tigt_input_flush(input);
+            assert(events.count == 1);
+            check(&events, 0, keys[key].key, 0, 0, TIGT_PRESS);
+            if (keys[key].key == TIGT_KEY_FUNCTION)
+                assert(events.values[0].key.value == keys[key].value);
+            /* CSI R is a cursor report, not the SS3 F3 key. */
+            const char report[] = "\033[12;34R";
+            tigt_input_feed(input, (const uint8_t *) report, strlen(report));
+            assert(events.count == 1);
+            tigt_input_destroy(input);
+        }
+    }
+}
+
 int main(void)
 {
     assert(signal(SIGINT, signal_seen) != SIG_ERR);
@@ -117,6 +154,7 @@ int main(void)
     check_plain();
     check_incremental();
     check_escape_and_modifier();
+    check_ss3();
     assert(signals_seen == 0);
     puts("PASS semantic controls, incremental CSI/Kitty events, Escape timeout, modifier release");
     return 0;

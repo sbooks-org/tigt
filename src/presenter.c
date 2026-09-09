@@ -60,9 +60,16 @@ typedef struct {
     bool joined[128];
 } logical_rows;
 
+typedef struct {
+    unsigned column, row;
+    size_t logical_column;
+    unsigned scroll_top, scroll_bottom, scroll_count;
+    bool empty_baseline;
+} glass_cursor;
 /* Frames are never coalesced. Analysis uses reusable scratch storage; neither
  * the destination nor the committed image/cursor changes on an unrepresentable
- * submission. A write failure can be partial and therefore poisons the session.
+ * submission. Hard write failures poison the session; backpressure retains one
+ * transaction, including its exact byte offset and uncommitted frame state.
  * The guest cursor may move above output without moving the output cursor. */
 struct tigt_presenter {
     tigt_presenter_config config;
@@ -90,13 +97,13 @@ struct tigt_presenter {
     char *bytes;
     size_t used;
     int buffer_error;
+    bool output_pending, next_fullscreen, next_recovery_clear;
+    size_t written;
+    tigt_presenter_frame next_frame;
+    glass_cursor next_cursor;
+    unsigned next_host_columns, next_host_rows;
 };
 
-typedef struct {
-    unsigned column, row;
-    size_t logical_column;
-    unsigned scroll_top, scroll_bottom, scroll_count;
-} glass_cursor;
 
 static void
 bytes(tigt_presenter *p, const void *data, size_t count)
@@ -185,7 +192,7 @@ static const tigt_text_cell blank = { ' ', 0, 0, 0 };
 static const tigt_text_cell *
 old_cell(const tigt_presenter *p, const glass_cursor *cursor, unsigned row, unsigned column)
 {
-    if (!p->initialized)
+    if (!p->initialized || cursor->empty_baseline)
         return &blank;
     if (cursor->scroll_count && row >= cursor->scroll_top && row <= cursor->scroll_bottom) {
         if (row + cursor->scroll_count > cursor->scroll_bottom)
@@ -587,11 +594,11 @@ scrolling(const tigt_presenter *p, const tigt_presenter_frame *frame, glass_curs
         for (unsigned y = top; matches && y + shift <= bottom; y++) {
             const tigt_text_cell *previous = p->image + (size_t) (y + shift) * p->columns;
             matches = row_equal(previous, p->candidate + (size_t) y * p->columns, p->columns);
-            /* A continued logical line can fill its current physical row and
-             * scroll before the next snapshot. Its already-emitted prefix must
-             * still match exactly; only the not-yet-emitted suffix may differ. */
-            if (!matches && y + shift == cursor->row && cursor->column != 0 &&
-                p->mapping.base[cursor->row] != 0)
+            /* A partially observed line can finish and scroll before the next
+             * snapshot, with or without a confirmed soft wrap. Its prefix
+             * before the output cursor must still match exactly; the suffix
+             * remains writable before advancing to the following row. */
+            if (!matches && y + shift == cursor->row && cursor->column != 0)
                 matches = row_equal(previous, p->candidate + (size_t) y * p->columns,
                                     cursor->column < p->columns ? cursor->column : p->columns);
             if (!screen_blank(previous, p->columns))
@@ -622,7 +629,14 @@ analyze(tigt_presenter *p, const tigt_presenter_frame *frame, glass_cursor *curs
             cursor->logical_column = 0;
             return TIGT_OK;
         }
-        return TIGT_ERROR_UNREPRESENTABLE;
+        if (!screen_blank(p->image, (size_t) p->columns * p->rows))
+            return TIGT_ERROR_UNREPRESENTABLE;
+        /* No visible text needs relocation. Adopt the new geometry at the
+         * current output line without inventing a clear, and never index the
+         * old image using the new geometry (which may have more rows/columns). */
+        cursor->row = 0;
+        left(p, cursor, 0);
+        cursor->empty_baseline = true;
     }
     for (unsigned y = 0; y < frame->rows; y++) {
         const tigt_text_cell *row = p->candidate + (size_t) y * frame->columns;
@@ -742,11 +756,11 @@ plan_glass(tigt_presenter *p, const tigt_presenter_frame *frame, glass_cursor *c
 }
 
 static int
-write_output(tigt_presenter *p)
+write_output(tigt_presenter *p, bool nonblocking)
 {
     if (p->buffer_error != TIGT_OK)
         return p->buffer_error;
-    if (p->used == 0)
+    if (p->written == p->used)
         return TIGT_OK;
 #if defined(__APPLE__)
     /* Follow snapshot.c's borrowed-description SIGPIPE policy on Darwin. */
@@ -770,22 +784,27 @@ write_output(tigt_presenter *p)
     }
     bool pipe_was_pending = sigismember(&pending, SIGPIPE) == 1;
 #endif
-    size_t offset = 0;
     int result = TIGT_OK, saved = 0;
-    while (offset < p->used) {
-        ssize_t count = write(p->config.output_fd, p->bytes + offset, p->used - offset);
-        if (count > 0)
-            offset += (size_t) count;
-        else if (count < 0 && errno == EINTR)
+    while (p->written < p->used) {
+        ssize_t count = write(p->config.output_fd, p->bytes + p->written, p->used - p->written);
+        if (count > 0) {
+            p->written += (size_t) count;
+            if (!nonblocking || p->written == p->used)
+                continue;
+            result = TIGT_PRESENTER_WOULD_BLOCK;
+            break;
+        } else if (count < 0 && errno == EINTR && !nonblocking)
             continue;
         else {
             saved = count == 0 ? EIO : errno;
-            result = TIGT_ERROR_SYSTEM;
+            result = count < 0 && (saved == EAGAIN || saved == EWOULDBLOCK ||
+                     (nonblocking && saved == EINTR)) ?
+                     TIGT_PRESENTER_WOULD_BLOCK : TIGT_ERROR_SYSTEM;
             break;
         }
     }
 #if defined(__APPLE__)
-    if (no_sigpipe == 0 && fcntl(p->config.output_fd, F_SETNOSIGPIPE, no_sigpipe) < 0 && result == TIGT_OK) {
+    if (no_sigpipe == 0 && fcntl(p->config.output_fd, F_SETNOSIGPIPE, no_sigpipe) < 0 && result >= TIGT_OK) {
         saved = errno;
         result = TIGT_ERROR_SYSTEM;
     }
@@ -796,7 +815,7 @@ write_output(tigt_presenter *p)
         sigwait(&pipe_set, &received);
     }
     int restore = pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
-    if (restore != 0 && result == TIGT_OK) {
+    if (restore != 0 && result >= TIGT_OK) {
         saved = restore;
         result = TIGT_ERROR_SYSTEM;
     }
@@ -826,6 +845,57 @@ commit_glass(tigt_presenter *p, const tigt_presenter_frame *frame, const glass_c
     p->output_column = cursor->column;
     p->output_row = cursor->row;
     p->logical_column = cursor->logical_column;
+}
+
+static int
+finish_output(tigt_presenter *p, bool nonblocking)
+{
+    int result = write_output(p, nonblocking);
+    if (result == TIGT_PRESENTER_WOULD_BLOCK)
+        return result;
+    if (result != TIGT_OK) {
+        p->error = result;
+        return result;
+    }
+    if (p->next_fullscreen) {
+        commit(p, &p->next_frame);
+        p->host_columns = p->next_host_columns;
+        p->host_rows = p->next_host_rows;
+        discard_expectations(&p->queue);
+        memset(&p->mapping, 0, sizeof(p->mapping));
+        p->logical_column = 0;
+    } else
+        commit_glass(p, &p->next_frame, &p->next_cursor);
+    p->fullscreen = p->next_fullscreen;
+    p->recovery_clear = p->next_recovery_clear;
+    p->pending = p->output_pending = false;
+    p->pending_ticks = 0;
+    return p->fullscreen ? TIGT_PRESENTER_FULLSCREEN : TIGT_OK;
+}
+
+static int
+begin_output(tigt_presenter *p, const tigt_presenter_frame *frame,
+             const glass_cursor *cursor, bool recovery_clear, bool nonblocking)
+{
+    p->next_frame = *frame;
+    p->next_frame.cells = p->candidate;
+    p->next_frame.stride = frame->columns;
+    p->next_fullscreen = cursor == NULL;
+    p->next_recovery_clear = recovery_clear;
+    if (cursor != NULL)
+        p->next_cursor = *cursor;
+    p->written = 0;
+    p->output_pending = true;
+    return finish_output(p, nonblocking);
+}
+
+static int
+require_nonblocking(const tigt_presenter *p)
+{
+    int flags = fcntl(p->config.output_fd, F_GETFL);
+    if (flags < 0)
+        return TIGT_ERROR_SYSTEM;
+    return (flags & O_NONBLOCK) ? TIGT_OK : TIGT_ERROR_ARGUMENT;
 }
 
 static int
@@ -872,7 +942,8 @@ ansi_equal(const tigt_text_cell *a, const tigt_text_cell *b)
 }
 
 static int
-draw_fullscreen(tigt_presenter *p, const tigt_presenter_frame *frame, bool entering)
+draw_fullscreen(tigt_presenter *p, const tigt_presenter_frame *frame, bool entering,
+                bool recovery_clear, bool nonblocking)
 {
     unsigned host_columns, host_rows;
     int result = terminal_size(p, &host_columns, &host_rows);
@@ -919,17 +990,9 @@ draw_fullscreen(tigt_presenter *p, const tigt_presenter_frame *frame, bool enter
         unsigned x = frame->cursor_column < width ? frame->cursor_column : width - 1;
         sequence(p, "\033[%u;%uH", top + y, x + 1);
     }
-    result = write_output(p);
-    if (result == TIGT_OK) {
-        p->host_columns = host_columns;
-        p->host_rows = host_rows;
-        p->fullscreen = true;
-        commit(p, frame);
-        discard_expectations(&p->queue);
-        memset(&p->mapping, 0, sizeof(p->mapping));
-        p->logical_column = 0;
-    }
-    return result == TIGT_OK ? TIGT_PRESENTER_FULLSCREEN : result;
+    p->next_host_columns = host_columns;
+    p->next_host_rows = host_rows;
+    return begin_output(p, frame, NULL, recovery_clear, nonblocking);
 }
 
 static int
@@ -1036,6 +1099,8 @@ tigt_presenter_notify(tigt_presenter *p, const tigt_presenter_notification *noti
         return TIGT_ERROR_ARGUMENT;
     if (p->error != TIGT_OK)
         return p->error;
+    if (p->output_pending)
+        return TIGT_ERROR_BUSY;
     for (unsigned q = 0; q < p->queue.count; q++)
         if (p->expectations[p->queue.order[q]].id == notification->operation_id)
             return TIGT_OK;
@@ -1118,6 +1183,8 @@ tigt_presenter_cancel(tigt_presenter *p, uint64_t operation_id)
 {
     if (p == NULL || operation_id == 0)
         return TIGT_ERROR_ARGUMENT;
+    if (p->output_pending)
+        return TIGT_ERROR_BUSY;
     for (unsigned q = 0; q < p->queue.count; q++)
         if (p->expectations[p->queue.order[q]].id == operation_id) {
             remove_expectation(&p->queue, q, 1);
@@ -1140,13 +1207,20 @@ tigt_presenter_get_notification_stats(const tigt_presenter *p, tigt_presenter_no
     return TIGT_OK;
 }
 
-int
-tigt_presenter_present(tigt_presenter *p, const tigt_presenter_frame *frame)
+static int
+present(tigt_presenter *p, const tigt_presenter_frame *frame, bool nonblocking)
 {
     if (p == NULL)
         return TIGT_ERROR_ARGUMENT;
     if (p->error != TIGT_OK)
         return p->error;
+    if (p->output_pending)
+        return TIGT_ERROR_BUSY;
+    if (nonblocking) {
+        int mode_result = require_nonblocking(p);
+        if (mode_result != TIGT_OK)
+            return mode_result;
+    }
     int result = validate(p, frame);
     if (result != TIGT_OK)
         return result;
@@ -1165,6 +1239,8 @@ tigt_presenter_present(tigt_presenter *p, const tigt_presenter_frame *frame)
             !screen_blank(p->candidate, (size_t) frame->columns * frame->rows)) {
             /* A clear was actually observed at a vsync. Probe the new text
              * against that empty baseline before touching the host region. */
+            unsigned old_column = p->output_column, old_row = p->output_row;
+            size_t old_logical_column = p->logical_column;
             p->output_column = p->output_row = 0;
             p->logical_column = 0;
             glass_cursor cursor;
@@ -1193,39 +1269,36 @@ tigt_presenter_present(tigt_presenter *p, const tigt_presenter_frame *frame)
                             memmove(p->bytes + prefix, p->bytes, p->used);
                             memcpy(p->bytes, preparation, prefix);
                             p->used += prefix;
-                            result = write_output(p);
+                            result = p->buffer_error;
                         } else if (result == TIGT_OK)
                             result = TIGT_ERROR_SYSTEM;
                     }
                 }
-                if (result == TIGT_OK) {
-                    p->fullscreen = p->recovery_clear = p->pending = false;
-                    commit_glass(p, frame, &cursor);
-                    return TIGT_OK;
-                }
+                p->output_column = old_column;
+                p->output_row = old_row;
+                p->logical_column = old_logical_column;
+                if (result == TIGT_OK)
+                    return begin_output(p, frame, &cursor, false, nonblocking);
                 p->error = result;
                 return result;
             }
+            p->output_column = old_column;
+            p->output_row = old_row;
+            p->logical_column = old_logical_column;
         }
-        result = draw_fullscreen(p, frame, false);
-        if (result >= TIGT_OK)
-            p->recovery_clear = p->config.reversible &&
-                (cleared || (p->recovery_clear &&
-                 screen_blank(p->candidate, (size_t) frame->columns * frame->rows)));
-        else
+        bool recovery_clear = p->config.reversible &&
+            (cleared || (p->recovery_clear &&
+             screen_blank(p->candidate, (size_t) frame->columns * frame->rows)));
+        result = draw_fullscreen(p, frame, false, recovery_clear, nonblocking);
+        if (result < TIGT_OK)
             p->error = result;
         return result;
     }
     glass_cursor cursor;
     result = plan_glass(p, frame, &cursor);
-    if (result == TIGT_OK) {
-        result = write_output(p);
-        if (result == TIGT_OK) {
-            commit_glass(p, frame, &cursor);
-            p->pending = false;
-            p->pending_ticks = 0;
-        }
-    } else if (result == TIGT_ERROR_UNREPRESENTABLE) {
+    if (result == TIGT_OK)
+        return begin_output(p, frame, &cursor, false, nonblocking);
+    else if (result == TIGT_ERROR_UNREPRESENTABLE) {
         if (!p->pending) {
             p->pending = true;
             p->pending_ticks = 0;
@@ -1233,14 +1306,8 @@ tigt_presenter_present(tigt_presenter *p, const tigt_presenter_frame *frame)
             p->pending_ticks += 2100u / frame->refresh_hz;
         if (p->pending_ticks < 210)
             return TIGT_PRESENTER_PENDING;
-        if (p->config.mode == TIGT_PRESENT_ADAPTIVE) {
-            result = draw_fullscreen(p, frame, true);
-            if (result == TIGT_PRESENTER_FULLSCREEN) {
-                p->pending = false;
-                p->recovery_clear = false;
-                return result;
-            }
-        }
+        if (p->config.mode == TIGT_PRESENT_ADAPTIVE)
+            result = draw_fullscreen(p, frame, true, false, nonblocking);
     }
     if (result < TIGT_OK)
         p->error = result;
@@ -1248,16 +1315,48 @@ tigt_presenter_present(tigt_presenter *p, const tigt_presenter_frame *frame)
 }
 
 int
+tigt_presenter_present(tigt_presenter *p, const tigt_presenter_frame *frame)
+{
+    return present(p, frame, false);
+}
+
+int
+tigt_presenter_present_nonblocking(tigt_presenter *p, const tigt_presenter_frame *frame)
+{
+    return present(p, frame, true);
+}
+
+int
+tigt_presenter_resume(tigt_presenter *p)
+{
+    if (p == NULL)
+        return TIGT_ERROR_ARGUMENT;
+    if (p->error != TIGT_OK)
+        return p->error;
+    if (!p->output_pending)
+        return TIGT_ERROR_BUSY;
+    int result = require_nonblocking(p);
+    return result == TIGT_OK ? finish_output(p, true) : result;
+}
+
+int
+tigt_presenter_fullscreen_output_started(const tigt_presenter *p)
+{
+    return p != NULL && (p->fullscreen ||
+        (p->output_pending && p->next_fullscreen && p->written != 0));
+}
+
+int
 tigt_presenter_reset(tigt_presenter *p)
 {
     if (p == NULL)
         return TIGT_ERROR_ARGUMENT;
-    p->initialized = p->fullscreen = p->recovery_clear = p->pending = false;
+    p->initialized = p->fullscreen = p->recovery_clear = p->pending = p->output_pending = false;
     p->pending_ticks = 0;
     p->error = p->buffer_error = TIGT_OK;
     p->columns = p->rows = p->guest_column = p->guest_row = 0;
     p->output_column = p->output_row = p->host_columns = p->host_rows = 0;
-    p->used = 0;
+    p->used = p->written = 0;
     discard_expectations(&p->queue);
     memset(&p->mapping, 0, sizeof(p->mapping));
     memset(p->recent_ids, 0, sizeof(p->recent_ids));

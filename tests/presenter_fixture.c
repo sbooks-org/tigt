@@ -393,6 +393,85 @@ geometry_and_scrolling(void)
 }
 
 static void
+geometry_from_blank_baseline(void)
+{
+    fixture f;
+    create_file(&f, 80, 25, 60, TIGT_ENCODING_ASCII);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "");
+    f.frame.columns = f.frame.stride = 40;
+    blank_screen(&f);
+    text(&f, 0, 0, "M0");
+    position(&f, 1, 0);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "M0\n"); /* No invented clear between observed blank and new text. */
+    destroy(&f);
+
+    create_file(&f, 40, 1, 60, TIGT_ENCODING_ASCII);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    f.frame.columns = f.frame.stride = 80;
+    f.frame.rows = 2;
+    blank_screen(&f);
+    text(&f, 1, 0, "W");
+    position(&f, 1, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "\nW"); /* New rows/columns compare against a blank baseline. */
+    destroy(&f);
+
+    create_file(&f, 80, 25, 60, TIGT_ENCODING_ASCII);
+    text(&f, 2, 0, "X");
+    position(&f, 2, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "\n\nX");
+    f.frame.columns = f.frame.stride = 40;
+    blank_screen(&f);
+    text(&f, 0, 0, "M0");
+    position(&f, 1, 0);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+    EXPECT(&f, ""); /* A nonblank old geometry still cannot be discarded. */
+    destroy(&f);
+}
+
+static void
+scrolling_after_partial_line(void)
+{
+    fixture f;
+    create_file(&f, 20, 3, 60, TIGT_ENCODING_ASCII);
+    text(&f, 0, 0, "A");
+    text(&f, 1, 0, "B");
+    text(&f, 2, 0, "C");
+    position(&f, 2, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "A\nB\nC");
+    /* Ordinary text finishes its current row, then CR/LF scrolls before vsync.
+     * The retained prefix proves where to resume; no soft-wrap hint is needed. */
+    blank_screen(&f);
+    text(&f, 0, 0, "B");
+    text(&f, 1, 0, "CDEF");
+    text(&f, 2, 0, "G");
+    position(&f, 2, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "DEF\nG");
+    destroy(&f);
+
+    create_file(&f, 20, 3, 60, TIGT_ENCODING_ASCII);
+    text(&f, 0, 0, "A");
+    text(&f, 1, 0, "B");
+    text(&f, 2, 0, "C");
+    position(&f, 2, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "A\nB\nC");
+    blank_screen(&f);
+    text(&f, 0, 0, "B");
+    text(&f, 1, 0, "XDEF"); /* A changed emitted prefix does not prove a scroll. */
+    text(&f, 2, 0, "G");
+    position(&f, 2, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+    EXPECT(&f, "");
+    destroy(&f);
+}
+
+static void
 confirmation_and_recovery(void)
 {
     fixture f;
@@ -1033,12 +1112,157 @@ notification_lifetime_and_transactions(void)
     destroy(&f);
 }
 
+static size_t
+fill_pipe(int fd)
+{
+    char padding[4096];
+    memset(padding, '#', sizeof(padding));
+    size_t filled = 0;
+    for (size_t chunk = sizeof(padding); chunk != 0; chunk = chunk == 1 ? 0 : 1) {
+        for (;;) {
+            ssize_t count = write(fd, padding, chunk);
+            if (count < 0) {
+                CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+                break;
+            }
+            CHECK(count > 0);
+            filled += (size_t) count;
+        }
+    }
+    return filled;
+}
+
+static void
+discard_padding(int fd, size_t count)
+{
+    char buffer[4096];
+    while (count != 0) {
+        size_t chunk = count < sizeof(buffer) ? count : sizeof(buffer);
+        ssize_t received = read(fd, buffer, chunk);
+        CHECK(received > 0);
+        for (ssize_t i = 0; i < received; i++)
+            CHECK(buffer[i] == '#');
+        count -= (size_t) received;
+    }
+}
+
+static size_t
+drain_pipe(int fd, char *bytes, size_t capacity)
+{
+    size_t used = 0;
+    for (;;) {
+        CHECK(used < capacity);
+        ssize_t count = read(fd, bytes + used, capacity - used);
+        if (count < 0) {
+            CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+            return used;
+        }
+        CHECK(count > 0);
+        used += (size_t) count;
+    }
+}
+
+static void
+nonblocking_transactions(void)
+{
+    fixture f;
+    create_file(&f, 320, 67, 60, TIGT_ENCODING_ASCII);
+    for (unsigned i = 0; i < 21440; i++) {
+        f.cells[i].codepoint = 'A' + i % 26;
+        f.cells[i].flags = TIGT_PRESENT_BOLD | TIGT_TEXT_UNDERLINE;
+    }
+    position(&f, 66, 319);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    struct stat status;
+    CHECK(fstat(fileno(f.file), &status) == 0);
+    size_t length = (size_t) status.st_size;
+    CHECK(length > 4096); /* Force a partial transaction with one page available. */
+    char *expected = malloc(length), *actual = malloc(length + 1);
+    CHECK(expected != NULL && actual != NULL);
+    CHECK(pread(fileno(f.file), expected, length, 0) == (ssize_t) length);
+    tigt_presenter_destroy(f.presenter);
+    CHECK(fclose(f.file) == 0);
+    f.file = NULL;
+    int descriptors[2];
+    CHECK(pipe(descriptors) == 0);
+    f.master = descriptors[0];
+    f.slave = descriptors[1];
+    tigt_presenter_config config = {
+        TIGT_PRESENTER_ABI_VERSION, f.slave, TIGT_PRESENT_GLASS, TIGT_ENCODING_ASCII, 0
+    };
+    CHECK(tigt_presenter_create(&config, &f.presenter) == TIGT_OK);
+    CHECK(tigt_presenter_present_nonblocking(f.presenter, &f.frame) == TIGT_ERROR_ARGUMENT);
+    CHECK(fcntl(f.master, F_SETFL, fcntl(f.master, F_GETFL) | O_NONBLOCK) == 0);
+    CHECK(fcntl(f.slave, F_SETFL, fcntl(f.slave, F_GETFL) | O_NONBLOCK) == 0);
+    notify(&f, 1, 0, 0, "A", NULL, 0);
+    size_t padding = fill_pipe(f.slave);
+    CHECK(padding >= 4096);
+    CHECK(tigt_presenter_present_nonblocking(f.presenter, &f.frame) == TIGT_PRESENTER_WOULD_BLOCK);
+    for (unsigned i = 0; i < 200; i++)
+        CHECK(tigt_presenter_resume(f.presenter) == TIGT_PRESENTER_WOULD_BLOCK);
+    notification_stats(&f, 0, 0, 0, 1); /* Resumes are not additional guest vsyncs. */
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_ERROR_BUSY);
+    CHECK(tigt_presenter_present_nonblocking(f.presenter, &f.frame) == TIGT_ERROR_BUSY);
+    const uint32_t observed = 'B';
+    const tigt_presenter_notification observation = {
+        .operation_id = 2, .text = &observed, .text_length = 1,
+        .columns = 320, .rows = 67
+    };
+    CHECK(tigt_presenter_notify(f.presenter, &observation) == TIGT_ERROR_BUSY);
+    CHECK(tigt_presenter_cancel(f.presenter, 1) == TIGT_ERROR_BUSY);
+    discard_padding(f.master, 4096);
+    CHECK(tigt_presenter_resume(f.presenter) == TIGT_PRESENTER_WOULD_BLOCK);
+    f.cells[0].codepoint = 'Z'; /* The pending frame must own its original cells. */
+    discard_padding(f.master, padding - 4096);
+    size_t used = drain_pipe(f.master, actual, length + 1);
+    CHECK(used > 0 && used < length);
+    notification_stats(&f, 0, 0, 0, 1); /* Partial output has not committed matches. */
+    int result = TIGT_PRESENTER_WOULD_BLOCK;
+    for (unsigned attempts = 0; result == TIGT_PRESENTER_WOULD_BLOCK; attempts++) {
+        CHECK(attempts < length);
+        result = tigt_presenter_resume(f.presenter);
+        used += drain_pipe(f.master, actual + used, length + 1 - used);
+    }
+    CHECK(result == TIGT_OK && used == length && memcmp(actual, expected, length) == 0);
+    notification_stats(&f, 1, 0, 0, 0);
+    f.cells[0].codepoint = 'A';
+    CHECK(tigt_presenter_present_nonblocking(f.presenter, &f.frame) == TIGT_OK);
+    CHECK(drain_pipe(f.master, actual, length + 1) == 0);
+    CHECK(tigt_presenter_resume(f.presenter) == TIGT_ERROR_BUSY);
+    notification_stats(&f, 1, 0, 0, 0);
+
+    /* Reset cancels a partially emitted transaction immediately and does not
+     * accidentally commit its notification or leak its tail into later output. */
+    CHECK(tigt_presenter_reset(f.presenter) == TIGT_OK);
+    notify(&f, 3, 0, 0, "A", NULL, 0);
+    padding = fill_pipe(f.slave);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_WOULD_BLOCK);
+    discard_padding(f.master, 4096);
+    CHECK(tigt_presenter_resume(f.presenter) == TIGT_PRESENTER_WOULD_BLOCK);
+    CHECK(tigt_presenter_reset(f.presenter) == TIGT_OK);
+    CHECK(tigt_presenter_resume(f.presenter) == TIGT_ERROR_BUSY);
+    notification_stats(&f, 1, 1, 0, 0);
+    discard_padding(f.master, padding - 4096);
+    used = drain_pipe(f.master, actual, length + 1);
+    CHECK(used > 0 && used < length && memcmp(actual, expected, used) == 0);
+    blank_screen(&f);
+    text(&f, 0, 0, "Q");
+    position(&f, 0, 1);
+    CHECK(tigt_presenter_present_nonblocking(f.presenter, &f.frame) == TIGT_OK);
+    CHECK(drain_pipe(f.master, actual, length + 1) == 1 && actual[0] == 'Q');
+    destroy(&f);
+    free(expected);
+    free(actual);
+}
+
 int
 main(void)
 {
     editing();
     clears_and_attributes();
+    scrolling_after_partial_line();
     geometry_and_scrolling();
+    geometry_from_blank_baseline();
     confirmation_and_recovery();
     adaptive();
     validation_and_io();
@@ -1047,5 +1271,6 @@ main(void)
     notification_false_and_resync();
     notification_logical_edits();
     notification_lifetime_and_transactions();
+    nonblocking_transactions();
     return 0;
 }

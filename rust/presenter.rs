@@ -2,13 +2,15 @@
 // Copyright (C) 2026 Simplebooks Foundation
 // Copyright (C) 2026 Josh Rodd
 
-//! Synchronous, output-only glass-TTY and adaptive text presentation.
+//! Output-only glass-TTY and adaptive text presentation.
 //!
 //! Unlike [`crate::Session`], this API does not use curses, read input, change
 //! termios, install signal handlers, or enter the alternate screen. Submit every
 //! guest vsync, including unchanged frames, with the independent logical cursor.
 //! Serialize writes to the destination and its duplicates; never share it with a
 //! live curses session. The borrowed descriptor must outlive the presenter.
+//! Use [`Presenter::present_nonblocking`] and [`Presenter::resume`] with an
+//! `O_NONBLOCK` descriptor to service host control between bounded write attempts.
 
 use crate::TextCell;
 use std::{
@@ -77,11 +79,12 @@ pub struct Cursor {
     pub row: u16,
 }
 
-/// A snapshot borrowed only for the synchronous call to [`Presenter::present`].
+/// A snapshot borrowed only for a submission call, including nonblocking calls.
 ///
 /// `stride` counts cells, not bytes. Padding after the final row is unnecessary.
 /// The wrapper checks geometry and slice bounds; C validates cell contents.
-/// Colors and flags use the existing [`TextCell`] layout without a staging copy.
+/// Colors and flags use the existing [`TextCell`] layout. C retains its validated
+/// candidate image, never this slice, while a nonblocking transaction is pending.
 #[derive(Clone, Copy, Debug)]
 pub struct Frame<'a> {
     pub cells: &'a [TextCell],
@@ -101,13 +104,46 @@ pub enum Status {
     Fullscreen,
 }
 
+impl Status {
+    fn from_status(status: c_int) -> Result<Self, Error> {
+        match status {
+            0 => Ok(Self::Glass),
+            1 => Ok(Self::Pending),
+            2 => Ok(Self::Fullscreen),
+            other => Err(Error::from_status(other)),
+        }
+    }
+}
+
+/// Completion of one submitted vsync, or output that still needs draining.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Progress {
+    Complete(Status),
+    /// Call [`Presenter::resume`] without resubmitting the frame.
+    /// Includes short writes and interrupted writes, not only `EAGAIN`.
+    WouldBlock,
+}
+
+impl Progress {
+    fn from_status(status: c_int) -> Result<Self, Error> {
+        if status == 4 {
+            Ok(Self::WouldBlock)
+        } else {
+            Status::from_status(status).map(Self::Complete)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Argument,
     /// Adaptive mode requires a terminal destination.
     Terminal,
     Busy,
-    /// Allocation or I/O failure. I/O failures are terminal until reset.
+    /// A synchronous submission encountered backpressure; its transaction is
+    /// retained. Set `O_NONBLOCK` and use [`Presenter::resume`] to finish it.
+    WouldBlock,
+    /// Allocation or hard I/O failure. Hard I/O failures are terminal until reset.
     System,
     /// Confirmed glass-TTY failure (ABORT); sticky until an explicit reset.
     Unrepresentable,
@@ -123,6 +159,7 @@ impl Error {
             -3 => Self::Busy,
             -4 => Self::System,
             -5 => Self::Unrepresentable,
+            4 => Self::WouldBlock,
             other => Self::UnexpectedStatus(other),
         }
     }
@@ -134,6 +171,7 @@ impl fmt::Display for Error {
             Self::Argument => f.write_str("invalid tigt presenter argument or frame buffer"),
             Self::Terminal => f.write_str("tigt adaptive presentation requires a terminal"),
             Self::Busy => f.write_str("the tigt presenter is unavailable"),
+            Self::WouldBlock => f.write_str("tigt presenter output needs resuming"),
             Self::System => f.write_str("a tigt presenter system operation failed"),
             Self::Unrepresentable => {
                 f.write_str("guest text cannot be represented as glass-TTY output")
@@ -227,9 +265,32 @@ struct RawFrame {
     hints: u32,
 }
 
+impl Frame<'_> {
+    fn raw(self) -> Result<RawFrame, Error> {
+        crate::validate_text(self.cells, self.columns, self.rows, self.stride)
+            .map_err(|_| Error::Argument)?;
+        if self.cursor.column >= self.columns || self.cursor.row >= self.rows {
+            return Err(Error::Argument);
+        }
+        Ok(RawFrame {
+            cells: self.cells.as_ptr(),
+            columns: self.columns,
+            rows: self.rows,
+            stride: self.stride,
+            cursor_column: self.cursor.column,
+            cursor_row: self.cursor.row,
+            refresh_hz: self.refresh_rate as u16,
+            hints: 0,
+        })
+    }
+}
+
 unsafe extern "C" {
     fn tigt_presenter_create(config: *const RawConfig, output: *mut *mut c_void) -> c_int;
     fn tigt_presenter_present(presenter: *mut c_void, frame: *const RawFrame) -> c_int;
+    fn tigt_presenter_present_nonblocking(presenter: *mut c_void, frame: *const RawFrame) -> c_int;
+    fn tigt_presenter_resume(presenter: *mut c_void) -> c_int;
+    fn tigt_presenter_fullscreen_output_started(presenter: *const c_void) -> c_int;
     fn tigt_presenter_reset(presenter: *mut c_void) -> c_int;
     fn tigt_presenter_destroy(presenter: *mut c_void);
     fn tigt_presenter_notify(presenter: *mut c_void, notification: *const RawNotification)
@@ -246,7 +307,7 @@ unsafe extern "C" {
 /// Mutable borrows serialize all operations. Like the existing video adapter,
 /// the opaque pointer makes this type neither Send nor Sync. The fd borrow
 /// prevents closing its owner while the presenter remains in use; writes through
-/// other handles must still be serialized by the application. Blocking output
+/// other handles must still be serialized by the application. Synchronous output
 /// can block a call. Dropping or resetting does not clear emitted output.
 /// On macOS, SIGPIPE suppression temporarily changes the borrowed open-file
 /// description's no-SIGPIPE flag and restores it before returning, so the
@@ -294,29 +355,54 @@ impl<'fd> Presenter<'fd> {
     /// speculative, ordered output expectations. Only matching screen evidence
     /// can confirm their soft-wrap annotations.
     pub fn present(&mut self, frame: Frame<'_>) -> Result<Status, Error> {
-        crate::validate_text(frame.cells, frame.columns, frame.rows, frame.stride)
-            .map_err(|_| Error::Argument)?;
-        if frame.cursor.column >= frame.columns || frame.cursor.row >= frame.rows {
-            return Err(Error::Argument);
-        }
-        let raw_frame = RawFrame {
-            cells: frame.cells.as_ptr(),
-            columns: frame.columns,
-            rows: frame.rows,
-            stride: frame.stride,
-            cursor_column: frame.cursor.column,
-            cursor_row: frame.cursor.row,
-            refresh_hz: frame.refresh_rate as u16,
-            hints: 0,
-        };
-        // Bounds above cover every visible cell. repr(C) TextCell is shared
-        // directly with C, which retains neither the slice nor this descriptor.
-        match unsafe { tigt_presenter_present(self.raw.as_ptr(), &raw_frame) } {
-            0 => Ok(Status::Glass),
-            1 => Ok(Status::Pending),
-            2 => Ok(Status::Fullscreen),
-            other => Err(Error::from_status(other)),
-        }
+        let raw_frame = frame.raw()?;
+        // Bounds above cover every visible cell. C retains its validated image,
+        // not the caller's slice or this descriptor.
+        Status::from_status(unsafe { tigt_presenter_present(self.raw.as_ptr(), &raw_frame) })
+    }
+
+    /// Submits one vsync with at most one write syscall and no waiting.
+    ///
+    /// Requires caller-set `O_NONBLOCK`; a blocking descriptor is rejected before
+    /// accepting the frame. [`Progress::WouldBlock`] retains exact unwritten bytes
+    /// and the candidate frame. Service host control and, if appropriate, wait
+    /// for writability before calling [`Self::resume`]. Do not resubmit the frame.
+    /// Short writes and `EINTR` also yield; no output is duplicated on resumption.
+    ///
+    /// Only one bounded transaction exists. New submissions, [`Self::notify`],
+    /// and [`Self::cancel`] return [`Error::Busy`] until it completes or is reset.
+    /// The input slice may be reused as soon as this call returns.
+    ///
+    /// POSIX may ignore `O_NONBLOCK` on regular files, whose writes can still
+    /// block in the kernel. Pipes and terminals support nonblocking output.
+    pub fn present_nonblocking(&mut self, frame: Frame<'_>) -> Result<Progress, Error> {
+        let raw_frame = frame.raw()?;
+        Progress::from_status(unsafe {
+            tigt_presenter_present_nonblocking(self.raw.as_ptr(), &raw_frame)
+        })
+    }
+
+    /// Attempts at most one nonblocking write of the pending transaction.
+    ///
+    /// Requires `O_NONBLOCK`. Does not advance guest vsync time or reconsider
+    /// notifications. Completion commits the frame and notification decisions
+    /// once; its status then describes the new presentation mode.
+    /// Returns [`Error::Busy`] when there is no pending output. Suspension or
+    /// cancellation can be serviced between attempts without entering C again.
+    pub fn resume(&mut self) -> Result<Progress, Error> {
+        Progress::from_status(unsafe { tigt_presenter_resume(self.raw.as_ptr()) })
+    }
+
+    /// Whether fullscreen output is committed or has begun emitting bytes.
+    ///
+    /// Read after submission/resumption, including on errors, before resetting
+    /// to decide whether terminal restoration controls are needed. Ordinary
+    /// glass output and blocked fullscreen entry with no emitted bytes return
+    /// false. This is current state, not a historical latch: it remains true
+    /// during pending glass recovery, then clears on completion or reset.
+    /// Performs no I/O; callers may publish the result for emergency recovery.
+    pub fn fullscreen_output_started(&self) -> bool {
+        unsafe { tigt_presenter_fullscreen_output_started(self.raw.as_ptr()) != 0 }
     }
 
     /// Queues an expectation without emitting text or retaining its slices.
@@ -364,8 +450,10 @@ impl<'fd> Presenter<'fd> {
 
     /// Starts a new empty glass baseline, clearing sticky failures.
     ///
-    /// Emits nothing. The consumer must first prepare the destination; this is
-    /// not automatic recovery or restoration of terminal contents.
+    /// Emits nothing and immediately discards any pending output transaction.
+    /// The consumer must first prepare the destination, including recovery from
+    /// partially emitted escape sequences; this does not roll back emitted bytes
+    /// or automatically restore terminal contents.
     pub fn reset(&mut self) -> Result<(), Error> {
         match unsafe { tigt_presenter_reset(self.raw.as_ptr()) } {
             0 => Ok(()),

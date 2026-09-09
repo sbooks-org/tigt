@@ -47,18 +47,22 @@ This is an additive, output-only API, independent of the curses `Session` and re
 |---|---|---|
 | `tigt_presenter_create(&config,&presenter)` | `Presenter::new(fd.as_fd(), config)` | Allocate an opaque presenter with a borrowed output fd. |
 | `tigt_presenter_present(presenter,&frame)` | `presenter.present(frame)` | Synchronously submit **every guest vsync**, including unchanged snapshots. |
+| `tigt_presenter_present_nonblocking(presenter,&frame)` | `presenter.present_nonblocking(frame)` | Submit a vsync using at most one nonblocking write. |
+| `tigt_presenter_resume(presenter)` | `presenter.resume()` | Continue the exact pending transaction without submitting another vsync. |
 | `tigt_presenter_reset(presenter)` | `presenter.reset()` | Start an empty glass baseline without emitting anything. |
 | `tigt_presenter_destroy(presenter)` | `Drop` | Free state; never close the output fd. |
 
 The presenter configuration uses `TIGT_PRESENTER_ABI_VERSION`, not the curses ABI version. Mode is `TIGT_PRESENT_GLASS` / `Mode::Glass` or `TIGT_PRESENT_ADAPTIVE` / `Mode::Adaptive`. Encoding is `TIGT_ENCODING_LOCALE`, `TIGT_ENCODING_UTF8`, or `TIGT_ENCODING_ASCII` / `Encoding::{Locale,Utf8,Ascii}`. The C `reversible` field is 0 or 1; Rust uses `Reversibility::{OneWay,Reversible}`. This option controls adaptive fallback, not pure glass mode.
 
-C callers retain ownership of the descriptor and serialize presenter operations and writes through every alias of that destination. Rust retains a `BorrowedFd` for the presenter's lifetime and uses mutable borrows for operations; it neither duplicates the fd nor takes ownership. The presenter is neither Send nor Sync. Submission retains neither the input slice nor its descriptor; Rust passes the existing `repr(C)` `TextCell` storage directly, without a cell-copy staging buffer. Blocking descriptor writes can block the calling thread. There are no input reads, termios changes, signal handlers, or alternate-screen entry/exit.
+C callers retain ownership of the descriptor and serialize presenter operations and writes through every alias of that destination. Rust retains a `BorrowedFd` for the presenter's lifetime and uses mutable borrows for operations; it neither duplicates the fd nor takes ownership. The presenter is neither Send nor Sync. Submission retains neither the input slice nor its descriptor; Rust passes the existing `repr(C)` `TextCell` storage directly, without a Rust staging buffer. C retains its validated candidate image until output commits. Blocking descriptor writes in the synchronous API can block the calling thread. There are no input reads, termios changes, signal handlers, or alternate-screen entry/exit.
 
 On macOS, writes temporarily enable no-SIGPIPE on the borrowed open-file description and restore its previous setting; this is another reason to serialize descriptor aliases. Other supported POSIX platforms suppress write-generated SIGPIPE on the calling thread without installing a signal handler.
 
 ### Snapshots, cursor and confirmation
 
 Frames use the text geometry limits above (1..320 columns, 1..128 rows, at most 21440 visible cells), not a fixed 80×25 assumption: 40- and 20-column guests are supported. Stride is in cells and at least columns; the slice must reach the last visible cell, with no required padding after the last row. The logical cursor is an explicit zero-based `(cursor_column,cursor_row)` / `Cursor { column, row }` inside the guest frame. It is independent of `TIGT_TEXT_CURSOR`, cursor visibility, and blink phase. Glass output never renders, shows, hides or simulates a terminal cursor.
+
+A geometry change can adopt new text directly when the previously committed screen is entirely blank: the presenter uses an empty baseline at the current output line, without inventing a clear or requiring another blank frame in the new mode. Both shrinking and growing geometry are supported this way. If the old screen contains text, a nonblank geometry change remains unrepresentable; an actually observed clear is still required before discarding that layout.
 
 Submit a coherent VRAM/register snapshot taken at vsync, not cells accumulated across different raster scanlines. For raw text apertures, `tigt_video_decode_text` accepts the current CRTC geometry without changing the legacy decoder contract. A guest may update text before updating its hardware cursor; an unchanged guest cursor is not a new leftward-movement request, and does not rewind the emitted glass cursor.
 
@@ -73,7 +77,21 @@ Confirmation is 100 ms measured in submitted vsync intervals after first detecti
 | `TIGT_PRESENTER_FULLSCREEN` | `Ok(Status::Fullscreen)` | Adaptive fallback is active. |
 | `TIGT_ERROR_UNREPRESENTABLE` | `Err(presenter::Error::Unrepresentable)` | Confirmed pure-glass ABORT; consumer chooses recovery. |
 
-Argument, terminal, busy and system failures propagate as the corresponding `presenter::Error` variants; unknown statuses preserve their numeric value. Unrepresentability and I/O failures are sticky until reset. Reset emits nothing: the consumer must prepare the destination before starting a new empty glass baseline. Reset is not an implicit repair of previously emitted text.
+Argument, terminal, busy and system failures propagate as the corresponding `presenter::Error` variants; unknown statuses preserve their numeric value. Unrepresentability and hard I/O failures are sticky until reset; ordinary backpressure is not. Reset emits nothing: the consumer must prepare the destination before starting a new empty glass baseline. Reset is not an implicit repair of previously emitted text.
+
+### Nonblocking output and cancellation
+
+Set `O_NONBLOCK` on the borrowed output descriptor before calling `present_nonblocking` or `resume`; these functions check the flag and reject a blocking descriptor without accepting a frame or writing. They never change the flag, poll, sleep, or start a background thread. Each call attempts at most **one** `write` syscall. A short write, `EAGAIN`/`EWOULDBLOCK`, or `EINTR` returns `TIGT_PRESENTER_WOULD_BLOCK` / `Ok(Progress::WouldBlock)`. This is a resumable result, not a sticky I/O failure. On platforms that ignore `O_NONBLOCK` for regular files, disk-file writes can still block in the kernel; the bounded nonblocking guarantee applies to pipes, sockets, and terminals that honor the flag.
+
+After `WouldBlock`, service host cancellation or suspension, wait for writability if appropriate, and call `resume()` without supplying another frame. C retains the exact unwritten suffix and the original candidate image, cursor, presentation-mode transition, and notification decisions in **one bounded transaction**. The caller may immediately reuse the original frame storage. Resumption does not validate a new snapshot, advance vsync time, rerun confirmation, or consume notifications again. Only complete output commits the image and notification decisions. Completion returns the ordinary C status or Rust `Ok(Progress::Complete(Status::{Glass,Pending,Fullscreen}))`; `Pending` is guest representability confirmation, not output backpressure.
+
+Until output completes, both submission variants, `notify`, and notification `cancel` return `BUSY` / `Error::Busy` without changing the pending transaction. Statistics remain readable. Calling `resume` with no pending transaction also returns `Busy`. There is no frame queue or coalescing: consumers needing lossless per-vsync output must stop guest advancement while draining, rather than accumulate unlimited frames or silently skip them. Do not turn resume attempts into extra guest vsync submissions.
+
+`reset` or destruction immediately discards unwritten output without issuing any writes or committing speculative notification matches. Already emitted bytes cannot be undone. To suspend and later continue against a changed terminal, prepare a fresh destination baseline and reset before submitting the current screen. In particular, cancellation can split a UTF-8 character or ANSI sequence; terminate a pending escape sequence (for example, with ANSI CAN) before emitting restoration controls. Reset clears fullscreen state; adaptive fallback is then reconsidered normally. A caller can instead retain the pending transaction across a pause if the destination remains untouched.
+
+To avoid emitting restoration controls for untouched glass output, query `tigt_presenter_fullscreen_output_started(presenter)` / `presenter.fullscreen_output_started()` after each submission or resumption, including errors, and before reset. It returns true when fullscreen is committed or a pending fullscreen transaction has emitted at least one byte. Thus it detects a partial first fullscreen entry even before `Complete(Fullscreen)`. It remains true during pending recovery to glass, then becomes false on successful recovery or reset. This is current state, not a historical latch; callers can publish or retain it according to their emergency-restoration policy. The query performs no I/O or allocation and still requires serialized presenter access. The C query returns zero for NULL.
+
+The existing `present` method remains synchronous on blocking descriptors. If a descriptor is nonblocking and it encounters `EAGAIN`, C returns `TIGT_PRESENTER_WOULD_BLOCK` and Rust returns nonsticky `Error::WouldBlock`; the transaction is retained and can be finished with `resume` after ensuring `O_NONBLOCK`. Hard I/O errors remain terminal until reset, including errors after a partially successful write.
 
 ### Glass byte rules
 
@@ -82,7 +100,7 @@ Glass presentation reconstructs a stream from successive snapshots, not a sequen
 | Guest operation | Output rule |
 |---|---|
 | New line | NL (`0x0a`) with implied carriage return, **not CRLF**. Never depend on host automatic wrapping at guest column boundaries. |
-| Upward block scroll | Detect retained rows and emit only the necessary newlines/new text, without duplicating previous output. |
+| Upward block scroll | Detect retained rows and emit only the necessary newlines/new text, without duplicating previous output. A partially observed cursor row may finish before scrolling if its prefix before the output cursor still matches exactly; its writable suffix is emitted before advancing. This does not require a soft-wrap notification and never reconstructs text that disappeared between snapshots. |
 | Same-line rewrite/count-up | Bare CR (`0x0d`); avoid premature space blanking while replacement text is arriving. |
 | Whole-screen clear at cursor `(0,0)` | FF (`0x0c`, never `0xff`). If the only previous text is one row beginning at `(0,0)`, clear that row with CR and spaces instead of FF. |
 | Blank tab spacing | Compress using standard eight-column TAB stops. |
@@ -140,7 +158,7 @@ Predictions expire after 2000 ms of guest vsync time, independently of the 100 m
 
 `tigt_presenter_cancel(presenter, operation_id)` / `presenter.cancel(operation_id)` withdraws the remaining prediction idempotently. `tigt_presenter_get_notification_stats` / `presenter.notification_stats()` reports consumed, discarded and expired operation counts plus current queue length. Counters are cumulative across reset and count operations, not characters; resynchronization past an unseen operation prefix counts that operation as discarded.
 
-The frame's reserved `hints` field remains **zero**; the queue is a separate API. Serialize notifications, cancellation and frame submissions on the presenter owner. Continue submitting every vsync normally, not extra frames per interrupt call.
+The frame's reserved `hints` field remains **zero**; the queue is a separate API. Serialize notifications, cancellation and frame submissions on the presenter owner; drain pending output before accepting further notifications or cancellation. Continue submitting every vsync normally, not extra frames per interrupt call.
 
 Predictions cannot recover text written and overwritten, or scrolled entirely away, between snapshots. Such output requires a stronger confirmed-output source; this API deliberately does not invent it from observed call arguments.
 
@@ -225,7 +243,7 @@ The input decoder is independent of a curses session and of the keyboard mapper:
 
 Feed arbitrary stream fragments; UTF-8 and escape sequences can span calls. Flush resolves a pending bare Escape; the embedding application chooses when to do that. Live sessions perform their own input polling/escape timeout. No key is reserved: Ctrl+C and Ctrl+Z are semantic input events.
 
-Events distinguish press, repeat and release; key identity includes Unicode characters, function keys, navigation, editing, lock and modifier keys. Modifier bits cover Shift, Control, Alt and Super. The decoder understands supported traditional terminal sequences and Kitty keyboard events. Legacy terminal taps cannot reconstruct physical key-release timing that the transport never reported. Invalid or unsupported input is not a promise of arbitrary terminal-protocol compatibility.
+Events distinguish press, repeat and release; key identity includes Unicode characters, function keys, navigation, editing, lock and modifier keys. Modifier bits cover Shift, Control, Alt and Super. The decoder understands supported traditional terminal sequences and Kitty keyboard events, including fragmented SS3 (`ESC O`) arrows, Home/End, keypad Begin, and F1–F4. SS3 R is F3; CSI R remains a cursor-position report, not a key. Legacy terminal taps cannot reconstruct physical key-release timing that the transport never reported. Invalid or unsupported input is not a promise of arbitrary terminal-protocol compatibility.
 
 C decoder creation rejects a NULL callback. Feed/flush/destroy must be externally serialized. A decoder callback executes synchronously during explicit feed/flush; a live-session callback executes on the input worker.
 

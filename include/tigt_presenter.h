@@ -9,6 +9,7 @@ extern "C" {
 #define TIGT_ERROR_UNREPRESENTABLE -5
 #define TIGT_PRESENTER_PENDING 1
 #define TIGT_PRESENTER_FULLSCREEN 2
+#define TIGT_PRESENTER_WOULD_BLOCK 4
 
 enum { TIGT_PRESENT_GLASS = 0, TIGT_PRESENT_ADAPTIVE = 1 };
 enum { TIGT_ENCODING_LOCALE = 0, TIGT_ENCODING_UTF8 = 1, TIGT_ENCODING_ASCII = 2 };
@@ -90,18 +91,48 @@ int tigt_presenter_notify(tigt_presenter *presenter, const tigt_presenter_notifi
 int tigt_presenter_cancel(tigt_presenter *presenter, uint64_t operation_id);
 int tigt_presenter_get_notification_stats(const tigt_presenter *presenter,
                                           tigt_presenter_notification_stats *stats);
-/* Output-only, synchronous; submit once per vsync, including unchanged frames.
+/* Output-only; submit once per vsync, including unchanged frames.
  * The caller serializes all operations and owns the borrowed output fd. Never
  * share output with a live curses session. Adaptive mode requires a TTY fd.
  * No stdin reads, termios raw mode, alternate screen, or signal handlers.
  * Returned status: OK (glass), PENDING (confirmation), FULLSCREEN, or error.
- * UNREPRESENTABLE is sticky until reset; I/O errors are likewise terminal.
+ * UNREPRESENTABLE and hard I/O errors are sticky until reset. Ordinary output
+ * backpressure returns WOULD_BLOCK and retains a resumable transaction.
  * Destroy frees state, never closes the fd. Reset starts a new empty glass
  * baseline without emitting output; consumer must have prepared its destination.
  * Logical cursor position is independent of TIGT_TEXT_CURSOR/visibility.
  */
 int tigt_presenter_create(const tigt_presenter_config *config, tigt_presenter **output);
 int tigt_presenter_present(tigt_presenter *presenter, const tigt_presenter_frame *frame);
+/* Bounded output: requires O_NONBLOCK on the borrowed fd; does not change it.
+ * Each call attempts at most one write, never polls, sleeps, or retries EINTR.
+ * WOULD_BLOCK means that exact unwritten bytes and the pending frame are owned
+ * by the presenter. This includes short writes and EINTR, not just EAGAIN.
+ * Resume without resubmitting the frame; neither frame time nor notification
+ * matching advances on resume. Completion returns OK, PENDING, or FULLSCREEN.
+ * Input frame storage may be reused immediately after submission returns.
+ *
+ * There is one bounded transaction, not a frame queue. Until it completes,
+ * present (either variant), notify, and cancel return BUSY without mutation.
+ * resume without a pending transaction returns BUSY. Stats remain readable.
+ * Callers can service cancellation/suspension between attempts and wait for
+ * writability themselves. Reset/destroy discard pending output immediately,
+ * without writing or rolling back emitted bytes; prepare the destination before
+ * continuing after reset, especially if cancellation split an escape sequence.
+ *
+ * The original present API continues writing until complete on blocking fds.
+ * It also preserves a transaction on EAGAIN; set O_NONBLOCK before resuming.
+ * On platforms that ignore O_NONBLOCK for regular files, file writes may block.
+ */
+int tigt_presenter_present_nonblocking(tigt_presenter *presenter, const tigt_presenter_frame *frame);
+int tigt_presenter_resume(tigt_presenter *presenter);
+/* Nonzero if fullscreen is committed or a pending fullscreen transaction has
+ * emitted any bytes. Read after present/resume, including errors, before reset
+ * when deciding whether terminal restoration is needed. This is current state,
+ * not a historical latch; completed glass recovery and reset clear it.
+ * Performs no I/O. NULL returns zero. Caller still serializes access.
+ */
+int tigt_presenter_fullscreen_output_started(const tigt_presenter *presenter);
 int tigt_presenter_reset(tigt_presenter *presenter);
 void tigt_presenter_destroy(tigt_presenter *presenter);
 #ifdef __cplusplus

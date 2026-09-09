@@ -484,6 +484,91 @@ fn output_presenter_preserves_glass_bytes_and_adaptive_transitions() {
 }
 
 #[test]
+fn rust_presenter_resumes_owned_frame_after_backpressure() {
+    use std::{
+        io::{Read, Write},
+        os::{fd::AsFd, unix::net::UnixStream},
+    };
+    use tigt::{
+        TextCell,
+        presenter::{
+            Config, Cursor, Encoding, Error, Frame, Mode, Notification, Presenter, Progress,
+            RefreshRate, Reversibility, Status,
+        },
+    };
+
+    let (writer, mut reader) = UnixStream::pair().unwrap();
+    writer.set_nonblocking(true).unwrap();
+    reader.set_nonblocking(true).unwrap();
+    let mut output = &writer;
+    let mut padding = 0;
+    loop {
+        match output.write(&[b'#'; 4096]) {
+            Ok(count) => {
+                assert_ne!(count, 0);
+                padding += count;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("filling destination: {error}"),
+        }
+    }
+    let mut presenter = Presenter::new(
+        writer.as_fd(),
+        Config {
+            mode: Mode::Glass,
+            encoding: Encoding::Ascii,
+            reversibility: Reversibility::OneWay,
+        },
+    )
+    .unwrap();
+    let mut cells = [TextCell {
+        codepoint: b' ' as u32,
+        foreground: 0,
+        background: 0,
+        flags: 0,
+    }; 4];
+    cells[0].codepoint = b'A' as u32;
+    cells[1].codepoint = b'B' as u32;
+    presenter
+        .notify(Notification {
+            operation_id: 1,
+            text: &[b'A' as u32, b'B' as u32],
+            boundaries: &[],
+            columns: 4,
+            rows: 1,
+            start: Cursor { column: 0, row: 0 },
+        })
+        .unwrap();
+    assert_eq!(
+        presenter.present_nonblocking(Frame {
+            cells: &cells,
+            columns: 4,
+            rows: 1,
+            stride: 4,
+            cursor: Cursor { column: 2, row: 0 },
+            refresh_rate: RefreshRate::Hz60,
+        }),
+        Ok(Progress::WouldBlock)
+    );
+    cells[0].codepoint = b'Z' as u32;
+    assert_eq!(presenter.resume(), Ok(Progress::WouldBlock));
+    assert_eq!(presenter.notification_stats().unwrap().consumed, 0);
+    let mut discarded = vec![0; padding];
+    reader.read_exact(&mut discarded).unwrap();
+    assert!(discarded.iter().all(|byte| *byte == b'#'));
+    assert_eq!(presenter.resume(), Ok(Progress::Complete(Status::Glass)));
+    let mut actual = [0; 2];
+    reader.read_exact(&mut actual).unwrap();
+    assert_eq!(&actual, b"AB");
+    assert_eq!(presenter.notification_stats().unwrap().consumed, 1);
+    assert_eq!(presenter.resume(), Err(Error::Busy));
+    assert_eq!(
+        reader.read(&mut actual).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
 fn production_palette_masks_transitions_bounds_and_all_thirteen_font_color_pairs() {
     let fixture = Fixture::build("renderer_fixture", true, true);
     let font = synthetic_font();
