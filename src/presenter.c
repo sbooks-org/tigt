@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <termios.h>
 #include <unistd.h>
 #include <wchar.h>
 #if defined(__APPLE__)
@@ -70,14 +71,23 @@ struct tigt_presenter {
     bool utf8;
     bool initialized;
     bool fullscreen;
-    bool recovery_clear;
+    bool recovery_boundary, recovery_text, recovery_confirming;
+    unsigned recovery_ticks;
     bool pending;
     unsigned pending_ticks; /* 1/2100 s: exact 50/60/70 Hz intervals. */
+    unsigned video_disabled_ticks;
+    bool video_disabled_released;
+    bool scroll_holding;
+    unsigned scroll_ticks;
     int error;
     uint16_t columns, rows;
     uint16_t guest_column, guest_row;
     unsigned output_column, output_row;
     unsigned host_columns, host_rows;
+    unsigned host_column, host_row, region_top, region_height;
+    bool host_cursor_known, host_wrap, matching_echo, echo_failed;
+    uint32_t local_echo[TIGT_PRESENTER_LOCAL_ECHO_MAX];
+    unsigned echo_start, echo_count, trial_echo_consumed;
     size_t logical_column;
     logical_rows mapping, trial_mapping;
     unsigned boundary_proof[128];
@@ -98,11 +108,23 @@ typedef struct {
     unsigned scroll_top, scroll_bottom, scroll_count;
 } glass_cursor;
 
+typedef struct {
+    unsigned top, bottom, count;
+    bool incomplete;
+} scroll_analysis;
+
+static bool scroll_matches_echo(tigt_presenter *p, const tigt_presenter_frame *frame,
+                                const scroll_analysis *scroll);
+
 static void
 bytes(tigt_presenter *p, const void *data, size_t count)
 {
     if (p->buffer_error != TIGT_OK)
         return;
+    if (p->matching_echo && p->trial_echo_consumed < p->echo_count) {
+        p->buffer_error = TIGT_ERROR_UNREPRESENTABLE;
+        return;
+    }
     if (count > PRESENTER_BYTES - p->used) {
         p->buffer_error = TIGT_ERROR_SYSTEM;
         errno = EOVERFLOW;
@@ -115,6 +137,16 @@ bytes(tigt_presenter *p, const void *data, size_t count)
 static void
 byte(tigt_presenter *p, char value)
 {
+    if (p->matching_echo && p->trial_echo_consumed < p->echo_count) {
+        unsigned slot = (p->echo_start + p->trial_echo_consumed) % TIGT_PRESENTER_LOCAL_ECHO_MAX;
+        if (value == '\r' && p->local_echo[slot] == '\n')
+            return; /* The CR half of DOS CR/LF was included in host echo. */
+        if (value != '\n' || p->local_echo[slot] != '\n')
+            p->buffer_error = TIGT_ERROR_UNREPRESENTABLE;
+        else
+            p->trial_echo_consumed++;
+        return;
+    }
     bytes(p, &value, 1);
 }
 
@@ -424,6 +456,14 @@ match_expectations(tigt_presenter *p, const tigt_presenter_frame *frame, const g
 static void
 glass_glyph(tigt_presenter *p, const tigt_text_cell *cell)
 {
+    if (p->trial_echo_consumed < p->echo_count) {
+        unsigned slot = (p->echo_start + p->trial_echo_consumed) % TIGT_PRESENTER_LOCAL_ECHO_MAX;
+        if (p->local_echo[slot] != cell->codepoint)
+            p->buffer_error = TIGT_ERROR_UNREPRESENTABLE;
+        else
+            p->trial_echo_consumed++;
+        return;
+    }
     if (cell->codepoint != ' ' && (cell->flags & TIGT_TEXT_UNDERLINE))
         bytes(p, "_\b", 2);
     glyph(p, cell->codepoint);
@@ -440,7 +480,8 @@ forward(tigt_presenter *p, glass_cursor *cursor, const tigt_presenter_frame *fra
     const tigt_text_cell *row = p->candidate + (size_t) cursor->row * frame->columns;
     while (cursor->column < target) {
         unsigned stop = cursor->column + (unsigned) (8 - cursor->logical_column % 8);
-        bool spaces = stop <= target && stop > cursor->column + 1;
+        bool spaces = p->trial_echo_consumed == p->echo_count &&
+                      stop <= target && stop > cursor->column + 1;
         for (unsigned x = cursor->column; spaces && x < stop; x++)
             spaces = row[x].codepoint == ' ' &&
                      old_cell(p, cursor, cursor->row, x)->codepoint == ' ';
@@ -476,9 +517,21 @@ left(tigt_presenter *p, glass_cursor *cursor, unsigned target)
 static void
 advance_row(tigt_presenter *p, glass_cursor *cursor, const tigt_presenter_frame *frame)
 {
+    unsigned echoed_columns = 0;
+    for (unsigned i = p->trial_echo_consumed;
+         i < p->echo_count && echoed_columns < frame->columns - cursor->column; i++) {
+        if (p->local_echo[(p->echo_start + i) % TIGT_PRESENTER_LOCAL_ECHO_MAX] == '\n')
+            break;
+        echoed_columns++;
+    }
+    bool echoed_wrap = p->trial_echo_consumed < p->echo_count &&
+                       echoed_columns >= frame->columns - cursor->column;
+    bool echoed_newline = p->trial_echo_consumed < p->echo_count &&
+        p->local_echo[(p->echo_start + p->trial_echo_consumed) % TIGT_PRESENTER_LOCAL_ECHO_MAX] == '\n';
     unsigned next = cursor->row + 1;
-    bool joined = p->boundary_proof[next] == TIGT_BOUNDARY_SOFT_WRAP ||
-                  (p->boundary_proof[next] != TIGT_BOUNDARY_NEWLINE && p->trial_mapping.joined[next]);
+    bool joined = echoed_wrap || (!echoed_newline &&
+        (p->boundary_proof[next] == TIGT_BOUNDARY_SOFT_WRAP ||
+         (p->boundary_proof[next] != TIGT_BOUNDARY_NEWLINE && p->trial_mapping.joined[next])));
     if (joined) {
         forward(p, cursor, frame, frame->columns);
         if (p->trial_mapping.base[cursor->row] > SIZE_MAX - frame->columns)
@@ -519,7 +572,8 @@ screen_blank(const tigt_text_cell *cells, size_t count)
 static bool
 clear_frame(const tigt_presenter *p, const tigt_presenter_frame *frame)
 {
-    return frame->cursor_column == 0 && frame->cursor_row == 0 &&
+    return ((frame->hints & TIGT_PRESENT_VIDEO_DISABLED) ||
+            (frame->cursor_column == 0 && frame->cursor_row == 0)) &&
            screen_blank(p->candidate, (size_t) frame->columns * frame->rows);
 }
 
@@ -559,62 +613,176 @@ row_equal(const tigt_text_cell *a, const tigt_text_cell *b, unsigned columns)
     return true;
 }
 
-/* A scrolling block must retain actual text, not merely match empty rows.
- * Rows outside the block are unchanged. The output cursor must lie inside it;
- * the retained rows are already in the transcript and must not be replayed. */
+/* An exposed row which still contains its old text, possibly after a
+ * left-to-right blanking prefix, is not evidence of fresh output. In
+ * particular, finishing the copy before clearing the bottom is not a scroll
+ * completion. Identical newly printed rows are deliberately ambiguous. */
 static bool
-scrolling(const tigt_presenter *p, const tigt_presenter_frame *frame, glass_cursor *cursor)
+uncleared_row(const tigt_text_cell *previous, const tigt_text_cell *row, unsigned columns)
 {
-    if (!p->initialized || p->columns != frame->columns || p->rows != frame->rows)
-        return false;
+    unsigned x = 0;
+    while (x < columns && row[x].codepoint == ' ')
+        x++;
+    return x < columns && row_equal(previous + x, row + x, columns - x);
+}
+
+/* The CRTC cursor can lag text already painted and committed. Retain that
+ * entire visible prefix, not just the current output position: a later scroll
+ * may append after its last glyph without overwriting any emitted text.
+ * Wrapped lines and local echo keep their existing stronger suffix proof. */
+static unsigned
+retained_output_columns(const tigt_presenter *p)
+{
+    unsigned width = p->output_column < p->columns ? p->output_column : p->columns;
+    if (width && (p->mapping.base[p->output_row] != 0 || p->echo_count != 0))
+        return width;
+    const tigt_text_cell *row = p->image + (size_t) p->output_row * p->columns;
+    unsigned end = p->columns;
+    while (end > width && row[end - 1].codepoint == ' ')
+        end--;
+    return end;
+}
+
+static bool
+copying_rows(const tigt_presenter *p, unsigned top, unsigned bottom, unsigned shift, unsigned width)
+{
+    size_t first = (size_t) top * p->columns;
+    size_t copied_end = (size_t) (bottom + 1 - shift) * p->columns;
+    size_t distance = (size_t) shift * p->columns;
+    size_t output = (size_t) p->output_row * p->columns;
+    /* A previous scroll may have completed between snapshots before this copy
+     * began. Its untouched suffix then has a smaller positive displacement,
+     * not zero. Fresh rows below that retained suffix do not prove alignment. */
+    for (unsigned base = 0; base < shift; base++) {
+        size_t end = (size_t) (bottom + 1 - base) * p->columns;
+        size_t old_distance = (size_t) base * p->columns;
+        bool copying = true, matches = true, moved_text = false, retained_text = false;
+        for (size_t i = first; matches && i < end; i++) {
+            const tigt_text_cell *cell = p->candidate + i;
+            if (copying && (i >= copied_end || !equal(p->image + i + distance, cell)))
+                copying = false;
+            bool unchanged = equal(p->image + i + old_distance, cell);
+            bool suffix = i + old_distance >= output + width &&
+                          i + old_distance < output + p->columns;
+            if (!copying && !unchanged && !suffix)
+                matches = false;
+            if (cell->codepoint != ' ') {
+                moved_text = moved_text || (copying && !unchanged);
+                retained_text = retained_text || (!copying && unchanged);
+            }
+        }
+        if (matches && moved_text && (base == 0 || retained_text))
+            return true;
+    }
+    return false;
+}
+
+/* Recognize an upward row copy in display order, not a collection of unrelated
+ * matching rows. At a vsync there may be any number of copied rows, one partly
+ * copied row, and an untouched (possibly already shifted) suffix. The last
+ * committed image remains the source. No retained text means no scroll proof.
+ *
+ * Unchanged leading rows need not be moved in the logical map. Include an
+ * unchanged bottom through the output cursor: a blank bottom row commonly
+ * survives a real scroll, including scrolling within a window. */
+static scroll_analysis
+scrolling(tigt_presenter *p, const tigt_presenter_frame *frame)
+{
+    scroll_analysis found = { 0 };
+    if (!p->initialized || p->columns != frame->columns || p->rows != frame->rows ||
+        clear_frame(p, frame))
+        return found;
     unsigned top = 0, bottom = frame->rows - 1;
     while (top < frame->rows && row_equal(p->image + (size_t) top * p->columns,
                                          p->candidate + (size_t) top * p->columns, p->columns))
         top++;
     if (top == frame->rows)
-        return false;
+        return found;
     while (bottom > top && row_equal(p->image + (size_t) bottom * p->columns,
                                      p->candidate + (size_t) bottom * p->columns, p->columns))
         bottom--;
-    /* A scroll often leaves the already-empty bottom row unchanged while the
-     * guest emits another newline there. Include that row in the alignment. */
-    if (bottom < cursor->row)
-        bottom = cursor->row;
-    if (cursor->row < top || cursor->row > bottom)
-        return false;
-    for (unsigned shift = 1; shift <= bottom - top; shift++) {
+    if (bottom < p->output_row)
+        bottom = p->output_row;
+    if (bottom < frame->cursor_row)
+        bottom = frame->cursor_row;
+    unsigned shifts = p->output_row >= top ? p->output_row - top : 0;
+    unsigned width = retained_output_columns(p);
+    for (unsigned shift = 1; shift <= shifts; shift++) {
         bool matches = true, text = false;
         for (unsigned y = top; matches && y + shift <= bottom; y++) {
             const tigt_text_cell *previous = p->image + (size_t) (y + shift) * p->columns;
-            matches = row_equal(previous, p->candidate + (size_t) y * p->columns, p->columns);
-            /* A continued logical line can fill its current physical row and
-             * scroll before the next snapshot. Its already-emitted prefix must
-             * still match exactly; only the not-yet-emitted suffix may differ. */
-            if (!matches && y + shift == cursor->row && cursor->column != 0 &&
-                p->mapping.base[cursor->row] != 0)
-                matches = row_equal(previous, p->candidate + (size_t) y * p->columns,
-                                    cursor->column < p->columns ? cursor->column : p->columns);
-            if (!screen_blank(previous, p->columns))
-                text = true;
+            const tigt_text_cell *row = p->candidate + (size_t) y * p->columns;
+            bool row_matches = row_equal(previous, row, p->columns);
+            /* Preserve the emitted prefix when output finished its current
+             * line before the copy. Wrapped output and echo retain their
+             * existing stronger proof for editing the suffix. */
+            if (!row_matches && y + shift == p->output_row)
+                row_matches = row_equal(previous, row, width);
+            matches = matches && row_matches;
+            text = text || !screen_blank(previous, p->columns);
         }
-        if (matches && text && cursor->row >= top + shift) {
-            cursor->scroll_top = top;
-            cursor->scroll_bottom = bottom;
-            cursor->scroll_count = shift;
-            cursor->row -= shift;
-            return true;
+        if (!matches) {
+            found.incomplete = found.incomplete || copying_rows(p, top, bottom, shift, width);
+            continue;
+        }
+        if (!text)
+            continue;
+        bool uncleared = false;
+        for (unsigned base = 0; !uncleared && base < shift; base++)
+            for (unsigned y = bottom + 1 - shift; !uncleared && y + base <= bottom; y++)
+                uncleared = uncleared_row(p->image + (size_t) (y + base) * p->columns,
+                                           p->candidate + (size_t) y * p->columns, p->columns);
+        scroll_analysis candidate = { .top = top, .bottom = bottom, .count = shift };
+        /* Local echo is already-emitted evidence, not a prediction. It can
+         * distinguish repeated prompts which geometry alone cannot align.
+         * This is only a scratch plan: the held echo/map/queue stay intact. */
+        if (!uncleared && p->echo_count && !scroll_matches_echo(p, frame, &candidate))
+            continue;
+        if (uncleared || found.count != 0)
+            found.incomplete = true;
+        else {
+            found.top = top;
+            found.bottom = bottom;
+            found.count = shift;
         }
     }
-    return false;
+    /* A fullscreen application can keep its cursor outside the copied window.
+     * Such a copy cannot move the glass output map, but must still be held
+     * before repainting. Use the untouched viewport suffix as evidence unless
+     * a completed alignment already reaches an observed output frontier. */
+    if (p->fullscreen && !found.incomplete &&
+        (!found.count || (p->output_row < bottom && frame->cursor_row < bottom))) {
+        for (unsigned shift = 1; !found.incomplete && shift < frame->rows - top; shift++)
+            found.incomplete = copying_rows(p, top, frame->rows - 1, shift, width);
+    }
+    return found;
+}
+
+static void
+apply_scroll(glass_cursor *cursor, const scroll_analysis *scroll)
+{
+    cursor->scroll_top = scroll->top;
+    cursor->scroll_bottom = scroll->bottom;
+    cursor->scroll_count = scroll->count;
+    cursor->row -= scroll->count;
 }
 
 static int
 analyze(tigt_presenter *p, const tigt_presenter_frame *frame, glass_cursor *cursor)
 {
+    bool disabled_blank = (frame->hints & TIGT_PRESENT_VIDEO_DISABLED) && clear_frame(p, frame);
+    if (p->echo_failed && !disabled_blank && !(p->initialized && clear_frame(p, frame) &&
+        !screen_blank(p->image, (size_t) p->columns * p->rows)))
+        return TIGT_ERROR_UNREPRESENTABLE;
     if (p->initialized && clear_frame(p, frame) &&
         !screen_blank(p->image, (size_t) p->columns * p->rows)) {
         clear_glass(p, cursor);
         return p->buffer_error;
+    }
+    if (disabled_blank) {
+        cursor->row = cursor->column = 0;
+        cursor->logical_column = 0;
+        return TIGT_OK;
     }
     if (p->initialized && (p->columns != frame->columns || p->rows != frame->rows)) {
         if (clear_frame(p, frame)) {
@@ -680,14 +848,10 @@ analyze(tigt_presenter *p, const tigt_presenter_frame *frame, glass_cursor *curs
         p->initialized && (p->guest_column != frame->cursor_column || p->guest_row != frame->cursor_row))
         left(p, cursor, frame->cursor_column);
     if (cursor->row == frame->cursor_row && cursor->column < frame->cursor_column) {
-        /* Advancing beneath live text must replay that text (including the
-         * unchanged digits of a CR rewrite). Trailing blank cursor motion is
-         * deferred, so it cannot prematurely blank a replacement in flight. */
-        const tigt_text_cell *row = p->candidate + (size_t) cursor->row * frame->columns;
-        unsigned end = frame->cursor_column;
-        while (end > cursor->column && row[end - 1].codepoint == ' ')
-            end--;
-        forward(p, cursor, frame, end);
+        /* The observed cursor confirms spaces as well as visible glyphs.
+         * Dropping trailing prompt spaces puts subsequent host local echo at
+         * a different column from the guest and makes its exact match fail. */
+        forward(p, cursor, frame, frame->cursor_column);
     }
     return p->buffer_error;
 }
@@ -695,15 +859,19 @@ analyze(tigt_presenter *p, const tigt_presenter_frame *frame, glass_cursor *curs
 static void
 prepare_plan(tigt_presenter *p, const tigt_presenter_frame *frame, const glass_cursor *cursor)
 {
+    p->trial_echo_consumed = 0;
+    p->matching_echo = true;
     p->trial_queue = p->queue;
     p->trial_mapping = p->mapping;
     memset(p->boundary_proof, 0, sizeof(p->boundary_proof));
     p->used = 0;
     p->buffer_error = TIGT_OK;
-    if (p->initialized &&
-        ((p->columns != frame->columns || p->rows != frame->rows) ||
-         (clear_frame(p, frame) && !screen_blank(p->image, (size_t) p->columns * p->rows)))) {
+    if (((frame->hints & TIGT_PRESENT_VIDEO_DISABLED) && clear_frame(p, frame)) ||
+        (p->initialized &&
+         ((p->columns != frame->columns || p->rows != frame->rows) ||
+          (clear_frame(p, frame) && !screen_blank(p->image, (size_t) p->columns * p->rows))))) {
         discard_expectations(&p->trial_queue);
+        p->trial_echo_consumed = p->echo_count;
         memset(&p->trial_mapping, 0, sizeof(p->trial_mapping));
         return;
     }
@@ -722,21 +890,34 @@ prepare_plan(tigt_presenter *p, const tigt_presenter_frame *frame, const glass_c
     match_expectations(p, frame, cursor);
 }
 
+static bool
+scroll_matches_echo(tigt_presenter *p, const tigt_presenter_frame *frame,
+                    const scroll_analysis *scroll)
+{
+    glass_cursor cursor = { .column = p->output_column, .row = p->output_row,
+                            .logical_column = p->logical_column };
+    apply_scroll(&cursor, scroll);
+    prepare_plan(p, frame, &cursor);
+    return analyze(p, frame, &cursor) == TIGT_OK;
+}
+
 static int
-plan_glass(tigt_presenter *p, const tigt_presenter_frame *frame, glass_cursor *cursor)
+plan_glass(tigt_presenter *p, const tigt_presenter_frame *frame, glass_cursor *cursor,
+           const scroll_analysis *scroll)
 {
     *cursor = (glass_cursor) { .column = p->output_column, .row = p->output_row,
                               .logical_column = p->logical_column };
-    if (p->initialized && p->mapping.base[p->output_row] != 0)
-        scrolling(p, frame, cursor);
+    if (scroll->count && (p->mapping.base[p->output_row] != 0 || p->echo_count != 0))
+        apply_scroll(cursor, scroll);
     prepare_plan(p, frame, cursor);
     int result = analyze(p, frame, cursor);
     if (result != TIGT_ERROR_UNREPRESENTABLE)
         return result;
     *cursor = (glass_cursor) { .column = p->output_column, .row = p->output_row,
                               .logical_column = p->logical_column };
-    if (!scrolling(p, frame, cursor))
+    if (!scroll->count)
         return result;
+    apply_scroll(cursor, scroll);
     prepare_plan(p, frame, cursor);
     return analyze(p, frame, cursor);
 }
@@ -817,15 +998,124 @@ commit(tigt_presenter *p, const tigt_presenter_frame *frame)
     p->initialized = true;
 }
 
+/* Track only bytes we actually wrote. Host line-discipline output is accounted
+ * separately and invalidates this observation until the consumer reports CPR. */
 static void
-commit_glass(tigt_presenter *p, const tigt_presenter_frame *frame, const glass_cursor *cursor)
+track_host_output(tigt_presenter *p, size_t offset)
 {
-    commit(p, frame);
+    if (!p->host_cursor_known || offset == p->used)
+        return;
+    struct termios modes;
+    if (tcgetattr(p->config.output_fd, &modes) < 0) {
+        p->host_cursor_known = false;
+        return;
+    }
+    bool newline_cr = (modes.c_oflag & (OPOST | ONLCR)) == (OPOST | ONLCR);
+    for (size_t i = offset; i < p->used; i++) {
+        unsigned char cp = (unsigned char) p->bytes[i];
+        if (cp == '\n' || cp == '\f') {
+            if (p->host_row < p->host_rows)
+                p->host_row++;
+            if (cp == '\n' && newline_cr)
+                p->host_column = 1;
+            p->host_wrap = false;
+        } else if (cp == '\r') {
+            p->host_column = 1;
+            p->host_wrap = false;
+        } else if (cp == '\b') {
+            if (p->host_column > 1)
+                p->host_column--;
+            p->host_wrap = false;
+        } else if (cp == '\t') {
+            unsigned next = ((p->host_column - 1) / 8 + 1) * 8 + 1;
+            p->host_column = next < p->host_columns ? next : p->host_columns;
+            p->host_wrap = false;
+        } else if (cp >= 0x20 && (cp & 0xc0) != 0x80) {
+            if (p->host_wrap) {
+                if (p->host_row < p->host_rows)
+                    p->host_row++;
+                p->host_column = 1;
+            }
+            p->host_wrap = p->host_column == p->host_columns;
+            if (!p->host_wrap)
+                p->host_column++;
+        }
+    }
+}
+
+static void
+commit_glass_plan(tigt_presenter *p, const glass_cursor *cursor)
+{
+    p->echo_start = (p->echo_start + p->trial_echo_consumed) % TIGT_PRESENTER_LOCAL_ECHO_MAX;
+    p->echo_count -= p->trial_echo_consumed;
+    p->echo_failed = false;
     p->queue = p->trial_queue;
     p->mapping = p->trial_mapping;
     p->output_column = cursor->column;
     p->output_row = cursor->row;
     p->logical_column = cursor->logical_column;
+}
+
+static void
+commit_glass(tigt_presenter *p, const tigt_presenter_frame *frame, const glass_cursor *cursor)
+{
+    commit(p, frame);
+    commit_glass_plan(p, cursor);
+}
+
+/* Fullscreen frames remain authoritative while a shadow glass trajectory is
+ * confirmed. A newline (or observed clear) followed by new text at the output
+ * frontier is evidence of sequential output; idle frames and same-line status
+ * rewrites alone are not. Require a full 100ms without an incompatible change
+ * before switching input modes. No fullscreen text is replayed on recovery. */
+static bool
+recovering(tigt_presenter *p, const tigt_presenter_frame *frame, const glass_cursor *cursor)
+{
+    if (clear_frame(p, frame)) {
+        p->recovery_boundary = true;
+        p->recovery_text = p->recovery_confirming = false;
+        p->recovery_ticks = 0;
+        return false;
+    }
+    if (p->columns != frame->columns || p->rows != frame->rows)
+        goto incompatible;
+    unsigned start_row = p->output_row - cursor->scroll_count;
+    bool text = false;
+    bool frontier = cursor->row == frame->cursor_row && cursor->column == frame->cursor_column;
+    for (unsigned y = 0; y < frame->rows; y++) {
+        for (unsigned x = 0; x < frame->columns; x++) {
+            const tigt_text_cell *cell = p->candidate + (size_t) y * frame->columns + x;
+            if ((y > cursor->row || (y == cursor->row && x >= cursor->column)) &&
+                cell->codepoint != ' ')
+                frontier = false;
+            const tigt_text_cell *previous = old_cell(p, cursor, y, x);
+            if (equal(previous, cell))
+                continue;
+            if (y < start_row || (y == start_row && x < p->output_column) ||
+                previous->codepoint != ' ')
+                goto incompatible;
+            text = text || cell->codepoint != ' ';
+        }
+    }
+    if (cursor->row > start_row)
+        p->recovery_boundary = true;
+    p->recovery_text = p->recovery_text || (p->recovery_boundary && text);
+    if (!frontier || !p->recovery_text) {
+        /* VRAM can reach vsync before its CRTC cursor. Keep observed text
+         * evidence, but start the quiet interval only when the cursor catches
+         * up and no retained text remains beneath or beyond it. */
+        p->recovery_confirming = false;
+        p->recovery_ticks = 0;
+    } else if (p->recovery_confirming)
+        p->recovery_ticks += 2100u / frame->refresh_hz;
+    else
+        p->recovery_confirming = true;
+    return p->recovery_confirming && p->recovery_ticks >= 210;
+
+incompatible:
+    p->recovery_boundary = p->recovery_text = p->recovery_confirming = false;
+    p->recovery_ticks = 0;
+    return false;
 }
 
 static int
@@ -840,15 +1130,9 @@ terminal_size(tigt_presenter *p, unsigned *columns, unsigned *rows)
 }
 
 static void
-prepare_region(tigt_presenter *p, unsigned host_rows, unsigned guest_rows, bool scroll)
+prepare_region(tigt_presenter *p, unsigned top, unsigned height)
 {
-    unsigned height = guest_rows < host_rows ? guest_rows : host_rows;
-    if (scroll) {
-        sequence(p, "\033[%u;1H", host_rows);
-        for (unsigned y = 0; y < height; y++)
-            byte(p, '\n');
-    }
-    for (unsigned y = host_rows - height + 1; y <= host_rows; y++)
+    for (unsigned y = top; y < top + height; y++)
         sequence(p, "\033[%u;1H\033[2K", y);
 }
 
@@ -878,17 +1162,34 @@ draw_fullscreen(tigt_presenter *p, const tigt_presenter_frame *frame, bool enter
     int result = terminal_size(p, &host_columns, &host_rows);
     if (result != TIGT_OK)
         return result;
-    bool resize = host_columns != p->host_columns || host_rows != p->host_rows ||
+    bool resize = !p->host_cursor_known || host_columns != p->host_columns || host_rows != p->host_rows ||
                   p->columns != frame->columns || p->rows != frame->rows;
     unsigned height = frame->rows < host_rows ? frame->rows : host_rows;
     unsigned width = frame->columns < host_columns ? frame->columns : host_columns;
-    unsigned top = host_rows - height + 1;
+    if (entering && (!p->host_cursor_known || host_columns != p->host_columns ||
+                     host_rows != p->host_rows))
+        return TIGT_PRESENTER_NEEDS_CURSOR;
+    unsigned top = entering ? p->host_row + (p->host_column > 1 || p->host_wrap) : p->region_top;
+    if (!entering && top > host_rows)
+        top = host_rows;
+    unsigned scroll = top + height - 1 > host_rows ? top + height - 1 - host_rows : 0;
+    top -= scroll;
     p->used = 0;
     p->buffer_error = TIGT_OK;
+    p->matching_echo = false;
     if (entering || resize) {
-        /* On resize also erase the old bottom region, but never preceding text. */
-        unsigned region_rows = frame->rows > p->rows ? frame->rows : p->rows;
-        prepare_region(p, host_rows, region_rows, entering);
+        if (scroll) {
+            sequence(p, "\033[%u;1H", host_rows);
+            for (unsigned y = 0; y < scroll; y++)
+                byte(p, '\n');
+        }
+        unsigned old_top = p->region_top > scroll ? p->region_top - scroll : 1;
+        unsigned end = top + height;
+        if (!entering && old_top + p->region_height > end)
+            end = old_top + p->region_height;
+        if (end > host_rows + 1)
+            end = host_rows + 1;
+        prepare_region(p, top, end - top);
     }
     bool emitted = entering || resize;
     for (unsigned y = 0; y < height; y++) {
@@ -923,11 +1224,21 @@ draw_fullscreen(tigt_presenter *p, const tigt_presenter_frame *frame, bool enter
     if (result == TIGT_OK) {
         p->host_columns = host_columns;
         p->host_rows = host_rows;
+        p->region_top = top;
+        p->region_height = height;
+        p->host_row = top + (frame->cursor_row < height ? frame->cursor_row : height - 1);
+        p->host_column = 1 + (frame->cursor_column < width ? frame->cursor_column : width - 1);
+        p->host_cursor_known = true;
+        p->host_wrap = p->echo_failed = false;
+        p->echo_count = 0;
         p->fullscreen = true;
         commit(p, frame);
-        discard_expectations(&p->queue);
+        if (entering)
+            discard_expectations(&p->queue);
         memset(&p->mapping, 0, sizeof(p->mapping));
-        p->logical_column = 0;
+        p->output_column = frame->cursor_column;
+        p->output_row = frame->cursor_row;
+        p->logical_column = frame->cursor_column;
     }
     return result == TIGT_OK ? TIGT_PRESENTER_FULLSCREEN : result;
 }
@@ -940,7 +1251,7 @@ validate(tigt_presenter *p, const tigt_presenter_frame *frame)
         (size_t) frame->columns * frame->rows > PRESENTER_CELLS ||
         frame->cursor_column >= frame->columns || frame->cursor_row >= frame->rows ||
         (frame->refresh_hz != 50 && frame->refresh_hz != 60 && frame->refresh_hz != 70) ||
-        frame->hints != 0)
+        (frame->hints & ~(TIGT_PRESENT_VIDEO_DISABLED | TIGT_PRESENT_VIDEO_MEMORY_CHANGED)) != 0)
         return TIGT_ERROR_ARGUMENT;
     locale_t previous = (locale_t) 0;
     if (p->utf8) {
@@ -1019,6 +1330,95 @@ tigt_presenter_create(const tigt_presenter_config *config, tigt_presenter **outp
         return TIGT_ERROR_SYSTEM;
     }
     *output = p;
+    return TIGT_OK;
+}
+
+int
+tigt_presenter_observe_cursor(tigt_presenter *p, unsigned column, unsigned row)
+{
+    if (p == NULL || column == 0 || row == 0)
+        return TIGT_ERROR_ARGUMENT;
+    unsigned columns, rows;
+    int result = terminal_size(p, &columns, &rows);
+    if (result != TIGT_OK)
+        return result;
+    if (column > columns || row > rows)
+        return TIGT_ERROR_ARGUMENT;
+    p->host_columns = columns;
+    p->host_rows = rows;
+    p->host_column = column;
+    p->host_row = row;
+    p->host_wrap = false;
+    p->host_cursor_known = true;
+    return TIGT_OK;
+}
+
+int
+tigt_presenter_forget_cursor(tigt_presenter *p)
+{
+    if (p == NULL)
+        return TIGT_ERROR_ARGUMENT;
+    p->host_cursor_known = false;
+    return TIGT_OK;
+}
+
+int
+tigt_presenter_local_echo(tigt_presenter *p, const uint32_t *text, size_t length)
+{
+    if (p == NULL || (length != 0 && text == NULL) || !p->initialized || p->fullscreen)
+        return TIGT_ERROR_ARGUMENT;
+    if (p->error != TIGT_OK)
+        return p->error;
+    if (p->echo_failed)
+        return TIGT_ERROR_UNREPRESENTABLE;
+    if (length == 0)
+        return TIGT_OK;
+    size_t column = p->logical_column;
+    for (unsigned i = 0; i < p->echo_count; i++)
+        column = p->local_echo[(p->echo_start + i) % TIGT_PRESENTER_LOCAL_ECHO_MAX] == '\n' ?
+                 0 : column + 1;
+    size_t start_column = column, count = 0;
+    locale_t previous = (locale_t) 0;
+    if (p->utf8) {
+        previous = uselocale(p->locale);
+        if (previous == (locale_t) 0)
+            return TIGT_ERROR_SYSTEM;
+    }
+    int result = TIGT_OK;
+    for (size_t i = 0; i < length; i++) {
+        uint32_t cp = text[i];
+        if (cp != '\n' && cp != '\t' &&
+            (cp < 0x20 || (cp >= 0x7f && cp <= 0x9f) || cp > 0x10ffff ||
+             (cp >= 0xd800 && cp <= 0xdfff) || (p->utf8 && wcwidth((wchar_t) cp) != 1))) {
+            result = TIGT_ERROR_ARGUMENT;
+            break;
+        }
+        size_t width = cp == '\t' ? 8 - column % 8 : 1;
+        if (width > TIGT_PRESENTER_LOCAL_ECHO_MAX - p->echo_count - count) {
+            result = TIGT_ERROR_UNREPRESENTABLE;
+            break;
+        }
+        count += width;
+        column = cp == '\n' ? 0 : column + width;
+    }
+    if (p->utf8 && uselocale(previous) == (locale_t) 0)
+        return TIGT_ERROR_SYSTEM;
+    if (result == TIGT_ERROR_UNREPRESENTABLE) {
+        p->echo_failed = true;
+        p->host_cursor_known = false;
+    }
+    if (result != TIGT_OK)
+        return result;
+    column = start_column;
+    for (size_t i = 0; i < length; i++) {
+        uint32_t cp = text[i];
+        size_t width = cp == '\t' ? 8 - column % 8 : 1;
+        for (size_t j = 0; j < width; j++)
+            p->local_echo[(p->echo_start + p->echo_count++) % TIGT_PRESENTER_LOCAL_ECHO_MAX] =
+                cp == '\t' ? ' ' : cp;
+        column = cp == '\n' ? 0 : column + width;
+    }
+    p->host_cursor_known = false;
     return TIGT_OK;
 }
 
@@ -1159,68 +1559,96 @@ tigt_presenter_present(tigt_presenter *p, const tigt_presenter_frame *frame)
         else
             q++;
     }
+    /* Hold before planning: the retained image, logical cursor, echo and
+     * recovery trajectory describe what was actually emitted. Aging above is
+     * independent, just as it is during representability confirmation. */
+    bool disabled = (frame->hints & TIGT_PRESENT_VIDEO_DISABLED) != 0;
+    if (!disabled) {
+        p->video_disabled_ticks = 0;
+        p->video_disabled_released = false;
+    } else {
+        if (frame->hints & TIGT_PRESENT_VIDEO_MEMORY_CHANGED)
+            p->video_disabled_released = true;
+        if (!p->video_disabled_released) {
+            p->video_disabled_ticks += 2100u / frame->refresh_hz;
+            if (p->video_disabled_ticks >= 420)
+                p->video_disabled_released = true;
+        }
+    }
+    scroll_analysis scroll = scrolling(p, frame);
+    if (scroll.incomplete || (disabled && scroll.count)) {
+        if (!p->scroll_holding) {
+            p->scroll_holding = true;
+            p->scroll_ticks = 0;
+        } else if (p->scroll_ticks < 1050)
+            p->scroll_ticks += 2100u / frame->refresh_hz;
+        /* Inspect the underlying text even during hardware blanking. A proven
+         * scroll can finish while video is still disabled, but must not paint
+         * its raw cells. Neither progress nor completion renews this 500ms
+         * deadline; a stopped copy eventually takes the ordinary fallback. */
+        if (p->scroll_ticks < 1050)
+            return TIGT_PRESENTER_PENDING;
+        if (!disabled) {
+            p->pending = true;
+            p->pending_ticks = 210;
+        }
+    } else {
+        p->scroll_holding = false;
+        p->scroll_ticks = 0;
+    }
+    if (disabled) {
+        if (!p->video_disabled_released)
+            return TIGT_PRESENTER_PENDING;
+        /* Non-scroll VRAM changes still release the ordinary disable hold
+         * immediately. Once released (or timed out), show only hardware black,
+         * never the underlying cells used to recognize a copying operation. */
+        for (size_t i = 0; i < (size_t) frame->columns * frame->rows; i++)
+            p->candidate[i] = blank;
+        scroll = (scroll_analysis) { 0 };
+    }
     if (p->fullscreen) {
-        bool cleared = clear_frame(p, frame);
-        if (p->config.reversible && p->recovery_clear && !cleared &&
-            !screen_blank(p->candidate, (size_t) frame->columns * frame->rows)) {
-            /* A clear was actually observed at a vsync. Probe the new text
-             * against that empty baseline before touching the host region. */
+        glass_cursor cursor;
+        if (screen_blank(p->image, (size_t) p->columns * p->rows)) {
+            /* No retained text constrains a blank fullscreen baseline. Cursor
+             * motion through it must not strand a later prompt above the probe. */
             p->output_column = p->output_row = 0;
             p->logical_column = 0;
-            glass_cursor cursor;
-            result = plan_glass(p, frame, &cursor);
-            if (result == TIGT_OK) {
-                size_t text_bytes = p->used;
-                unsigned host_columns, host_rows;
-                result = terminal_size(p, &host_columns, &host_rows);
-                if (result == TIGT_OK) {
-                    /* Prefix preparation in the same bounded transaction. */
-                    p->used = 0;
-                    prepare_region(p, host_rows, frame->rows, false);
-                    sequence(p, "\033[%u;1H", host_rows);
-                    for (unsigned y = 0; y < frame->rows; y++)
-                        byte(p, '\n');
-                    size_t prefix = p->used;
-                    /* Re-analysis avoids retaining another frame-sized byte
-                     * allocation. The small preparation prefix is bounded. */
-                    char preparation[8192];
-                    if (prefix > sizeof(preparation))
-                        result = TIGT_ERROR_SYSTEM;
-                    else {
-                        memcpy(preparation, p->bytes, prefix);
-                        result = plan_glass(p, frame, &cursor);
-                        if (result == TIGT_OK && text_bytes <= PRESENTER_BYTES - prefix) {
-                            memmove(p->bytes + prefix, p->bytes, p->used);
-                            memcpy(p->bytes, preparation, prefix);
-                            p->used += prefix;
-                            result = write_output(p);
-                        } else if (result == TIGT_OK)
-                            result = TIGT_ERROR_SYSTEM;
-                    }
-                }
-                if (result == TIGT_OK) {
-                    p->fullscreen = p->recovery_clear = p->pending = false;
-                    commit_glass(p, frame, &cursor);
-                    return TIGT_OK;
-                }
-                p->error = result;
-                return result;
-            }
+            memset(&p->mapping, 0, sizeof(p->mapping));
+        }
+        bool planned = !scroll.incomplete && p->config.reversible &&
+                       plan_glass(p, frame, &cursor, &scroll) == TIGT_OK;
+        bool recovered = planned && recovering(p, frame, &cursor);
+        if (!planned) {
+            p->recovery_boundary = p->recovery_text = p->recovery_confirming = false;
+            p->recovery_ticks = 0;
         }
         result = draw_fullscreen(p, frame, false);
-        if (result >= TIGT_OK)
-            p->recovery_clear = p->config.reversible &&
-                (cleared || (p->recovery_clear &&
-                 screen_blank(p->candidate, (size_t) frame->columns * frame->rows)));
-        else
+        if (result < TIGT_OK) {
             p->error = result;
+            return result;
+        }
+        if (planned)
+            commit_glass_plan(p, &cursor);
+        else
+            discard_expectations(&p->queue);
+        if (recovered && frame->cursor_row < p->region_height &&
+            frame->cursor_column < p->host_columns) {
+            /* The retained region already contains every confirmed byte, at
+             * the observed host origin. Continue exactly at its current cursor:
+             * no region clear, transcript copy, cursor rebase, or local echo. */
+            p->fullscreen = p->pending = false;
+            p->recovery_boundary = p->recovery_text = p->recovery_confirming = false;
+            p->recovery_ticks = 0;
+            return TIGT_OK;
+        }
         return result;
     }
     glass_cursor cursor;
-    result = plan_glass(p, frame, &cursor);
+    result = scroll.incomplete ? TIGT_ERROR_UNREPRESENTABLE : plan_glass(p, frame, &cursor, &scroll);
     if (result == TIGT_OK) {
         result = write_output(p);
         if (result == TIGT_OK) {
+            track_host_output(p, 0);
             commit_glass(p, frame, &cursor);
             p->pending = false;
             p->pending_ticks = 0;
@@ -1237,7 +1665,8 @@ tigt_presenter_present(tigt_presenter *p, const tigt_presenter_frame *frame)
             result = draw_fullscreen(p, frame, true);
             if (result == TIGT_PRESENTER_FULLSCREEN) {
                 p->pending = false;
-                p->recovery_clear = false;
+                p->recovery_boundary = p->recovery_text = p->recovery_confirming = false;
+                p->recovery_ticks = 0;
                 return result;
             }
         }
@@ -1252,11 +1681,19 @@ tigt_presenter_reset(tigt_presenter *p)
 {
     if (p == NULL)
         return TIGT_ERROR_ARGUMENT;
-    p->initialized = p->fullscreen = p->recovery_clear = p->pending = false;
-    p->pending_ticks = 0;
+    p->initialized = p->fullscreen = p->pending = false;
+    p->recovery_boundary = p->recovery_text = p->recovery_confirming = false;
+    p->pending_ticks = p->recovery_ticks = 0;
+    p->video_disabled_ticks = 0;
+    p->video_disabled_released = false;
+    p->scroll_holding = false;
+    p->scroll_ticks = 0;
     p->error = p->buffer_error = TIGT_OK;
     p->columns = p->rows = p->guest_column = p->guest_row = 0;
     p->output_column = p->output_row = p->host_columns = p->host_rows = 0;
+    p->host_column = p->host_row = p->region_top = p->region_height = 0;
+    p->host_cursor_known = p->host_wrap = p->matching_echo = p->echo_failed = false;
+    p->echo_start = p->echo_count = p->trial_echo_consumed = 0;
     p->used = 0;
     discard_expectations(&p->queue);
     memset(&p->mapping, 0, sizeof(p->mapping));
@@ -1278,5 +1715,5 @@ tigt_presenter_destroy(tigt_presenter *p)
     free(p);
 }
 
-/* Vertical tabs and additional character sets (notably ISO-8859-1), input,
- * cooked echo validation and editing-key handling remain consumer work. */
+/* Vertical tabs, additional character sets (notably ISO-8859-1), terminal
+ * querying, cooked input and editing-key handling remain consumer work. */

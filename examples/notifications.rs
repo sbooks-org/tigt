@@ -29,6 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stride: 20,
         cursor: Cursor { column: 0, row: 0 },
         refresh_rate: RefreshRate::Hz60,
+        hints: 0,
     })?;
     let text: Vec<u32> = "Hello, wrapped glass-TTY!".chars().map(u32::from).collect();
     let boundaries = [
@@ -71,6 +72,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             stride: 20,
             cursor,
             refresh_rate: RefreshRate::Hz60,
+            hints: 0,
         })?;
         thread::sleep(Duration::from_secs_f64(1.0 / 60.0));
     }

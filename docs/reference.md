@@ -47,6 +47,9 @@ This is an additive, output-only API, independent of the curses `Session` and re
 |---|---|---|
 | `tigt_presenter_create(&config,&presenter)` | `Presenter::new(fd.as_fd(), config)` | Allocate an opaque presenter with a borrowed output fd. |
 | `tigt_presenter_present(presenter,&frame)` | `presenter.present(frame)` | Synchronously submit **every guest vsync**, including unchanged snapshots. |
+| `tigt_presenter_observe_cursor(presenter,column,row)` | `presenter.observe_cursor(column,row)` | Record the current one-based host cursor; no reads or writes. |
+| `tigt_presenter_forget_cursor(presenter)` | `presenter.forget_cursor()` | Invalidate host position after external output or resume. |
+| `tigt_presenter_local_echo(presenter,text,length)` | `presenter.local_echo(text)` | Account for a finalized, already-displayed host-edited line before guest key delivery. |
 | `tigt_presenter_reset(presenter)` | `presenter.reset()` | Start an empty glass baseline without emitting anything. |
 | `tigt_presenter_destroy(presenter)` | `Drop` | Free state; never close the output fd. |
 
@@ -66,14 +69,23 @@ Supply `refresh_hz` 50, 60 or 70 / `RefreshRate::{Hz50,Hz60,Hz70}` on every vsyn
 
 Confirmation is 100 ms measured in submitted vsync intervals after first detection: five at 50 Hz, six at 60 Hz, seven at 70 Hz. Including the initial bad observation, that is six, seven or eight consecutive bad snapshots respectively. Do not submit only changed frames or retry the same snapshot in a tight loop: both alter the effective confirmation time.
 
+Frame `hints` accepts `TIGT_PRESENT_VIDEO_DISABLED` / `presenter::VIDEO_DISABLED` (bit 0) and `TIGT_PRESENT_VIDEO_MEMORY_CHANGED` / `presenter::VIDEO_MEMORY_CHANGED` (bit 1); unknown bits are invalid and zero preserves ordinary presentation. Disabled means **hardware video output is disabled**, not that enabled VRAM happens to decode as blank. Continue submitting the actual decoded cells and logical cursor.
+
+Hardware disable holds the last emitted image, cursor, local echo and presentation mode for 200 ms before output planning. The first disabled frame counts one interval: at 60 Hz the first 11 submissions emit nothing and the 12th renders the disabled blank; at 50 Hz the first 9 are held and the 10th renders. Timing accumulates exact 1/2100-second ticks across cadence changes (420 ticks), independently of the 100 ms adaptive confirmation/recovery timers. Held submissions return `PENDING`, including in full-screen mode, and continue aging speculative notifications. Consumers must retain their current cooked/raw input mode on `PENDING`.
+
+`VIDEO_MEMORY_CHANGED` means **any raw video-memory byte differs from the last snapshot actually submitted to the presenter**, including character, attribute and offscreen bytes; the first snapshot is changed. The consumer compares the complete relevant aperture exactly; comparing while skipping a submission (for example while waiting for DSR) must not consume the change notification. A change on the first or any later disabled submission releases the hold immediately, even when decoded disabled cells are identical. Release remains latched for that continuous disable interval; it does not restart each frame. Reenable and reset start a fresh interval. Reenabled output and ordinary enabled blanks/`CLS` undergo normal immediate presentation, without this hold.
+
+A released hardware-disabled blank is a clear regardless of the unchanged logical guest cursor, so it does not wait behind glass unrepresentability confirmation. Nonblank cells are still subject to normal representability rules; hints neither manufacture cells nor bypass sticky errors, argument validation or required host-cursor observation.
+
 | C result | Rust result | Meaning |
 |---|---|---|
 | `TIGT_OK` | `Ok(Status::Glass)` | Representable glass state. |
-| `TIGT_PRESENTER_PENDING` | `Ok(Status::Pending)` | Awaiting confirmation; continue submitting vsyncs. |
+| `TIGT_PRESENTER_PENDING` | `Ok(Status::Pending)` | Awaiting confirmation or holding disabled output; continue vsyncs and retain current input mode. |
 | `TIGT_PRESENTER_FULLSCREEN` | `Ok(Status::Fullscreen)` | Adaptive fallback is active. |
+| `TIGT_PRESENTER_NEEDS_CURSOR` (4) | `Ok(Status::NeedsCursor)` | No output written; acquire and observe the current host cursor before adaptive fallback. Not yet full-screen. |
 | `TIGT_ERROR_UNREPRESENTABLE` | `Err(presenter::Error::Unrepresentable)` | Confirmed pure-glass ABORT; consumer chooses recovery. |
 
-Argument, terminal, busy and system failures propagate as the corresponding `presenter::Error` variants; unknown statuses preserve their numeric value. Unrepresentability and I/O failures are sticky until reset. Reset emits nothing: the consumer must prepare the destination before starting a new empty glass baseline. Reset is not an implicit repair of previously emitted text.
+Argument, terminal, busy and system failures propagate as the corresponding `presenter::Error` variants; unknown statuses preserve their numeric value. Unrepresentability and I/O failures are sticky until reset. Reset emits nothing: the consumer must prepare the destination before starting a new empty glass baseline. It clears local-echo accounting and invalidates host cursor observation; it is not an implicit repair of previously emitted text.
 
 ### Glass byte rules
 
@@ -82,7 +94,7 @@ Glass presentation reconstructs a stream from successive snapshots, not a sequen
 | Guest operation | Output rule |
 |---|---|
 | New line | NL (`0x0a`) with implied carriage return, **not CRLF**. Never depend on host automatic wrapping at guest column boundaries. |
-| Upward block scroll | Detect retained rows and emit only the necessary newlines/new text, without duplicating previous output. |
+| Upward block scroll | Detect retained rows and emit only the necessary newlines/new text, without duplicating previous output. A current partial row may finish before scrolling if its emitted prefix still matches and its old suffix was blank. |
 | Same-line rewrite/count-up | Bare CR (`0x0d`); avoid premature space blanking while replacement text is arriving. |
 | Whole-screen clear at cursor `(0,0)` | FF (`0x0c`, never `0xff`). If the only previous text is one row beginning at `(0,0)`, clear that row with CR and spaces instead of FF. |
 | Blank tab spacing | Compress using standard eight-column TAB stops. |
@@ -91,6 +103,7 @@ Glass presentation reconstructs a stream from successive snapshots, not a sequen
 | Character erasure | BS, SP, BS for each erased character. |
 | Character replacement | BS, new character for each replaced character. |
 | Leftward cursor movement beneath live text | Bare BS as needed, even when no glyph changed. |
+| Forward cursor movement through blanks | Emit the confirmed spacing, including trailing prompt spaces, using TAB where possible. This keeps subsequent local echo at the guest's column. |
 
 Use `TIGT_TEXT_UNDERLINE` / `TEXT_UNDERLINE`, and the presenter-only `TIGT_PRESENT_BOLD`, `TIGT_PRESENT_REVERSE` / `presenter::{TEXT_BOLD,TEXT_REVERSE}` flags for these overprint effects. The extra flags are **not** accepted by `Session::present_text`. Glass output ignores color and other presentation attributes; cell cursor flags are not a substitute for the logical cursor.
 
@@ -102,9 +115,27 @@ In UTF-8 mode, wide characters and standalone combining marks are rejected rathe
 
 ### Adaptive normal-screen region
 
-Adaptive creation rejects a non-TTY destination with `TERMINAL`; choose pure glass for files and pipes. Adaptive starts in glass mode and switches only after confirmed unrepresentability. Full-screen fallback occupies the **bottom guest-sized region of the normal host screen**, clipping to smaller host windows. It never uses the alternate screen, and preceding output remains in scrollback.
+Adaptive creation rejects a non-TTY destination with `TERMINAL`; choose pure glass for files and pipes. Adaptive starts in glass mode and switches only after confirmed unrepresentability and a valid host cursor observation. Full-screen fallback occupies a **guest-sized region relative to the current host cursor on the normal screen**, clipping to smaller host windows. Its origin is the current row when the one-based column is 1, or the following row when the column is greater than 1. It scrolls only the height that would overflow the host screen, not unconditionally to the bottom. The stored origin is reused for updates, resizes and recovery. It never uses the alternate screen, and preceding output remains in scrollback.
 
-`OneWay` retains fallback until explicit reset. `Reversible` can return only after a guest clear followed by text that meets glass requirements. The transition clears/prepares the region, scrolls upward by the guest row count (25 for a 25-row guest), and resumes glass output; a cursor move alone does not trigger reversal.
+Supply the actual current position after preceding output with `tigt_presenter_observe_cursor(presenter,column,row)` / `presenter.observe_cursor(column,row)`. Coordinates are **one-based host coordinates**, unlike the frame's zero-based guest cursor; zero is `ARGUMENT`. The call reads and writes nothing. The presenter tracks that observation through its own output. Call `tigt_presenter_forget_cursor` / `presenter.forget_cursor()` after external output or terminal resume, or before fallback if the position may be stale. Reset and local-echo registration also invalidate the observation.
+
+When a fresh observation is needed, `present` returns `TIGT_PRESENTER_NEEDS_CURSOR` / `Status::NeedsCursor` and writes nothing. The consumer sends a terminal cursor-position request (DSR, `ESC [ 6 n`), demultiplexes its `ESC [ row ; column R` response from keyboard/cooked input, and calls `observe_cursor(column,row)` before resubmitting at the upcoming guest vsync. Do not treat `NeedsCursor` as active full-screen presentation or derive position from guest geometry. `observe_cursor` clears the pending request. The presenter remains output-only: it never reads stdin, parses terminal input, or changes termios. Input ownership, serialization of the DSR exchange with other output, and any temporary terminal-mode changes belong to the consumer.
+
+`OneWay` retains fallback until explicit reset. `Reversible` observes a shadow glass trajectory while continuing to draw full-screen frames. A forward row boundary (including a recognized scroll) followed by new text, or an observed clear followed by new text, arms recovery. The cursor must reach the text frontier, with no retained text beneath or beyond it, and remain representable for 100 ms of submitted vsync intervals. VRAM may precede its CRTC cursor update; that text evidence is retained, but confirmation waits for the cursor. Incompatible writes reset confirmation. Idle frames, cursor movement and same-line status rewrites alone cannot arm it.
+
+Recovery continues **at the cursor in the retained normal-screen region**: no region clear, history erasure, text replay, or cursor-origin rebasing is performed. A clipped cursor outside that region cannot recover until visible. Ordinary DOS output and the returning command prompt can therefore restore glass without `CLS`; writes above the active logical output line legitimately remain full-screen. Input consumers switch back to cooked input only when `present` returns `OK`.
+
+### Already-displayed local echo
+
+`tigt_presenter_local_echo(presenter,text,length)` / `presenter.local_echo(text)` records **actual output already displayed by the host terminal**, not speculative guest output. Register only when input and output refer to the same echoing TTY, before delivering any keys from that finalized line to the guest. Do not register pure-pipe input or a line echoed on a different terminal.
+
+Keep host canonical input and echo enabled for host line editing. The consumer submits the final edited line, with erase/kill edits already folded, decoded as single-cell Unicode scalars plus TAB and the LF already displayed by the terminal. Do not submit raw editing keystrokes, encoded bytes, CR or other control characters. The API copies the payload before returning, emits nothing, and invalidates the host cursor observation because the terminal has emitted ahead of the guest.
+
+Accounting is bounded by `TIGT_PRESENTER_LOCAL_ECHO_MAX` / `presenter::LOCAL_ECHO_MAX` (4096 scalars). Success returns `TIGT_OK` / `Ok(())`; invalid arguments return `TIGT_ERROR_ARGUMENT` / `Error::Argument`, and capacity overflow returns `TIGT_ERROR_UNREPRESENTABLE` / `Error::Unrepresentable`. Do not silently truncate a line or deliver unaccounted keys after registration fails.
+
+Matching guest screen evidence consumes only confirmed glyph and newline operations, suppressing their duplicate output. The finalized input trajectory also supplies guest automatic soft-wrap boundaries, so those wraps do not add spurious newlines. Guest output not covered by confirmed local echo still uses ordinary presentation. A mismatch fails representability rather than replaying the already-displayed line. This is deliberately different from `notify`: speculative predictions may be discarded and ordinary output used, whereas actual host output cannot be undone or emitted again.
+
+Consumers that switch to raw input for active adaptive fallback must preserve unread cooked text, distinguish terminal replies from guest keys, and restore cooked editing when reversible presentation returns to glass. These input policies are not implemented by the presenter library.
 
 ### Speculative output notifications
 
@@ -120,7 +151,7 @@ The integration contract is:
 - The consumer associates the notification with the corresponding output operation and resulting vsync update, making it available before tigt presents that update. Ordering must distinguish multiple wraps or explicit newlines between two snapshots; an unqualified “this frame wrapped” flag is insufficient.
 - The notification is consumed only for its matching wrap. It must not suppress a later explicit newline, apply to unrelated output, or remain armed after the predicted wrap does not occur. Nested observations of the same output, such as a DOS call reaching BIOS, must not double-count it.
 - For a matched soft wrap, tigt tracks the physical guest row transition, including any resulting screen scroll, but continues the glass-TTY logical line without emitting NL solely for that transition. An explicit newline remains a newline, even when adjacent to a wrap. This does not rely on host automatic wrapping at the guest's column boundary.
-- Screen snapshots remain the source of displayed text. The observer annotates boundaries; it does not supply a replacement text stream. Without a matching notification, tigt must not infer a soft wrap merely because the previous row reached the right edge.
+- Screen snapshots remain the source of guest text. The observer annotates boundaries; it does not supply a replacement text stream. Without a matching notification or the separate finalized local-echo trajectory, tigt must not infer a soft wrap merely because the previous row reached the right edge.
 
 For example, if a write produces `ABCDE` followed by `FG` across the right edge of a five-column guest, an observed soft-wrap boundary permits glass output `ABCDEFG`, not `ABCDE\nFG`. A subsequent explicit newline still emits NL. Merely seeing those two rows in a snapshot cannot establish this distinction.
 
@@ -140,27 +171,29 @@ Predictions expire after 2000 ms of guest vsync time, independently of the 100 m
 
 `tigt_presenter_cancel(presenter, operation_id)` / `presenter.cancel(operation_id)` withdraws the remaining prediction idempotently. `tigt_presenter_get_notification_stats` / `presenter.notification_stats()` reports consumed, discarded and expired operation counts plus current queue length. Counters are cumulative across reset and count operations, not characters; resynchronization past an unseen operation prefix counts that operation as discarded.
 
-The frame's reserved `hints` field remains **zero**; the queue is a separate API. Serialize notifications, cancellation and frame submissions on the presenter owner. Continue submitting every vsync normally, not extra frames per interrupt call.
+Frame hints describe hardware output and video-memory changes; speculative notifications use this separate queue API. Serialize notifications, cancellation and frame submissions on the presenter owner. Continue submitting every vsync normally, not extra frames per interrupt call.
 
 Predictions cannot recover text written and overwritten, or scrolled entirely away, between snapshots. Such output requires a stronger confirmed-output source; this API deliberately does not invent it from observed call arguments.
 
 #### Captured boot, scrolling and clear regressions
 
-`tests/boot_notifications.rs` replays PC DOS 1.00 and 2.10 on IBM 5150 and XT machines with CGA. The boot-only fixtures remain intact; the additional `*-scroll` captures continue from boot through four `DIR` commands, `CLS`, and another four `DIR` commands. The fixtures retain ordered INT 10h/INT 21h observations, registers and relevant buffers, plus coherent VRAM/CRTC snapshots. Lossless VRAM patches and repeat counts preserve every vsync and interrupt boundary. BIOS teletype (INT 10h/AH=0Eh) is the notification source; retained DOS calls and nested BIOS operations are not counted again.
+`tests/boot_notifications.rs` replays PC DOS 1.00 and 2.10 on IBM 5150 and XT machines with CGA. The boot-only captured traces remain intact; the additional `*-scroll` captures continue from boot through four `DIR` commands, `CLS`, and another four `DIR` commands. The fixtures retain ordered INT 10h/INT 21h observations, registers and relevant buffers, plus coherent VRAM/CRTC snapshots. Lossless VRAM patches and repeat counts preserve every vsync and interrupt boundary. BIOS teletype (INT 10h/AH=0Eh) is the notification source; retained DOS calls and nested BIOS operations are not counted again.
 
 The scrolling JSONL files use lossless gzip containers to keep the permanent fixtures small; decompression preserves the original event order, interrupt boundaries and frame repeats. Provenance retains both the uncompressed trace hashes and the stored gzip hashes. Glass goldens retain their exact control bytes, including sampled carriage returns and the DOS 2.10 clear marker.
 
-Boot-only expected glass bytes were derived through the pre-notification presenter. Scrolling goldens are independently generated by the real presenter with notifications disabled, then reviewed against the captured guest screens; notified replay must match those snapshot-only bytes exactly. Neither oracle manufactures output from interrupt arguments. The regressions require eight complete directory transcripts, including rows no longer visible after scrolling, and observable upward row shifts before and after `CLS`.
+Expected glass bytes are generated by the real presenter with notifications disabled, then reviewed against the captured guest screens; notified replay must match those snapshot-only bytes exactly. The trailing-cursor-spacing correction regenerates affected byte oracles without changing their independently rendered CR/BS/TAB/LF/FF history. Neither oracle manufactures output from interrupt arguments. The regressions require eight complete directory transcripts, including rows no longer visible after scrolling, and observable upward row shifts before and after `CLS`.
 
 The captured DOS versions behave differently: PC DOS 1.00 rejects `CLS` with `Bad command or file name` and leaves the listing visible; PC DOS 2.10 clears the listing and returns to a lone `A>` on the second screen row. Tests check these outcomes in decoded snapshots as well as checking output after the command. The clear is not inferred from an interrupt call.
 
 `tests/fixtures/boot-notifications/provenance.json` records source-media and trace hashes, machine BIOS, event counts and oracle provenance. No guest disk or ROM binaries are included. Date/time input and all nine commands were ordinary terminal input; captures ended with a verified host stop at the stable prompt, not guest poweroff. Synthetic exact-byte regressions separately exercise confirmed soft wraps, ambiguity, expiration, cancellation and transaction boundaries that these captures do not necessarily trigger.
 
+The presenter fixture also reproduces PC DOS 2.10 LINK's `Object Modules [.OBJ]: ` prompt: its trailing blank puts the guest cursor at zero-based column 23. Omitting that confirmed space left glass one column behind and made the subsequent already-echoed response contradict the local-echo ledger. The fix is general forward-cursor spacing, not executable detection. Separate regressions cover sequential no-clear recovery, transient incompatible edits, cursor lag, retained origins in a 107-row host, and echoed commands that wrap and scroll after recovery.
+
 #### Other deferred work
 
 Vertical tabs and additional character sets, specifically ISO-8859-1, remain unimplemented TODOs.
 
-Input is outside this presenter. Future cooked-input and guest-echo validation are design intent only: this API does not implement raw input, backspace/arrow input handling, echo checking, or echo errors. The existing independent input decoder does not change that boundary.
+Input reading and editing remain outside this presenter: the consumer owns cooked/raw modes, backspace/arrow handling, and terminal-response demultiplexing. The presenter does validate guest echo against registered already-displayed local output as described above; it does not implement a terminal input loop. The existing independent input decoder does not change that boundary.
 
 ## Display technology
 

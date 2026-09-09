@@ -23,8 +23,8 @@
         "sha256": "e2b7f615c2a346077aee135b885c64461f11e925c2ee0e631bd2b11656890512",
         "size": 538366
       },
-      "oracle": "Decoded captured VRAM/CRTC through pre-notification tigt, reviewed against actual captured terminal screen; not interrupt argument concatenation.",
-      "stdout_sha256": "0a1b654bb02f8fc601555dc40099e85cd15937321834ed85c993f437fee81477"
+      "oracle": "Captured VRAM/CRTC replay with notifications disabled; regenerated for confirmed trailing cursor spacing. Independently rendered CR/BS/TAB/LF/FF history matches the previously reviewed oracle exactly; not interrupt argument concatenation.",
+      "stdout_sha256": "5539ca1e2c0f6825e68a0cb1a802ad1b81fb3a5a2280996f397bbbb29d7c550a"
     },
     {
       "scenario": "dos100-5150",
@@ -73,8 +73,8 @@
         "sha256": "35eb0a34153efc8e131d90d4544b0d7285141d660ea4f4a17522be8f86c3caf3",
         "size": 643100
       },
-      "oracle": "Decoded captured VRAM/CRTC through pre-notification tigt, reviewed against actual captured terminal screen; not interrupt argument concatenation.",
-      "stdout_sha256": "4460d740f2300ab3503ddf096334d6da2e580ffd9321d7b0ef04cc4426503fa7"
+      "oracle": "Captured VRAM/CRTC replay with notifications disabled; regenerated for confirmed trailing cursor spacing. Independently rendered CR/BS/TAB/LF/FF history matches the previously reviewed oracle exactly; not interrupt argument concatenation.",
+      "stdout_sha256": "b411b9cb33c3326d03556fec80cfbb6e016f2c384ac8995e5365c378f6c01cd3"
     },
     {
       "scenario": "dos210-5150",
@@ -125,7 +125,8 @@
       },
       "oracle": "Real tigt Presenter replay with notifications disabled; identical ordered VRAM/CRTC snapshots and every repeated vsync. Reviewed against raw captured screens: every one of 38 distinct directory rows is witnessed in VRAM and occurs eight times in the glass transcript. No interrupt arguments used as output.",
       "oracle_mode": "snapshot",
-      "stdout_sha256": "783702991995c921611135e63807f1a9da6dee4263386908b5da2e5afcfb8c1e",
+      "stdout_sha256": "41cb4129c8596e76943092b0c2b1ca1dd12defa9a7db0c6e57d171341674c3d3",
+      "spacing_oracle": "Regenerated with confirmed trailing cursor spacing; independently rendered CR/BS/TAB/LF/FF history matches the previously reviewed oracle exactly.",
       "source_capture_directory": "/Users/josh/src/JoshRodd/86Box-contributions-2/work/boot-notifications/dos100-xt/capture",
       "cls_outcome": "Unsupported: Bad command or file name; listing remains visible.",
       "scroll_witness_policy": "Raw snapshots within 12 vsync frames retain display rows shifted upward 1..5 rows, ignoring the bottom two actively written rows; at least four matching nonblank rows required. Window permits observable intermediate BIOS copy states. Witness ranges do not overlap.",
@@ -273,7 +274,8 @@
       },
       "oracle": "Real tigt Presenter replay with notifications disabled; identical ordered VRAM/CRTC snapshots and every repeated vsync. Reviewed against raw captured screens: every one of 38 distinct directory rows is witnessed in VRAM and occurs eight times in the glass transcript. No interrupt arguments used as output.",
       "oracle_mode": "snapshot",
-      "stdout_sha256": "93a4ce87cf631dabcb0ae12c0dd5c506ca305cba42e74878588f414ceeb5585d",
+      "stdout_sha256": "31fbb6a87dd6798c39e51d0bbe3837933c476dbc4aea1eff2f9e77cd55211399",
+      "spacing_oracle": "Regenerated with confirmed trailing cursor spacing; independently rendered CR/BS/TAB/LF/FF history matches the previously reviewed oracle exactly.",
       "source_capture_directory": "/Users/josh/src/JoshRodd/86Box-contributions-2/work/boot-notifications/dos100-5150/capture",
       "cls_outcome": "Unsupported: Bad command or file name; listing remains visible.",
       "scroll_witness_policy": "Raw snapshots within 12 vsync frames retain display rows shifted upward 1..5 rows, ignoring the bottom two actively written rows; at least four matching nonblank rows required. Window permits observable intermediate BIOS copy states. Witness ranges do not overlap.",
@@ -421,7 +423,8 @@
       },
       "oracle": "Real tigt Presenter replay with notifications disabled; identical ordered VRAM/CRTC snapshots and every repeated vsync. Reviewed against raw captured screens: every one of 38 distinct directory rows is witnessed in VRAM and occurs eight times in the glass transcript. No interrupt arguments used as output.",
       "oracle_mode": "snapshot",
-      "stdout_sha256": "16e6021bd04d922d8ebed6a124e2fa7748cf0236825a23120353ada6696bdeca",
+      "stdout_sha256": "df52d7303a2b809d9a1444dc0aaa6df8584c8102fa67407720a691235f842567",
+      "spacing_oracle": "Regenerated with confirmed trailing cursor spacing; independently rendered CR/BS/TAB/LF/FF history matches the previously reviewed oracle exactly.",
       "source_capture_directory": "/Users/josh/src/JoshRodd/86Box-contributions-2/work/boot-notifications/dos210-xt/capture",
       "cls_outcome": "Observed clear: only A> remains on zero-based row 1, cursor 82.",
       "scroll_witness_policy": "Raw snapshots within 12 vsync frames retain display rows shifted upward 1..5 rows, ignoring the bottom two actively written rows; at least four matching nonblank rows required. Window permits observable intermediate BIOS copy states. Witness ranges do not overlap.",
@@ -569,7 +572,8 @@
       },
       "oracle": "Real tigt Presenter replay with notifications disabled; identical ordered VRAM/CRTC snapshots and every repeated vsync. Reviewed against raw captured screens: every one of 38 distinct directory rows is witnessed in VRAM and occurs eight times in the glass transcript. No interrupt arguments used as output.",
       "oracle_mode": "snapshot",
-      "stdout_sha256": "6e409b50c1a85dd4d747dd86383d33e489cc792ed454ae9932700ed41ea56e0e",
+      "stdout_sha256": "72c9f63fb516b7f644b7888212b4eac3ff29aabb4ec3a39dda813121437e5935",
+      "spacing_oracle": "Regenerated with confirmed trailing cursor spacing; independently rendered CR/BS/TAB/LF/FF history matches the previously reviewed oracle exactly.",
       "source_capture_directory": "/Users/josh/src/JoshRodd/86Box-contributions-2/work/boot-notifications/dos210-5150/capture",
       "cls_outcome": "Observed clear: only A> remains on zero-based row 1, cursor 82.",
       "scroll_witness_policy": "Raw snapshots within 12 vsync frames retain display rows shifted upward 1..5 rows, ignoring the bottom two actively written rows; at least four matching nonblank rows required. Window permits observable intermediate BIOS copy states. Witness ranges do not overlap.",

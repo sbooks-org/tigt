@@ -41,6 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             stride: 20,
             cursor,
             refresh_rate: RefreshRate::Hz60,
+            hints: 0,
         })?;
         thread::sleep(Duration::from_secs_f64(1.0 / 60.0));
     }

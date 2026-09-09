@@ -11,10 +11,11 @@ use tigt::{
     TextCell, cp437_codepoint,
     presenter::{
         Boundary, BoundaryKind, Config, Cursor, Encoding, Frame, Mode, Notification, Presenter,
-        RefreshRate, Reversibility, TEXT_BOLD, TEXT_REVERSE,
+        RefreshRate, Reversibility, TEXT_BOLD, TEXT_REVERSE, VIDEO_DISABLED, VIDEO_MEMORY_CHANGED,
     },
     video::{AdapterKind, Frame as VideoFrame, VideoAdapter},
 };
+use tigt_gfxreader::terminal::{COLS, Terminal};
 
 fn hex(value: &str) -> Vec<u8> {
     assert_eq!(value.len() % 2, 0);
@@ -49,6 +50,7 @@ fn replay(trace: &str, notifications: bool, mut observe: impl FnMut(&Frame<'_>))
             VideoAdapter::new(AdapterKind::Mda).unwrap(),
         ];
         let mut vram = vec![0; 16384];
+        let mut submitted_vram: Option<Vec<u8>> = None;
         for line in trace.lines() {
             let event: Value = serde_json::from_str(line).unwrap();
             match event["kind"].as_str().unwrap() {
@@ -128,7 +130,7 @@ fn replay(trace: &str, notifications: bool, mut observe: impl FnMut(&Frame<'_>))
                     if !monochrome && mode & 2 != 0 {
                         continue;
                     }
-                    decoder.write(port + 4, mode);
+                    decoder.write(port + 4, mode | 8);
                     let VideoFrame::Text { cells, .. } =
                         decoder.decode_text(&vram, columns, rows, true).unwrap()
                     else {
@@ -136,15 +138,13 @@ fn replay(trace: &str, notifications: bool, mut observe: impl FnMut(&Frame<'_>))
                     };
                     let mut cells: Vec<TextCell> = cells.to_vec();
                     let start = u16::from_be_bytes([crtc[12], crtc[13]]) as usize;
-                    if mode & 8 != 0 {
-                        for (index, cell) in cells.iter_mut().enumerate() {
-                            let attr = vram[((start + index) * 2 + 1) & (vram.len() - 1)];
-                            if attr & 8 != 0 {
-                                cell.flags |= TEXT_BOLD;
-                            }
-                            if attr & 0x70 == 0x70 {
-                                cell.flags |= TEXT_REVERSE;
-                            }
+                    for (index, cell) in cells.iter_mut().enumerate() {
+                        let attr = vram[((start + index) * 2 + 1) & (vram.len() - 1)];
+                        if attr & 8 != 0 {
+                            cell.flags |= TEXT_BOLD;
+                        }
+                        if attr & 0x70 == 0x70 {
+                            cell.flags |= TEXT_REVERSE;
                         }
                     }
                     let position = number(&event, "cursor");
@@ -153,7 +153,14 @@ fn replay(trace: &str, notifications: bool, mut observe: impl FnMut(&Frame<'_>))
                     } else {
                         0
                     };
-                    let frame = Frame {
+                    let hints = if mode & 8 == 0 { VIDEO_DISABLED } else { 0 }
+                        | if submitted_vram.as_deref() != Some(vram.as_slice()) {
+                            VIDEO_MEMORY_CHANGED
+                        } else {
+                            0
+                        };
+                    submitted_vram = Some(vram.clone());
+                    let mut frame = Frame {
                         cells: &cells,
                         columns,
                         rows,
@@ -167,12 +174,14 @@ fn replay(trace: &str, notifications: bool, mut observe: impl FnMut(&Frame<'_>))
                         } else {
                             RefreshRate::Hz60
                         },
+                        hints,
                     };
                     observe(&frame);
                     for _ in 0..event["repeat"].as_u64().unwrap_or(1) {
                         presenter
                             .present(frame)
                             .unwrap_or_else(|error| panic!("event {}: {error}", event["seq"]));
+                        frame.hints &= !VIDEO_MEMORY_CHANGED;
                     }
                 }
                 other => panic!("unknown trace event {other}"),
@@ -212,6 +221,121 @@ fn real_dos_boots_reconcile_observed_calls_without_inventing_output() {
         let trace = std::fs::read_to_string(root.join(format!("{case}.jsonl"))).unwrap();
         let expected = std::fs::read(root.join(format!("{case}.stdout"))).unwrap();
         assert_bytes(&replay(&trace, true, |_| {}), &expected, case);
+    }
+}
+
+#[test]
+fn real_cga_disabled_scroll_preserves_history_until_the_copy_finishes() {
+    // IBM XT 8088/4.77 MHz, DOS 2.10 DIR: seq 5781 copies through row 18
+    // while rows 19..24 are still old; mode 0x25 has video enable clear.
+    // Seq 5799 reenables after the copy and starts the next directory row.
+    let compressed = std::fs::File::open(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/boot-notifications/cga8088-disabled-scroll.jsonl.gz"),
+    )
+    .unwrap();
+    let mut trace = String::new();
+    flate2::read::GzDecoder::new(compressed)
+        .read_to_string(&mut trace)
+        .unwrap();
+    let baseline = trace.lines().next().unwrap();
+    let mut expected = replay(baseline, false, |_| {});
+    expected.extend_from_slice(b"\nBAC");
+    let actual = replay(&trace, false, |_| {});
+    assert_bytes(&actual, &expected, "disabled copy must not blank or replay DIR history");
+}
+
+#[test]
+fn real_mda_scroll_holds_a_copied_prefix_after_finishing_the_source_line() {
+    // V20/10 MHz DIR: seq 2634 has video enabled, copies only the first three
+    // rows, and finishes SYS.COM in the still-unmoved bottom source row.
+    let compressed = std::fs::File::open(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/boot-notifications/mda-v20-partial-scroll.jsonl.gz"),
+    )
+    .unwrap();
+    let mut trace = String::new();
+    flate2::read::GzDecoder::new(compressed)
+        .read_to_string(&mut trace)
+        .unwrap();
+    let frames: Vec<_> = trace.lines().collect();
+    let coherent = format!("{}\n{}\n", frames[0], frames[2]);
+    let expected = replay(&coherent, false, |_| {});
+    let actual = replay(&trace, false, |_| {});
+    assert_bytes(&actual, &expected, "partial copy must not alter the completed DIR transcript");
+    let transcript = std::str::from_utf8(&actual).unwrap();
+    assert_eq!(transcript.matches("SYS").count(), 2); // ANSI.SYS and SYS.COM.
+    assert!(transcript.trim_end().ends_with("DISKCOPY COM"));
+}
+
+#[test]
+fn real_mda_successive_directory_scrolls_preserve_every_file_once() {
+    // Three actual DIR commands at 10 MHz exposed cursor-lagged BASIC/BASICA
+    // appends. The old policy rejected seq 17053, then repeatedly fell back
+    // and repainted retained listings in the interactive capture.
+    let compressed = std::fs::File::open(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/boot-notifications/mda-v20-repeated-dir.jsonl.gz"),
+    )
+    .unwrap();
+    let mut trace = String::new();
+    flate2::read::GzDecoder::new(compressed)
+        .read_to_string(&mut trace)
+        .unwrap();
+    let actual = replay(&trace, false, |_| {});
+    let transcript = std::str::from_utf8(&actual).unwrap().replace("\r\n", "\n");
+    assert!(!transcript.contains('\x0c'), "DIR must not clear retained history");
+    assert!(transcript.ends_with("A>"));
+    let listings: Vec<Vec<Vec<String>>> = transcript
+        .split("A>DIR\n")
+        .skip(1)
+        .map(|listing| {
+            let listing = listing
+                .split_once("A>")
+                .map_or(listing, |(body, _)| body)
+                .trim()
+                .replace('\n', "\r\n");
+            // A terminal applies the cursor-lag backspaces, rather than
+            // interpreting overwritten digits as additional file-size text.
+            let terminal = Terminal::replay(listing.as_bytes());
+            assert!(terminal.errors.is_empty(), "{:?}", terminal.errors);
+            terminal.cells().0
+                .chunks_exact(COLS)
+                .map(|row| {
+                    row.iter()
+                        .map(|cell| cell.character)
+                        .collect::<String>()
+                        .split_whitespace()
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .collect()
+        })
+        .collect();
+    assert_eq!(listings.len(), 3);
+    let first = &listings[0];
+    assert_eq!(
+        first
+            .iter()
+            .filter(|fields| {
+                fields.get(1).is_some_and(|extension| matches!(extension.as_str(), "COM" | "SYS" | "EXE" | "BAS"))
+            })
+            .count(),
+        39,
+    );
+    for listing in &listings {
+        assert_eq!(listing, first, "a DIR lost or replayed retained rows");
+        for expected in [
+            "MORE COM 384 10-20-83 12:00p",
+            "BASIC COM 16256 10-20-83 12:00p",
+            "BASICA COM 26112 10-20-83 12:00p",
+        ] {
+            assert_eq!(
+                listing.iter().filter(|fields| fields.iter().map(String::as_str).eq(expected.split_whitespace())).count(),
+                1,
+                "cursor-lagged directory field changed: {expected}",
+            );
+        }
     }
 }
 
@@ -337,7 +461,14 @@ fn real_dos_directory_history_survives_scrolls_and_the_observed_cls_outcome() {
                     .split_once("A>")
                     .map_or(listing, |(body, _)| body)
                     .trim();
-                assert_eq!(listing, first_listing, "{case}: incomplete listing {phase}");
+                // A sampled blank cursor advance may use spaces rather than a
+                // later TAB. Compare complete ordered directory fields here;
+                // the independent byte oracle above checks the control stream.
+                assert_eq!(
+                    listing.lines().map(|line| line.split_whitespace().collect::<Vec<_>>()).collect::<Vec<_>>(),
+                    first_listing.lines().map(|line| line.split_whitespace().collect::<Vec<_>>()).collect::<Vec<_>>(),
+                    "{case}: incomplete listing {phase}"
+                );
             }
         }
         assert!(screens.scrolls[0] > 0, "{case}: no observed pre-CLS scroll");

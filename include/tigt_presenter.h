@@ -9,24 +9,41 @@ extern "C" {
 #define TIGT_ERROR_UNREPRESENTABLE -5
 #define TIGT_PRESENTER_PENDING 1
 #define TIGT_PRESENTER_FULLSCREEN 2
+#define TIGT_PRESENTER_NEEDS_CURSOR 4
+#define TIGT_PRESENTER_LOCAL_ECHO_MAX 4096u
 
 enum { TIGT_PRESENT_GLASS = 0, TIGT_PRESENT_ADAPTIVE = 1 };
 enum { TIGT_ENCODING_LOCALE = 0, TIGT_ENCODING_UTF8 = 1, TIGT_ENCODING_ASCII = 2 };
 /* Additional flags accepted by this presenter only. */
 enum { TIGT_PRESENT_BOLD = 1u << 2, TIGT_PRESENT_REVERSE = 1u << 3 };
+/* Frame hints, independent of cell flags and speculative notifications. */
+enum {
+    TIGT_PRESENT_VIDEO_DISABLED = 1u << 0,
+    TIGT_PRESENT_VIDEO_MEMORY_CHANGED = 1u << 1
+};
 typedef struct {
     uint32_t abi_version;
     int output_fd;
     uint32_t mode;
     uint32_t encoding;
+    /* 0: retain fallback. 1: resume at its retained cursor after observed
+     * sequential row advancement and text (or clear and text), with 100ms at
+     * the text frontier. Recovery never clears or replays the host region. */
     uint32_t reversible;
 } tigt_presenter_config;
 typedef struct {
+    /* Underlying decoded text, including while VIDEO_DISABLED: decode with
+     * hardware blanking bypassed. The presenter alone masks disabled output. */
     const tigt_text_cell *cells;
     uint16_t columns, rows, stride;
     uint16_t cursor_column, cursor_row;
     uint16_t refresh_hz; /* 50, 60, or reserved future VGA cadence 70. */
-    /* Reserved; must be zero. Notifications are separate from frame hints. */
+    /* VIDEO_DISABLED means hardware output is disabled, not an ordinary blank.
+     * VIDEO_MEMORY_CHANGED means any raw VRAM byte differs from the previous
+     * snapshot submitted here (including attributes/offscreen bytes); set it
+     * for the initial snapshot. Comparing while skipping submission must not
+     * consume that notification. Zero preserves ordinary presentation.
+     * Unknown bits are invalid. Hardware-disabled raw cells are never painted. */
     uint32_t hints;
 } tigt_presenter_frame;
 typedef struct tigt_presenter tigt_presenter;
@@ -90,14 +107,55 @@ int tigt_presenter_notify(tigt_presenter *presenter, const tigt_presenter_notifi
 int tigt_presenter_cancel(tigt_presenter *presenter, uint64_t operation_id);
 int tigt_presenter_get_notification_stats(const tigt_presenter *presenter,
                                           tigt_presenter_notification_stats *stats);
+/* Actual host observations, never speculative output predictions. Coordinates
+ * are one-based, as in a terminal cursor-position report. The consumer owns
+ * querying/demultiplexing replies; the presenter never reads input. Adaptive
+ * entry returns NEEDS_CURSOR without output if its host position is unknown.
+ * Forget the observation after untracked external output or terminal resume.
+ */
+int tigt_presenter_observe_cursor(tigt_presenter *presenter, unsigned column, unsigned row);
+int tigt_presenter_forget_cursor(tigt_presenter *presenter);
+/* Register text ALREADY displayed by the same host TTY's line discipline,
+ * before delivering its keys to the guest. Supply the final edited line as
+ * single-cell scalars, LF and TAB; erased input is absent. Tabs expand at the
+ * logical output column. The next guest output must confirm this exact stream.
+ * Confirmation suppresses those glyphs/newlines, not their cursor/mapping
+ * updates; known guest wraps do not insert extra host newlines. This is separate
+ * from notify and does not change notification statistics.
+ *
+ * The copied queue holds LOCAL_ECHO_MAX expanded scalars. Overflow or a
+ * contradictory guest output is unrepresentable, never silently replayed.
+ * A clear, geometry change, fullscreen entry or reset ends local accounting.
+ * Invalid scalars return ARGUMENT; overflow returns UNREPRESENTABLE. Requires
+ * an initialized glass baseline. Pipe input has no local echo to register.
+ */
+int tigt_presenter_local_echo(tigt_presenter *presenter, const uint32_t *text, size_t length);
 /* Output-only, synchronous; submit once per vsync, including unchanged frames.
  * The caller serializes all operations and owns the borrowed output fd. Never
  * share output with a live curses session. Adaptive mode requires a TTY fd.
  * No stdin reads, termios raw mode, alternate screen, or signal handlers.
- * Returned status: OK (glass), PENDING (confirmation), FULLSCREEN, or error.
+ * Returned status: OK (glass), PENDING (confirmation, scroll, or disable hold),
+ * NEEDS_CURSOR (observation), FULLSCREEN, or error. PENDING retains the current
+ * presentation/input mode, including when already fullscreen.
+ * A copied row prefix/partial row followed by an untouched (possibly already
+ * shifted) suffix, or uncleared exposed rows, holds the committed image/cursor/
+ * echo/map for at most 500ms from first detection. Progress/idle observations
+ * do not renew the deadline. Coherent, uniquely aligned completion commits
+ * once; ambiguous repeated rows cannot invent scrollback. Timeout takes the
+ * ordinary glass error/adaptive fallback, including when already fullscreen.
+ * Ordinary unrepresentable edits still use the separate 100ms confirmation.
+ * Hardware-disabled output ordinarily holds for 200ms unless VRAM changes.
+ * The first disabled vsync counts: 10 frames at 50Hz, 12 at 60Hz. Changed VRAM
+ * bypasses that hold for the disable interval; reenable/reset starts fresh.
+ * Exception: recognized scrolling (even a completed copy while still disabled)
+ * retains the prior presentation under the same bounded 500ms scroll deadline.
+ * All other disabled memory changes show hardware black immediately; raw text
+ * is never painted while disabled. Enabled blank/CLS frames are not debounced.
  * UNREPRESENTABLE is sticky until reset; I/O errors are likewise terminal.
  * Destroy frees state, never closes the fd. Reset starts a new empty glass
  * baseline without emitting output; consumer must have prepared its destination.
+ * Reversible adaptive recovery also needs 100ms of representable frontier
+ * observations; cursor motion/idle/same-line rewrites alone cannot arm it.
  * Logical cursor position is independent of TIGT_TEXT_CURSOR/visibility.
  */
 int tigt_presenter_create(const tigt_presenter_config *config, tigt_presenter **output);

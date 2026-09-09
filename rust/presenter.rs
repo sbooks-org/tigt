@@ -12,17 +12,26 @@
 
 use crate::TextCell;
 use std::{
-    ffi::{c_int, c_void},
+    ffi::{c_int, c_uint, c_void},
     fmt,
     os::fd::{AsRawFd, BorrowedFd},
     ptr::{self, NonNull},
 };
 
 pub const ABI_VERSION: u32 = 1;
+/// Maximum decoded scalars in bounded already-displayed local-echo accounting.
+pub const LOCAL_ECHO_MAX: usize = 4096;
 /// Presenter-only flag; not accepted by the curses text API.
 pub const TEXT_BOLD: u32 = 1 << 2;
 /// Presenter-only flag; glass-TTY treats reverse video as bold overprinting.
 pub const TEXT_REVERSE: u32 = 1 << 3;
+/// Frame hint: hardware output is disabled, not merely displaying blank cells.
+/// Supply underlying unblanked text in [`Frame::cells`]; tigt masks disabled output.
+pub const VIDEO_DISABLED: u32 = 1 << 0;
+/// Frame hint: any raw VRAM byte changed since the last submitted snapshot.
+/// Include attributes/offscreen memory and set this for the initial snapshot.
+/// Comparisons during skipped submissions must not consume this notification.
+pub const VIDEO_MEMORY_CHANGED: u32 = 1 << 1;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,7 +57,9 @@ pub enum Encoding {
 pub enum Reversibility {
     /// Stay full-screen after adaptive fallback until an explicit reset.
     OneWay = 0,
-    /// Allow a guest clear followed by representable text to restore glass mode.
+    /// Resume at the retained cursor after sequential row advancement and text
+    /// (or clear and text), confirmed for 100 ms at the text frontier.
+    /// Recovery neither clears the region nor replays its contents.
     Reversible = 1,
 }
 
@@ -84,21 +95,29 @@ pub struct Cursor {
 /// Colors and flags use the existing [`TextCell`] layout without a staging copy.
 #[derive(Clone, Copy, Debug)]
 pub struct Frame<'a> {
+    /// Underlying decoded text, with hardware blanking bypassed even when
+    /// [`VIDEO_DISABLED`] is set. Disabled raw cells are inspected, never painted.
     pub cells: &'a [TextCell],
     pub columns: u16,
     pub rows: u16,
     pub stride: u16,
     pub cursor: Cursor,
     pub refresh_rate: RefreshRate,
+    /// Zero for ordinary output, or a combination of [`VIDEO_DISABLED`] and
+    /// [`VIDEO_MEMORY_CHANGED`]. Unknown bits are rejected.
+    pub hints: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Glass,
-    /// Unrepresentable update awaiting confirmation; continue every vsync.
+    /// Confirmation, scroll, or disable hold; keep submitting without changing input mode.
     Pending,
     /// Adaptive presentation is using the normal-screen clipped region.
     Fullscreen,
+    /// No output was written: observe the current host cursor, then resume vsyncs.
+    /// This is not an active full-screen transition.
+    NeedsCursor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,6 +249,17 @@ struct RawFrame {
 unsafe extern "C" {
     fn tigt_presenter_create(config: *const RawConfig, output: *mut *mut c_void) -> c_int;
     fn tigt_presenter_present(presenter: *mut c_void, frame: *const RawFrame) -> c_int;
+    fn tigt_presenter_observe_cursor(
+        presenter: *mut c_void,
+        column: c_uint,
+        row: c_uint,
+    ) -> c_int;
+    fn tigt_presenter_forget_cursor(presenter: *mut c_void) -> c_int;
+    fn tigt_presenter_local_echo(
+        presenter: *mut c_void,
+        text: *const u32,
+        length: usize,
+    ) -> c_int;
     fn tigt_presenter_reset(presenter: *mut c_void) -> c_int;
     fn tigt_presenter_destroy(presenter: *mut c_void);
     fn tigt_presenter_notify(presenter: *mut c_void, notification: *const RawNotification)
@@ -289,10 +319,30 @@ impl<'fd> Presenter<'fd> {
     /// Pending for five/six/seven elapsed vsync intervals at 50/60/70 Hz
     /// (100 ms; six/seven/eight bad observations including first detection).
     /// Recovery cancels confirmation. Confirmed glass failure returns
-    /// [`Error::Unrepresentable`]; adaptive mode instead returns Fullscreen.
-    /// The wrapper supplies zero reserved frame hints. Use [`Self::notify`] for
-    /// speculative, ordered output expectations. Only matching screen evidence
-    /// can confirm their soft-wrap annotations.
+    /// [`Error::Unrepresentable`]; adaptive mode returns [`Status::NeedsCursor`]
+    /// without writing if it needs a fresh host position, or [`Status::Fullscreen`]
+    /// once fallback is active. On NeedsCursor, obtain a host DSR response, call
+    /// [`Self::observe_cursor`], and resubmit at the next guest vsync.
+    /// Recognized upward copies (including a partial row, an already-shifted
+    /// untouched suffix, or uncleared exposed rows) retain the committed image,
+    /// cursor, echo and logical mapping for at most 500 ms from first detection.
+    /// Progress and identical observations never renew that deadline. Coherent,
+    /// uniquely aligned completion commits once; ambiguous repeated rows cannot
+    /// invent scrollback. Timeout takes ordinary glass error/adaptive fallback.
+    /// The hold applies in glass and fullscreen, without aging recovery evidence.
+    /// Notifications still age on every valid vsync.
+    ///
+    /// [`VIDEO_DISABLED`] ordinarily holds the previous presentation for 200 ms:
+    /// ten 50 Hz or twelve 60 Hz submissions, counting the first disabled frame.
+    /// [`VIDEO_MEMORY_CHANGED`] releases that ordinary hold for the remainder of
+    /// the disable interval. Exception: recognized scrolling, including a
+    /// completed copy while still disabled, uses the same 500 ms scroll deadline.
+    /// Other disabled memory changes show hardware black immediately. Underlying
+    /// raw cells are never painted while disabled. Reenable/reset starts a fresh
+    /// ordinary disable interval; enabled blanks are never held. These intervals
+    /// are independent of the ordinary 100 ms confirmation/recovery.
+    /// Use [`Self::notify`] for speculative, ordered output expectations.
+    /// Only matching screen evidence can confirm their soft-wrap annotations.
     pub fn present(&mut self, frame: Frame<'_>) -> Result<Status, Error> {
         crate::validate_text(frame.cells, frame.columns, frame.rows, frame.stride)
             .map_err(|_| Error::Argument)?;
@@ -307,7 +357,7 @@ impl<'fd> Presenter<'fd> {
             cursor_column: frame.cursor.column,
             cursor_row: frame.cursor.row,
             refresh_hz: frame.refresh_rate as u16,
-            hints: 0,
+            hints: frame.hints,
         };
         // Bounds above cover every visible cell. repr(C) TextCell is shared
         // directly with C, which retains neither the slice nor this descriptor.
@@ -315,6 +365,55 @@ impl<'fd> Presenter<'fd> {
             0 => Ok(Status::Glass),
             1 => Ok(Status::Pending),
             2 => Ok(Status::Fullscreen),
+            4 => Ok(Status::NeedsCursor),
+            other => Err(Error::from_status(other)),
+        }
+    }
+
+    /// Records the current one-based host cursor after all preceding output.
+    ///
+    /// Neither reads nor writes. Zero coordinates return [`Error::Argument`].
+    /// The consumer obtains the actual position (for example, from a DSR reply),
+    /// demultiplexing terminal replies from user input. The presenter tracks its
+    /// own subsequent output and clears any pending [`Status::NeedsCursor`].
+    pub fn observe_cursor(&mut self, column: u32, row: u32) -> Result<(), Error> {
+        match unsafe { tigt_presenter_observe_cursor(self.raw.as_ptr(), column, row) } {
+            0 => Ok(()),
+            other => Err(Error::from_status(other)),
+        }
+    }
+
+    /// Invalidates host position after external output or terminal resume.
+    ///
+    /// Emits nothing. Adaptive fallback requests a fresh observation when needed;
+    /// call this before fallback if other output may have moved the host cursor.
+    pub fn forget_cursor(&mut self) -> Result<(), Error> {
+        match unsafe { tigt_presenter_forget_cursor(self.raw.as_ptr()) } {
+            0 => Ok(()),
+            other => Err(Error::from_status(other)),
+        }
+    }
+
+    /// Records a finalized host-edited line that the terminal already displayed.
+    ///
+    /// Call before delivering any of its keys to the guest, and only when input
+    /// and output refer to the same echoing TTY; never register piped input.
+    /// Fold cooked editing into the final decoded single-cell Unicode scalars,
+    /// allowing TAB and the already-displayed LF, not raw editing keystrokes.
+    ///
+    /// Unlike [`Self::notify`], this accounts for actual output. Confirmed guest
+    /// glyphs, newlines and soft wraps consume that accounting without duplicate
+    /// output. A mismatch fails representability rather than replaying host echo.
+    /// Invalid input returns [`Error::Argument`]; exceeding the bounded
+    /// [`LOCAL_ECHO_MAX`] capacity returns [`Error::Unrepresentable`].
+    /// C copies the slice before returning and emits nothing. This invalidates
+    /// the host cursor observation because local echo has moved it ahead.
+    pub fn local_echo(&mut self, text: &[u32]) -> Result<(), Error> {
+        // The slice remains live for this call; C validates and copies its data.
+        match unsafe {
+            tigt_presenter_local_echo(self.raw.as_ptr(), text.as_ptr(), text.len())
+        } {
+            0 => Ok(()),
             other => Err(Error::from_status(other)),
         }
     }
@@ -365,7 +464,8 @@ impl<'fd> Presenter<'fd> {
     /// Starts a new empty glass baseline, clearing sticky failures.
     ///
     /// Emits nothing. The consumer must first prepare the destination; this is
-    /// not automatic recovery or restoration of terminal contents.
+    /// not automatic recovery or restoration of terminal contents. Also discards
+    /// local-echo accounting and invalidates the host cursor observation.
     pub fn reset(&mut self) -> Result<(), Error> {
         match unsafe { tigt_presenter_reset(self.raw.as_ptr()) } {
             0 => Ok(()),

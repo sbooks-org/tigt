@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <locale.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -26,11 +27,14 @@
     } \
 } while (0)
 #define SGR "\033[0;38;2;170;170;170;48;2;0;0;0m"
+#define BLACK_SGR "\033[0;38;2;0;0;0;48;2;0;0;0m"
 
 typedef struct {
     FILE *file;
     int master, slave;
     off_t offset;
+    pthread_t thread;
+    int concurrent_output, running, result, expected_result;
     tigt_presenter *presenter;
     tigt_presenter_frame frame;
     tigt_text_cell cells[21440];
@@ -108,6 +112,28 @@ create_pty(fixture *f, unsigned guest_columns, unsigned guest_rows,
     CHECK(tigt_presenter_create(&config, &f->presenter) == TIGT_OK);
 }
 
+static void *
+present_thread(void *opaque)
+{
+    fixture *f = opaque;
+    f->result = tigt_presenter_present(f->presenter, &f->frame);
+    return NULL;
+}
+
+/* A real terminal drains concurrently. Darwin's PTY queue can be smaller than
+ * a 25-row ANSI transaction; never make the writer wait for its own reader. */
+static void
+submit_output(fixture *f, int expected)
+{
+    CHECK(!f->running);
+    if (f->concurrent_output) {
+        f->expected_result = expected;
+        f->running = 1;
+        CHECK(pthread_create(&f->thread, NULL, present_thread, f) == 0);
+    } else
+        CHECK(tigt_presenter_present(f->presenter, &f->frame) == expected);
+}
+
 static void
 expect_bytes(fixture *f, const char *expected, size_t count)
 {
@@ -145,6 +171,11 @@ expect_bytes(fixture *f, const char *expected, size_t count)
                 break;
             }
         }
+    }
+    if (f->running) {
+        CHECK(pthread_join(f->thread, NULL) == 0);
+        f->running = 0;
+        CHECK(f->result == f->expected_result);
     }
     if (used != count || memcmp(actual, expected, count) != 0) {
         fprintf(stderr, "expected %zu bytes, received %zu\nexpected:", count, used);
@@ -231,7 +262,7 @@ editing(void)
     text(&f, 0, 0, "  ");
     position(&f, 0, 1); /* Not a screen-clear/home operation. */
     CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
-    EXPECT(&f, "\b \b\b \b");
+    EXPECT(&f, "\b \b\b \b ");
     CHECK(tigt_presenter_reset(f.presenter) == TIGT_OK);
     blank_screen(&f);
     text(&f, 0, 0, "100");
@@ -262,7 +293,11 @@ editing(void)
     EXPECT(&f, "\bB"); /* Replacement at column zero is still a BS edit. */
     position(&f, 0, 8);
     CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
-    EXPECT(&f, ""); /* Blank cursor motion cannot blank incoming text. */
+    EXPECT(&f, "\t"); /* Forward motion confirms blank spacing, not a deletion. */
+    text(&f, 0, 1, "incoming");
+    position(&f, 0, 9);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "\b\b\b\b\b\b\bincoming");
     CHECK(tigt_presenter_reset(f.presenter) == TIGT_OK);
     blank_screen(&f);
     position(&f, 0, 0);
@@ -393,6 +428,342 @@ geometry_and_scrolling(void)
 }
 
 static void
+sequential_scroll_suffix(void)
+{
+    fixture f;
+    create_file(&f, 80, 3, 50, TIGT_ENCODING_ASCII);
+    text(&f, 0, 0, "old");
+    text(&f, 1, 0, "listing");
+    text(&f, 2, 0, "COMMAND  COM");
+    position(&f, 2, 12);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "old\nlisting\nCOMMAND  COM");
+    /* A fast guest finishes the current partial DIR row, then scrolls and
+     * starts the next row between snapshots. No wrap/echo notification exists. */
+    blank_screen(&f);
+    text(&f, 0, 0, "listing");
+    text(&f, 1, 0, "COMMAND  COM    17792  10-20-83  12:00p");
+    text(&f, 2, 0, "ANSI");
+    position(&f, 2, 4);
+    text(&f, 1, 0, "X");
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+    EXPECT(&f, ""); /* A changed emitted prefix cannot masquerade as a scroll. */
+    text(&f, 1, 0, "C");
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "\t17792  10-20-83  12:00p\nANSI");
+    destroy(&f);
+
+    create_file(&f, 80, 3, 50, TIGT_ENCODING_ASCII);
+    text(&f, 0, 0, "old");
+    text(&f, 1, 0, "listing");
+    text(&f, 2, 0, "COMMAND  COM    KEEP");
+    position(&f, 2, 20);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "old\nlisting\nCOMMAND  COM\tKEEP");
+    position(&f, 2, 12);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "\b\b\b\b\b\b\b\b");
+    blank_screen(&f);
+    text(&f, 0, 0, "listing");
+    text(&f, 1, 0, "COMMAND  COM    17792  10-20-83  12:00p");
+    text(&f, 2, 0, "ANSI");
+    position(&f, 2, 4);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+    EXPECT(&f, ""); /* Pre-existing nonblank suffix is not an append proof. */
+    destroy(&f);
+
+    create_file(&f, 20, 3, 50, TIGT_ENCODING_ASCII);
+    text(&f, 0, 0, "old");
+    text(&f, 1, 0, "listing");
+    text(&f, 2, 0, "MORE 3");
+    position(&f, 2, 6);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "old\nlisting\nMORE 3");
+    blank_screen(&f);
+    text(&f, 0, 0, "listing");
+    text(&f, 1, 0, "MORE 384");
+    text(&f, 2, 0, "BASIC 12");
+    position(&f, 2, 7); /* The final glyph is painted before CRTC advancement. */
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "84\nBASIC 12\b");
+    text(&f, 0, 0, "MORE 384");
+    text(&f, 2, 8, "3");
+    position(&f, 2, 0);
+    for (unsigned i = 0; i < 8; i++)
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+    EXPECT(&f, "");
+    blank_screen(&f);
+    text(&f, 0, 0, "MORE 384");
+    text(&f, 1, 0, "BASIC 123");
+    text(&f, 2, 0, "NEXT");
+    position(&f, 2, 4);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "23\nNEXT"); /* Replace at the lagged cursor, then append once. */
+    destroy(&f);
+}
+
+static void
+multiple_row_scrolls(void)
+{
+    fixture f;
+    create_file(&f, 8, 9, 60, TIGT_ENCODING_ASCII);
+    const char *rows[] = { "A", "B", "C", "D", "E", "F", "G", "H", "I",
+                           "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T" };
+    for (unsigned y = 0; y < 9; y++)
+        text(&f, y, 0, rows[y]);
+    position(&f, 8, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "A\nB\nC\nD\nE\nF\nG\nH\nI");
+    const unsigned shifts[] = { 2, 3, 6 };
+    const char *suffixes[] = { "\nJ\nK", "\nL\nM\nN", "\nO\nP\nQ\nR\nS\nT" };
+    unsigned origin = 0;
+    for (unsigned step = 0; step < 3; step++) {
+        origin += shifts[step];
+        blank_screen(&f);
+        for (unsigned y = 0; y < 9; y++)
+            text(&f, y, 0, rows[origin + y]);
+        position(&f, 8, 1);
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+        expect_bytes(&f, suffixes[step], strlen(suffixes[step]));
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+        EXPECT(&f, ""); /* One commit per snapshot, not one per shifted row. */
+    }
+    destroy(&f);
+}
+
+static void
+progressive_scroll_copy(void)
+{
+    fixture f;
+    create_file(&f, 8, 6, 60, TIGT_ENCODING_ASCII);
+    const char *rows[] = { "alpha", "bravo", "charlie", "delta", "echo", "foxtrot" };
+    for (unsigned y = 0; y < 6; y++)
+        text(&f, y, 0, rows[y]);
+    position(&f, 5, 7);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "alpha\nbravo\ncharlie\ndelta\necho\nfoxtrot");
+    tigt_text_cell committed[48];
+    memcpy(committed, f.cells, sizeof(committed));
+    /* A two-row REP MOVSW has copied two rows and three cells of the next.
+     * Repeated vsyncs do not prove that the remaining VRAM write completed. */
+    memcpy(f.cells, committed + 16, 19 * sizeof(*f.cells));
+    for (unsigned i = 0; i < 8; i++) {
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+        EXPECT(&f, "");
+    }
+    memcpy(f.cells, committed + 16, 32 * sizeof(*f.cells));
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+    EXPECT(&f, ""); /* Retained rows align, but the exposed rows are stale. */
+    text(&f, 4, 0, "        ");
+    text(&f, 5, 0, "   ");
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+    EXPECT(&f, ""); /* The final erase is still only a prefix of a row. */
+    text(&f, 4, 0, "golf    ");
+    text(&f, 5, 0, "hotel   ");
+    position(&f, 5, 5);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "\ngolf\nhotel");
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "");
+    text(&f, 5, 5, "!");
+    position(&f, 5, 6);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "!"); /* Cursor and logical row mapping advance only on commit. */
+    destroy(&f);
+}
+
+static void
+windowed_scroll_copy(void)
+{
+    fixture f;
+    create_file(&f, 8, 8, 60, TIGT_ENCODING_ASCII);
+    text(&f, 0, 0, "HEADER");
+    for (unsigned y = 2; y <= 6; y++) {
+        const char value[] = { (char) ('A' + y - 2), 0 };
+        text(&f, y, 0, value);
+    }
+    position(&f, 6, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "HEADER\n\nA\nB\nC\nD\nE");
+    text(&f, 2, 0, "C");
+    text(&f, 3, 0, "D");
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+    EXPECT(&f, "");
+    text(&f, 4, 0, "E");
+    text(&f, 5, 0, "F");
+    text(&f, 6, 0, "G");
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "\nF\nG"); /* Neither heading nor unchanged blank borders replay. */
+    destroy(&f);
+}
+
+static void
+scroll_hold_deadline_and_disabled(void)
+{
+    fixture f;
+    create_file(&f, 8, 6, 60, TIGT_ENCODING_ASCII);
+    for (unsigned y = 0; y < 6; y++) {
+        const char value[] = { (char) ('A' + y), 0 };
+        text(&f, y, 0, value);
+    }
+    position(&f, 5, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "A\nB\nC\nD\nE\nF");
+    text(&f, 0, 0, "B");
+    text(&f, 1, 0, "C");
+    /* A stalled copy cannot freeze a real application forever. Progress
+     * inside the bounded interval must not restart the deadline either. */
+    for (unsigned i = 0; i < 20; i++) {
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+        EXPECT(&f, "");
+    }
+    text(&f, 2, 0, "D");
+    unsigned pending = 0;
+    int result;
+    do {
+        result = tigt_presenter_present(f.presenter, &f.frame);
+        EXPECT(&f, "");
+        pending++;
+    } while (result == TIGT_PRESENTER_PENDING && pending <= 20);
+    CHECK(result == TIGT_ERROR_UNREPRESENTABLE);
+    destroy(&f);
+
+    create_file(&f, 8, 4, 60, TIGT_ENCODING_ASCII);
+    text(&f, 0, 0, "A");
+    text(&f, 1, 0, "B");
+    text(&f, 2, 0, "C");
+    text(&f, 3, 0, "D");
+    position(&f, 3, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "A\nB\nC\nD");
+    text(&f, 0, 0, "B");
+    f.frame.hints = TIGT_PRESENT_VIDEO_DISABLED | TIGT_PRESENT_VIDEO_MEMORY_CHANGED;
+    for (unsigned i = 0; i < 20; i++) {
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+        EXPECT(&f, "");
+        f.frame.hints = TIGT_PRESENT_VIDEO_DISABLED;
+    }
+    text(&f, 1, 0, "C");
+    f.frame.hints |= TIGT_PRESENT_VIDEO_MEMORY_CHANGED;
+    pending = 0;
+    do {
+        result = tigt_presenter_present(f.presenter, &f.frame);
+        if (result == TIGT_PRESENTER_PENDING)
+            EXPECT(&f, "");
+        pending++;
+        f.frame.hints = TIGT_PRESENT_VIDEO_DISABLED;
+    } while (result == TIGT_PRESENTER_PENDING && pending <= 20);
+    CHECK(result == TIGT_OK);
+    EXPECT(&f, "\f"); /* A disabled copy may outlast 200ms, but not remain frozen. */
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, ""); /* No repeated blank or restarted scroll interval. */
+    destroy(&f);
+
+    create_file(&f, 8, 4, 60, TIGT_ENCODING_ASCII);
+    text(&f, 0, 0, "A");
+    text(&f, 1, 0, "B");
+    text(&f, 2, 0, "C");
+    text(&f, 3, 0, "D");
+    position(&f, 3, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "A\nB\nC\nD");
+    text(&f, 0, 0, "B");
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+    EXPECT(&f, "");
+    blank_screen(&f);
+    position(&f, 3, 1);
+    f.frame.hints = TIGT_PRESENT_VIDEO_DISABLED | TIGT_PRESENT_VIDEO_MEMORY_CHANGED;
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "\f"); /* Explicit hardware blank wins over an active scroll hold. */
+    f.frame.hints = 0;
+    blank_screen(&f);
+    text(&f, 0, 0, "R");
+    position(&f, 0, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "R");
+    destroy(&f);
+}
+
+static void
+scroll_hold_local_echo(void)
+{
+    fixture f;
+    create_file(&f, 8, 4, 60, TIGT_ENCODING_ASCII);
+    text(&f, 0, 0, "old");
+    text(&f, 1, 0, "listing");
+    text(&f, 2, 0, "last");
+    text(&f, 3, 0, "A>");
+    position(&f, 3, 2);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "old\nlisting\nlast\nA>");
+    const uint32_t echo[] = { 'D', 'I', 'R', '\n' };
+    CHECK(write(fileno(f.file), "DIR\n", 4) == 4);
+    CHECK(tigt_presenter_local_echo(f.presenter, echo, 4) == TIGT_OK);
+    EXPECT(&f, "DIR\n");
+    text(&f, 0, 0, "listing ");
+    text(&f, 3, 2, "DIR");
+    for (unsigned i = 0; i < 8; i++)
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+    EXPECT(&f, "");
+    blank_screen(&f);
+    text(&f, 0, 0, "listing");
+    text(&f, 1, 0, "last");
+    text(&f, 2, 0, "A>DIR");
+    text(&f, 3, 0, "result");
+    position(&f, 3, 6);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "result"); /* Retained prompt, cooked echo and LF each appear once. */
+    destroy(&f);
+}
+
+static void
+overlapping_and_ambiguous_scrolls(void)
+{
+    fixture f;
+    create_file(&f, 8, 8, 60, TIGT_ENCODING_ASCII);
+    for (unsigned y = 0; y < 8; y++) {
+        const char value[] = { (char) ('A' + y), 0 };
+        text(&f, y, 0, value);
+    }
+    position(&f, 7, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "A\nB\nC\nD\nE\nF\nG\nH");
+    /* One scroll completed between samples, then the next started. The
+     * uncopied suffix is already shifted once, not the committed image. */
+    const char *partial[] = { "C", "D", "D", "E", "F", "G", "H", "I" };
+    for (unsigned y = 0; y < 8; y++)
+        text(&f, y, 0, partial[y]);
+    for (unsigned i = 0; i < 8; i++)
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+    EXPECT(&f, "");
+    for (unsigned y = 2; y < 6; y++) {
+        const char value[] = { (char) ('C' + y), 0 };
+        text(&f, y, 0, value);
+    }
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+    EXPECT(&f, ""); /* Both newly exposed rows still retain earlier contents. */
+    text(&f, 6, 0, "I");
+    text(&f, 7, 0, "J");
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "\nI\nJ");
+    destroy(&f);
+
+    create_file(&f, 8, 6, 60, TIGT_ENCODING_ASCII);
+    for (unsigned y = 0; y < 6; y++)
+        text(&f, y, 0, y % 2 ? "B" : "A");
+    position(&f, 5, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "A\nB\nA\nB\nA\nB");
+    for (unsigned y = 0; y < 5; y++)
+        text(&f, y, 0, y % 2 ? "A" : "B");
+    text(&f, 5, 0, "C");
+    for (unsigned i = 0; i < 8; i++)
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+    EXPECT(&f, ""); /* Repeated anchors cannot prove one versus three rows. */
+    destroy(&f);
+}
+
+static void
 confirmation_and_recovery(void)
 {
     fixture f;
@@ -454,7 +825,163 @@ confirmation_and_recovery(void)
 }
 
 static void
-fallback(fixture *f)
+video_disable_glass(void)
+{
+    fixture f;
+    for (unsigned hz = 50; hz <= 60; hz += 10) {
+        /* A disabled CRTC does not reset its logical cursor. This multiline
+         * erase would otherwise enter the 100ms representability gate. */
+        create_file(&f, 20, 3, hz, TIGT_ENCODING_ASCII);
+        text(&f, 0, 0, "A");
+        text(&f, 1, 0, "B");
+        position(&f, 1, 1);
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+        EXPECT(&f, "A\nB");
+        blank_screen(&f);
+        position(&f, 1, 1);
+        f.frame.hints = TIGT_PRESENT_VIDEO_DISABLED;
+        for (unsigned i = 1; i < hz / 5; i++) {
+            CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+            EXPECT(&f, "");
+        }
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+        EXPECT(&f, "\f");
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+        EXPECT(&f, ""); /* Neither a new hold nor phantom cursor whitespace. */
+        f.frame.hints = 0;
+        text(&f, 0, 0, "R");
+        position(&f, 0, 1);
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+        EXPECT(&f, "R");
+        blank_screen(&f);
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+        EXPECT(&f, "\r \r"); /* Enabled CLS remains immediate. */
+        destroy(&f);
+
+        for (unsigned held = 0; held <= 1; held++) {
+            create_file(&f, 20, 3, hz, TIGT_ENCODING_ASCII);
+            text(&f, 0, 0, "A");
+            text(&f, 1, 0, "B");
+            position(&f, 1, 1);
+            CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+            EXPECT(&f, "A\nB");
+            blank_screen(&f);
+            position(&f, 1, 1);
+            f.frame.hints = TIGT_PRESENT_VIDEO_DISABLED;
+            if (held) {
+                CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+                EXPECT(&f, "");
+            }
+            /* Raw memory changed; decoded disabled cells are identical. */
+            f.frame.hints |= TIGT_PRESENT_VIDEO_MEMORY_CHANGED;
+            CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+            EXPECT(&f, "\f");
+            f.frame.hints = TIGT_PRESENT_VIDEO_DISABLED;
+            CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+            EXPECT(&f, "");
+            f.frame.hints = 0;
+            text(&f, 0, 0, "R");
+            position(&f, 0, 1);
+            CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+            EXPECT(&f, "R");
+            blank_screen(&f);
+            f.frame.hints = TIGT_PRESENT_VIDEO_DISABLED;
+            CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+            EXPECT(&f, ""); /* Reenable rearms, even after a memory bypass. */
+            CHECK(tigt_presenter_reset(f.presenter) == TIGT_OK);
+            for (unsigned i = 1; i < hz / 5; i++)
+                CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+            CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+            EXPECT(&f, ""); /* Reset restarts the interval and empty baseline. */
+            destroy(&f);
+        }
+    }
+
+    create_file(&f, 20, 3, 60, TIGT_ENCODING_ASCII);
+    text(&f, 0, 0, "A");
+    position(&f, 0, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "A");
+    blank_screen(&f);
+    f.frame.hints = TIGT_PRESENT_VIDEO_DISABLED;
+    for (unsigned i = 0; i < 6; i++)
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+    f.frame.refresh_hz = 50;
+    for (unsigned i = 0; i < 4; i++)
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+    EXPECT(&f, ""); /* 6/60 + 4/50 seconds = 180ms. */
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "\r \r");
+    destroy(&f);
+}
+
+static void
+video_disable_echo_and_controls(void)
+{
+    fixture f;
+    create_file(&f, 20, 3, 60, TIGT_ENCODING_ASCII);
+    text(&f, 0, 0, "A>");
+    position(&f, 0, 2);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "A>");
+    CHECK(write(fileno(f.file), "X\n", 2) == 2);
+    const uint32_t echo[] = { 'X', '\n' };
+    CHECK(tigt_presenter_local_echo(f.presenter, echo, 2) == TIGT_OK);
+    EXPECT(&f, "X\n");
+    blank_screen(&f);
+    position(&f, 2, 5);
+    f.frame.hints = TIGT_PRESENT_VIDEO_DISABLED;
+    for (unsigned i = 0; i < 11; i++)
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+    EXPECT(&f, "");
+    f.frame.hints = 0;
+    blank_screen(&f);
+    text(&f, 0, 0, "A>X");
+    text(&f, 1, 0, "R");
+    position(&f, 1, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "R"); /* Held cursor/image/echo must not consume or replay X/LF. */
+    blank_screen(&f);
+    f.frame.hints = TIGT_PRESENT_VIDEO_DISABLED;
+    for (unsigned i = 0; i < 11; i++)
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+    EXPECT(&f, ""); /* Reenable cancelled the first nearly-expired interval. */
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "\f");
+    destroy(&f);
+
+    create_file(&f, 20, 3, 60, TIGT_ENCODING_ASCII);
+    text(&f, 0, 0, "A");
+    text(&f, 1, 0, "B");
+    position(&f, 1, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "A\nB");
+    blank_screen(&f);
+    position(&f, 1, 1);
+    f.frame.hints = TIGT_PRESENT_VIDEO_MEMORY_CHANGED;
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+    EXPECT(&f, ""); /* Enabled blank at non-home cursor is not a hardware clear. */
+    f.frame.hints |= TIGT_PRESENT_VIDEO_DISABLED;
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "\f"); /* Disabled clear cancels an already-pending failure. */
+    f.frame.hints = TIGT_PRESENT_VIDEO_MEMORY_CHANGED;
+    text(&f, 0, 0, "A");
+    text(&f, 1, 0, "B");
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "A\nB");
+    text(&f, 0, 0, "X");
+    for (unsigned i = 0; i < 6; i++)
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_ERROR_UNREPRESENTABLE);
+    blank_screen(&f);
+    f.frame.hints |= TIGT_PRESENT_VIDEO_DISABLED;
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_ERROR_UNREPRESENTABLE);
+    EXPECT(&f, ""); /* Hints cannot bypass a sticky failure. */
+    destroy(&f);
+}
+
+static void
+fallback_at(fixture *f, unsigned column, unsigned row)
 {
     text(f, 0, 0, "A");
     text(f, 1, 0, "B");
@@ -466,7 +993,145 @@ fallback(fixture *f)
         CHECK(tigt_presenter_present(f->presenter, &f->frame) == TIGT_PRESENTER_PENDING);
         EXPECT(f, "");
     }
-    CHECK(tigt_presenter_present(f->presenter, &f->frame) == TIGT_PRESENTER_FULLSCREEN);
+    CHECK(tigt_presenter_present(f->presenter, &f->frame) == TIGT_PRESENTER_NEEDS_CURSOR);
+    EXPECT(f, "");
+    CHECK(tigt_presenter_observe_cursor(f->presenter, column, row) == TIGT_OK);
+    submit_output(f, TIGT_PRESENTER_FULLSCREEN);
+}
+
+static void
+fallback(fixture *f)
+{
+    struct winsize size;
+    CHECK(ioctl(f->slave, TIOCGWINSZ, &size) == 0);
+    fallback_at(f, 2, size.ws_row);
+}
+
+static void
+video_disable_fullscreen(void)
+{
+    fixture f;
+    for (unsigned hz = 50; hz <= 60; hz += 10) {
+        create_pty(&f, 4, 2, 10, 6, 1);
+        fallback(&f);
+        EXPECT(&f, "\033[6;1H\n\n\033[5;1H\033[2K\033[6;1H\033[2K"
+                   "\033[5;1H" SGR "X   \033[6;1H" SGR "B   \033[0m\033[6;2H");
+        f.frame.refresh_hz = hz;
+        blank_screen(&f);
+        position(&f, 1, 1);
+        f.frame.hints = TIGT_PRESENT_VIDEO_DISABLED;
+        for (unsigned i = 1; i < hz / 5; i++) {
+            CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+            EXPECT(&f, "");
+        }
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+        EXPECT(&f, "\033[5;1H" BLACK_SGR "    \033[6;1H" BLACK_SGR "    \033[0m\033[6;2H");
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+        EXPECT(&f, "");
+        f.frame.hints = 0;
+        text(&f, 0, 0, "R");
+        position(&f, 0, 1);
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+        EXPECT(&f, "\033[5;1H" SGR "R   \033[6;1H" SGR "    \033[0m\033[5;2H");
+        blank_screen(&f);
+        f.frame.hints = TIGT_PRESENT_VIDEO_DISABLED;
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+        EXPECT(&f, "");
+        f.frame.hints = 0;
+        text(&f, 0, 0, "Q");
+        position(&f, 0, 1);
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+        EXPECT(&f, "\033[5;1H" SGR "Q\033[0m\033[5;2H");
+        blank_screen(&f);
+        position(&f, 1, 1);
+        f.frame.hints = TIGT_PRESENT_VIDEO_DISABLED | TIGT_PRESENT_VIDEO_MEMORY_CHANGED;
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+        EXPECT(&f, "\033[5;1H" BLACK_SGR "    \033[6;1H" BLACK_SGR "    \033[0m\033[6;2H");
+        f.frame.hints = TIGT_PRESENT_VIDEO_DISABLED;
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+        EXPECT(&f, "");
+        destroy(&f);
+    }
+
+    /* Disabled non-scroll raw text is never an image to paint. An unrelated
+     * edit blanks immediately, without requesting or inventing a host origin. */
+    create_pty(&f, 4, 2, 10, 6, 0);
+    text(&f, 0, 0, "A");
+    text(&f, 1, 0, "B");
+    position(&f, 1, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "A\nB");
+    text(&f, 0, 0, "X");
+    f.frame.hints = TIGT_PRESENT_VIDEO_DISABLED | TIGT_PRESENT_VIDEO_MEMORY_CHANGED;
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "\f");
+    f.frame.hints = TIGT_PRESENT_VIDEO_DISABLED;
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "");
+    f.frame.hints = 0;
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "X\nB");
+    destroy(&f);
+}
+
+static void
+settle_recovery(fixture *f)
+{
+    for (unsigned i = 1; i <= f->frame.refresh_hz / 10; i++) {
+        submit_output(f, i == f->frame.refresh_hz / 10 ? TIGT_OK : TIGT_PRESENTER_FULLSCREEN);
+        EXPECT(f, ""); /* Switching modes must not erase or replay the region. */
+    }
+}
+
+static void
+scroll_hold_fullscreen(void)
+{
+    fixture f;
+    create_pty(&f, 4, 4, 100, 107, 1);
+    fallback_at(&f, 7, 53);
+    EXPECT(&f, "\033[54;1H\033[2K\033[55;1H\033[2K\033[56;1H\033[2K\033[57;1H\033[2K"
+               "\033[54;1H" SGR "X   \033[55;1H" SGR "B   \033[56;1H" SGR "    "
+               "\033[57;1H" SGR "    \033[0m\033[55;2H");
+    text(&f, 0, 0, "A");
+    text(&f, 2, 0, "C");
+    text(&f, 3, 0, "D");
+    position(&f, 3, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+    EXPECT(&f, "\033[54;1H" SGR "A\033[56;1H" SGR "C\033[57;1H" SGR "D\033[0m\033[57;2H");
+    position(&f, 0, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+    EXPECT(&f, "\033[54;2H");
+    text(&f, 1, 0, "C");
+    for (unsigned i = 0; i < 8; i++) {
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+        EXPECT(&f, ""); /* The cursor need not be inside a copied window. */
+    }
+    text(&f, 2, 0, "D");
+    text(&f, 3, 0, "E");
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+    EXPECT(&f, "\033[55;1H" SGR "C\033[56;1H" SGR "D\033[57;1H" SGR "E\033[0m\033[54;2H");
+    position(&f, 3, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+    EXPECT(&f, "\033[57;2H");
+    text(&f, 0, 0, "Z");
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+    EXPECT(&f, "\033[54;1H" SGR "Z\033[0m\033[57;2H"); /* Restart recovery after an edit. */
+    text(&f, 0, 0, "C");
+    text(&f, 1, 0, "D");
+    for (unsigned i = 0; i < 8; i++) {
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+        EXPECT(&f, ""); /* No torn delta paint and no cursor repositioning. */
+    }
+    text(&f, 2, 0, "E");
+    text(&f, 3, 0, "F");
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+    EXPECT(&f, "\033[54;1H" SGR "C\033[55;1H" SGR "D\033[56;1H" SGR "E\033[57;1H" SGR "F\033[0m\033[57;2H");
+    settle_recovery(&f);
+    text(&f, 3, 1, "!");
+    position(&f, 3, 2);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "!"); /* Recovery keeps the committed cursor, not region top. */
+    destroy(&f);
 }
 
 static void
@@ -492,14 +1157,12 @@ adaptive(void)
             notify(&f, 1, 0, 0, "R", NULL, 0);
         text(&f, 0, 0, "R");
         position(&f, 0, 1);
-        CHECK(tigt_presenter_present(f.presenter, &f.frame) ==
-              (reversible ? TIGT_OK : TIGT_PRESENTER_FULLSCREEN));
-        if (reversible)
-            EXPECT(&f, "\033[5;1H\033[2K\033[6;1H\033[2K\033[6;1H\n\nR");
-        else
-            EXPECT(&f, "\033[5;1H" SGR "R\033[0m\033[5;2H");
-        if (reversible)
-            notification_stats(&f, 1, 0, 0, 0); /* Recovery plans twice, consumes once. */
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+        EXPECT(&f, "\033[5;1H" SGR "R\033[0m\033[5;2H");
+        if (reversible) {
+            settle_recovery(&f);
+            notification_stats(&f, 1, 0, 0, 0);
+        }
         destroy(&f);
     }
     create_pty(&f, 4, 2, 10, 6, 0);
@@ -523,8 +1186,268 @@ adaptive(void)
     EXPECT(&f, "\033[1;1H" SGR " \033[0m\033[1;1H");
     text(&f, 0, 0, "R");
     position(&f, 0, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+    EXPECT(&f, "\033[1;1H" SGR "R\033[0m\033[1;2H");
+    settle_recovery(&f);
+    destroy(&f);
+}
+
+static void
+adaptive_origin(void)
+{
+    /* All positions use the same 107-row viewport. Only the bottom case
+     * scrolls; a later cursor delta and reversible recovery keep the origin. */
+    const unsigned rows[] = { 2, 53, 107 };
+    fixture f;
+    for (unsigned i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+        create_pty(&f, 4, 25, 100, 107, 1);
+        f.concurrent_output = 1;
+        fallback_at(&f, i == 1 ? 7 : 1, rows[i]);
+        unsigned top = i == 2 ? 83 : rows[i] + (i == 1);
+        char expected[4096];
+        int count = 0;
+        if (i == 2) {
+            count = snprintf(expected, sizeof(expected), "\033[107;1H");
+            for (unsigned y = 0; y < 24; y++)
+                expected[count++] = '\n';
+        }
+        for (unsigned y = 0; y < 25; y++)
+            count += snprintf(expected + count, sizeof(expected) - (size_t) count,
+                              "\033[%u;1H\033[2K", top + y);
+        for (unsigned y = 0; y < 25; y++)
+            count += snprintf(expected + count, sizeof(expected) - (size_t) count,
+                "\033[%u;1H" SGR "%s", top + y, y == 0 ? "X   " : y == 1 ? "B   " : "    ");
+        count += snprintf(expected + count, sizeof(expected) - (size_t) count,
+                          "\033[0m\033[%u;2H", top + 1);
+        expect_bytes(&f, expected, (size_t) count);
+        if (i == 1) {
+            struct winsize larger = { .ws_col = 100, .ws_row = 120 };
+            CHECK(ioctl(f.slave, TIOCSWINSZ, &larger) == 0);
+            submit_output(&f, TIGT_PRESENTER_FULLSCREEN);
+            expect_bytes(&f, expected, (size_t) count); /* Grow without reanchoring. */
+        }
+        position(&f, 0, 2);
+        submit_output(&f, TIGT_PRESENTER_FULLSCREEN);
+        count = snprintf(expected, sizeof(expected), "\033[%u;3H", top);
+        expect_bytes(&f, expected, (size_t) count);
+        blank_screen(&f);
+        submit_output(&f, TIGT_PRESENTER_FULLSCREEN);
+        count = snprintf(expected, sizeof(expected),
+            "\033[%u;1H" SGR " \033[%u;1H" SGR " \033[0m\033[%u;1H", top, top + 1, top);
+        expect_bytes(&f, expected, (size_t) count);
+        text(&f, 0, 0, "R");
+        position(&f, 0, 1);
+        submit_output(&f, TIGT_PRESENTER_FULLSCREEN);
+        count = snprintf(expected, sizeof(expected),
+                         "\033[%u;1H" SGR "R\033[0m\033[%u;2H", top, top);
+        expect_bytes(&f, expected, (size_t) count);
+        settle_recovery(&f);
+        destroy(&f);
+    }
+}
+
+static void
+sequential_recovery(void)
+{
+    fixture f;
+    create_pty(&f, 4, 4, 100, 107, 1);
+    fallback_at(&f, 7, 53);
+    EXPECT(&f, "\033[54;1H\033[2K\033[55;1H\033[2K\033[56;1H\033[2K\033[57;1H\033[2K"
+               "\033[54;1H" SGR "X   \033[55;1H" SGR "B   \033[56;1H" SGR "    "
+               "\033[57;1H" SGR "    \033[0m\033[55;2H");
+    text(&f, 1, 1, "C");
+    position(&f, 1, 2);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+    EXPECT(&f, "\033[55;2H" SGR "C\033[0m\033[55;3H");
+    for (unsigned i = 0; i < 10; i++)
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+    EXPECT(&f, ""); /* Idle and same-line updates cannot arm recovery. */
+    text(&f, 2, 0, "A>");
+    position(&f, 2, 2);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+    EXPECT(&f, "\033[56;1H" SGR "A>\033[0m\033[56;3H");
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+    text(&f, 0, 0, "Y");
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+    EXPECT(&f, "\033[54;1H" SGR "Y\033[0m\033[56;3H");
+    for (unsigned i = 0; i < 10; i++)
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+    EXPECT(&f, ""); /* A transient sequential suffix must not oscillate modes. */
+    position(&f, 3, 0);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+    EXPECT(&f, "\033[57;1H");
+    for (unsigned i = 0; i < 10; i++)
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+    EXPECT(&f, ""); /* A newline needs actual subsequent text. */
+    text(&f, 3, 0, "A>");
+    position(&f, 3, 1); /* The BIOS has not yet advanced past the final glyph. */
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+    EXPECT(&f, "\033[57;1H" SGR "A>\033[0m\033[57;2H");
+    for (unsigned i = 0; i < 10; i++)
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+    EXPECT(&f, "");
+    position(&f, 3, 2);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_FULLSCREEN);
+    EXPECT(&f, "\033[57;3H");
+    settle_recovery(&f);
+    /* The recovered cursor is the retained prompt, not a replay at region top.
+     * A cooked command wraps and scrolls the guest while its echo stays local. */
+    const uint32_t dir[] = { 'D', 'I', 'R', '\n' };
+    CHECK(tigt_presenter_local_echo(f.presenter, dir, 4) == TIGT_OK);
+    blank_screen(&f);
+    text(&f, 0, 0, "A>");
+    text(&f, 1, 0, "A>DI");
+    text(&f, 2, 0, "R");
+    position(&f, 3, 0);
     CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
-    EXPECT(&f, "\033[1;1H\033[2K\033[1;1H\n\n\nR"); /* Guest rows, not clipped rows. */
+    EXPECT(&f, "");
+    text(&f, 3, 0, "DIR");
+    position(&f, 3, 3);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "DIR");
+    destroy(&f);
+}
+
+static void
+local_echo(void)
+{
+    fixture f;
+    const uint32_t ver[] = { 'V', 'E', 'R', '\n' };
+    create_file(&f, 20, 4, 60, TIGT_ENCODING_ASCII);
+    text(&f, 0, 0, "A>");
+    position(&f, 0, 2);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "A>");
+    /* The host already displayed the final edited input before guest keys
+     * arrived. Confirming each letter, CR and LF must emit no second copy. */
+    CHECK(write(fileno(f.file), "VER\n", 4) == 4);
+    CHECK(tigt_presenter_local_echo(f.presenter, ver, 4) == TIGT_OK);
+    EXPECT(&f, "VER\n");
+    for (unsigned i = 0; i < 3; i++) {
+        f.cells[2 + i].codepoint = ver[i];
+        position(&f, 0, 3 + i);
+        CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+        EXPECT(&f, "");
+    }
+    position(&f, 0, 0); /* Separately observed DOS CR before LF. */
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "");
+    position(&f, 1, 0);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "");
+    text(&f, 1, 0, "DOS");
+    position(&f, 1, 3);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "DOS");
+    notification_stats(&f, 0, 0, 0, 0);
+    destroy(&f);
+
+    create_file(&f, 5, 4, 60, TIGT_ENCODING_ASCII);
+    text(&f, 0, 0, "A>");
+    position(&f, 0, 2);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "A>");
+    const uint32_t wrapped[] = { 'a', 'b', 'c', 'd', 'e', '\n' };
+    CHECK(tigt_presenter_local_echo(f.presenter, wrapped, 6) == TIGT_OK);
+    text(&f, 0, 2, "abc");
+    text(&f, 1, 0, "de");
+    position(&f, 1, 2);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "");
+    position(&f, 2, 0);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "");
+    text(&f, 2, 0, "A>");
+    position(&f, 2, 2);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "A>");
+    destroy(&f);
+
+    create_file(&f, 8, 3, 60, TIGT_ENCODING_ASCII);
+    text(&f, 0, 0, "old");
+    text(&f, 1, 0, "line");
+    text(&f, 2, 0, "A>");
+    position(&f, 2, 2);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "old\nline\nA>");
+    CHECK(tigt_presenter_local_echo(f.presenter, ver, 4) == TIGT_OK);
+    blank_screen(&f);
+    text(&f, 0, 0, "line");
+    text(&f, 1, 0, "A>VER");
+    position(&f, 2, 0);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "");
+    text(&f, 2, 0, "OK");
+    position(&f, 2, 2);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "OK");
+    destroy(&f);
+
+    create_file(&f, 8, 3, 60, TIGT_ENCODING_ASCII);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    CHECK(tigt_presenter_local_echo(f.presenter, ver, 4) == TIGT_OK);
+    text(&f, 0, 0, "VX");
+    position(&f, 0, 2);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+    EXPECT(&f, "");
+    text(&f, 0, 0, "VER");
+    position(&f, 1, 0);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, ""); /* Failed plans must not consume the matched V prefix. */
+    text(&f, 1, 0, "OK");
+    position(&f, 1, 2);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "OK");
+    destroy(&f);
+
+    create_file(&f, 8, 3, 60, TIGT_ENCODING_ASCII);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    uint32_t full[TIGT_PRESENTER_LOCAL_ECHO_MAX];
+    for (unsigned i = 0; i < TIGT_PRESENTER_LOCAL_ECHO_MAX; i++)
+        full[i] = 'x';
+    CHECK(tigt_presenter_local_echo(f.presenter, full, TIGT_PRESENTER_LOCAL_ECHO_MAX) == TIGT_OK);
+    CHECK(tigt_presenter_local_echo(f.presenter, full, 1) == TIGT_ERROR_UNREPRESENTABLE);
+    text(&f, 0, 0, "x");
+    position(&f, 0, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_PRESENTER_PENDING);
+    EXPECT(&f, ""); /* Overflow cannot silently drop an already-displayed prefix. */
+    CHECK(tigt_presenter_reset(f.presenter) == TIGT_OK);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "x");
+    destroy(&f);
+}
+
+static void
+prompt_space_echo(void)
+{
+    /* PC DOS 2.10 LINK trace: Object Modules prompt at row14,col23,
+     * response ';' at col23, then a separate CR/LF and diagnostic. The blank
+     * before input must be emitted before host echo is registered. */
+    fixture f;
+    create_file(&f, 80, 25, 60, TIGT_ENCODING_ASCII);
+    text(&f, 14, 0, "Object Modules [.OBJ]: ");
+    position(&f, 14, 23);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "\n\n\n\n\n\n\n\n\n\n\n\n\n\nObject Modules [.OBJ]: ");
+    CHECK(write(fileno(f.file), ";\n", 2) == 2);
+    const uint32_t response[] = { ';', '\n' };
+    CHECK(tigt_presenter_local_echo(f.presenter, response, 2) == TIGT_OK);
+    EXPECT(&f, ";\n");
+    text(&f, 14, 23, ";");
+    position(&f, 14, 24);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "");
+    position(&f, 14, 0);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "");
+    position(&f, 15, 0);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "");
+    text(&f, 15, 0, "No object modules specified.");
+    text(&f, 17, 0, "A>");
+    position(&f, 17, 2);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "No object modules specified.\n\nA>");
     destroy(&f);
 }
 
@@ -539,7 +1462,7 @@ validation_and_io(void)
     tigt_presenter *other = (tigt_presenter *) 1;
     CHECK(tigt_presenter_create(&adaptive_config, &other) == TIGT_ERROR_TERMINAL);
     CHECK(other == NULL);
-    f.frame.hints = 1;
+    f.frame.hints = 1u << 2;
     CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_ERROR_ARGUMENT);
     f.frame.hints = 0;
     f.frame.refresh_hz = 59;
@@ -1039,8 +1962,23 @@ main(void)
     editing();
     clears_and_attributes();
     geometry_and_scrolling();
+    sequential_scroll_suffix();
+    multiple_row_scrolls();
+    progressive_scroll_copy();
+    windowed_scroll_copy();
+    scroll_hold_deadline_and_disabled();
+    scroll_hold_local_echo();
+    overlapping_and_ambiguous_scrolls();
     confirmation_and_recovery();
+    video_disable_glass();
+    video_disable_echo_and_controls();
+    video_disable_fullscreen();
+    scroll_hold_fullscreen();
     adaptive();
+    adaptive_origin();
+    local_echo();
+    prompt_space_echo();
+    sequential_recovery();
     validation_and_io();
     encoding();
     notification_matching();
