@@ -20,8 +20,27 @@ static void on_input(const tigt_input_event *event, void *unused)
 
 int main(int argc, char **argv)
 {
-    const int once = argc == 2 && !strcmp(argv[1], "--once");
-    const tigt_config config = { TIGT_ABI_VERSION, once ? NULL : on_input, NULL };
+    int once = 0;
+    uint32_t graphics = TIGT_GRAPHICS_AUTO;
+    for (int i = 1; i < argc; ++i) {
+        if (!strcmp(argv[i], "--once")) {
+            once = 1;
+        } else if (!strcmp(argv[i], "--graphics") && i + 1 < argc) {
+            const char *mode = argv[++i];
+            if (!strcmp(mode, "auto")) graphics = TIGT_GRAPHICS_AUTO;
+            else if (!strcmp(mode, "blocks")) graphics = TIGT_GRAPHICS_BLOCKS;
+            else if (!strcmp(mode, "sixel")) graphics = TIGT_GRAPHICS_SIXEL;
+            else if (!strcmp(mode, "ascii")) graphics = TIGT_GRAPHICS_ASCII;
+            else {
+                fprintf(stderr, "unknown graphics mode: %s\n", mode);
+                return 2;
+            }
+        } else {
+            fprintf(stderr, "usage: %s [--once] [--graphics auto|blocks|sixel|ascii]\n", argv[0]);
+            return !strcmp(argv[i], "--help") ? 0 : 2;
+        }
+    }
+    const tigt_config config = { TIGT_ABI_VERSION, once ? NULL : on_input, NULL, graphics };
     int result = tigt_init(&config);
     if (result != TIGT_OK) {
         fprintf(stderr, "tigt_init failed: %d (run inside a terminal)\n", result);

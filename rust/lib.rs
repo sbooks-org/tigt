@@ -32,12 +32,38 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 pub const TEXT_MAX_COLUMNS: u16 = 320;
 pub const TEXT_MAX_ROWS: u16 = 128;
 pub const TEXT_MAX_CELLS: usize = 21440;
 pub const TEXT_UNDERLINE: u32 = 1;
 pub const TEXT_CURSOR: u32 = 2;
+
+/// Bitmap output policy, selected at initialization and resolved again on resume.
+///
+/// Explicit modes never silently fall back; unavailable modes return
+/// [`Error::Terminal`]. ASCII requires the optional `libcaca` build feature.
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GraphicsMode {
+    #[default]
+    Auto = 0,
+    Blocks = 1,
+    Sixel = 2,
+    Ascii = 3,
+}
+
+impl GraphicsMode {
+    fn from_raw(value: u32) -> Self {
+        match value {
+            0 => Self::Auto,
+            1 => Self::Blocks,
+            2 => Self::Sixel,
+            3 => Self::Ascii,
+            _ => unreachable!("C returned an invalid graphics mode"),
+        }
+    }
+}
 
 /// Terminal presentation policy; this does not decode hardware video memory.
 #[repr(u32)]
@@ -185,7 +211,12 @@ pub struct Session {
 impl Session {
     /// Opens an output-only session without creating an input worker.
     pub fn new() -> Result<Self, Error> {
-        Self::start(SessionClaim::acquire()?, None)
+        Self::new_with_graphics(GraphicsMode::Auto)
+    }
+
+    /// Opens an output-only session with an explicit bitmap output policy.
+    pub fn new_with_graphics(mode: GraphicsMode) -> Result<Self, Error> {
+        Self::start(SessionClaim::acquire()?, None, mode)
     }
 
     /// Opens a session with a serialized input-thread callback.
@@ -197,13 +228,24 @@ impl Session {
     where
         F: FnMut(InputEvent) + Send + 'static,
     {
+        Self::with_input_and_graphics(GraphicsMode::Auto, handler)
+    }
+
+    /// Opens a session with a bitmap policy and serialized input-thread callback.
+    ///
+    /// Callback panic handling is the same as [`Self::with_input`].
+    pub fn with_input_and_graphics<F>(mode: GraphicsMode, handler: F) -> Result<Self, Error>
+    where
+        F: FnMut(InputEvent) + Send + 'static,
+    {
         let claim = SessionClaim::acquire()?;
-        Self::start(claim, Some(CallbackHandle::new(Box::new(handler))))
+        Self::start(claim, Some(CallbackHandle::new(Box::new(handler))), mode)
     }
 
     fn start(
         claim: SessionClaim,
         callback: Option<CallbackHandle<InputHandler>>,
+        mode: GraphicsMode,
     ) -> Result<Self, Error> {
         let (on_input, user) = match &callback {
             Some(state) => (
@@ -216,6 +258,7 @@ impl Session {
             abi_version: ABI_VERSION,
             on_input,
             user,
+            graphics_mode: mode as u32,
         };
         // Config is copied by C; callback storage stays at its raw allocation.
         // Init failure stops callbacks before returning; claim then releases
@@ -226,6 +269,16 @@ impl Session {
             _claim: claim,
             _owner_thread: PhantomData,
         })
+    }
+
+    /// Returns the configured policy, unchanged by suspend/resume.
+    pub fn requested_graphics_mode(&self) -> GraphicsMode {
+        GraphicsMode::from_raw(unsafe { ffi::tigt_get_requested_graphics_mode() })
+    }
+
+    /// Returns the resolved bitmap output mode. Resume resolves the mode again.
+    pub fn graphics_mode(&self) -> GraphicsMode {
+        GraphicsMode::from_raw(unsafe { ffi::tigt_get_graphics_mode() })
     }
 
     /// Reports asynchronous input-handler failure without touching curses.
@@ -251,6 +304,8 @@ impl Session {
     /// Copies a 320x200 or 640x200 RGB frame. The high color byte is ignored;
     /// stride is in pixels and `pixel_width` is 1 or 2 backing pixels per
     /// logical terminal pixel. Padding after the last row is not required.
+    /// Native snapshots retain exact RGB. Sixel preserves up to 256 colours
+    /// within its percentage-channel precision; larger sets are quantized.
     pub fn present_bitmap(
         &self,
         pixels: &[u32],
@@ -267,6 +322,49 @@ impl Session {
         // Dimensions and every read row are within pixels; C copies them now.
         check_status(unsafe {
             ffi::tigt_present_bitmap(pixels.as_ptr(), width, height, stride, pixel_width)
+        })
+    }
+
+    /// Copies an indexed bitmap, resolving its palette to exact native RGB.
+    ///
+    /// Dimensions and stride follow [`Self::present_bitmap`]. `None` selects
+    /// standard IBM16 colours and requires indices in 0..16. An explicit
+    /// palette must contain 1..=256 `0x00RRGGBB` colours with zero high bytes.
+    /// Every visible source index must be in range; stride padding is ignored.
+    /// Invalid input leaves the stored frame unchanged. Native snapshots retain
+    /// resolved RGB, not palette indices.
+    pub fn present_indexed_bitmap(
+        &self,
+        indices: &[u8],
+        width: u16,
+        height: u16,
+        stride: u16,
+        pixel_width: u8,
+        palette: Option<&[u32]>,
+    ) -> Result<(), Error> {
+        self.input_status()?;
+        if !matches!(width, 320 | 640) || height != 200 || !matches!(pixel_width, 1 | 2) {
+            return Err(Error::Argument);
+        }
+        validate_frame_length(indices, width as usize, height as usize, stride as usize)?;
+        let (palette, palette_size) = match palette {
+            Some(colors) if (1..=256).contains(&colors.len()) => {
+                (colors.as_ptr(), colors.len() as u16)
+            }
+            Some(_) => return Err(Error::Argument),
+            None => (ptr::null(), 0),
+        };
+        // C checks palette RGB and all source indices before copying the frame.
+        check_status(unsafe {
+            ffi::tigt_present_indexed_bitmap(
+                indices.as_ptr(),
+                width,
+                height,
+                stride,
+                pixel_width,
+                palette,
+                palette_size,
+            )
         })
     }
 

@@ -63,7 +63,7 @@ int main(void)
     assert(frame.cells[40].codepoint == 'R');
     assert(tigt_video_present(video, vram, sizeof(vram), 1) == TIGT_ERROR_BUSY);
 
-    const tigt_config config = { TIGT_ABI_VERSION, on_input, NULL };
+    const tigt_config config = { TIGT_ABI_VERSION, on_input, NULL, TIGT_GRAPHICS_BLOCKS };
     assert(tigt_init(&config) == TIGT_OK);
     assert(tigt_video_present(video, vram, sizeof(vram), 1) == TIGT_OK);
     wait_for_stage(1);

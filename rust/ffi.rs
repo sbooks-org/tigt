@@ -27,6 +27,7 @@ pub(crate) struct Config {
     pub abi_version: u32,
     pub on_input: Option<InputCallback>,
     pub user: *mut c_void,
+    pub graphics_mode: u32,
 }
 
 #[repr(C)]
@@ -43,12 +44,23 @@ unsafe extern "C" {
     pub(crate) fn tigt_resume() -> c_int;
     pub(crate) fn tigt_suspend();
     pub(crate) fn tigt_shutdown();
+    pub(crate) fn tigt_get_graphics_mode() -> u32;
+    pub(crate) fn tigt_get_requested_graphics_mode() -> u32;
     pub(crate) fn tigt_present_bitmap(
         pixels: *const u32,
         width: u16,
         height: u16,
         stride: u16,
         pixel_width: u8,
+    ) -> c_int;
+    pub(crate) fn tigt_present_indexed_bitmap(
+        indices: *const u8,
+        width: u16,
+        height: u16,
+        stride: u16,
+        pixel_width: u8,
+        palette: *const u32,
+        palette_size: u16,
     ) -> c_int;
     pub(crate) fn tigt_present_text(
         cells: *const crate::TextCell,

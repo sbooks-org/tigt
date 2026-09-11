@@ -142,7 +142,7 @@ tigt-gfxreader --help
 
 Its [usage guide](https://github.com/sbooks-org/tigt-gfxreader) documents direct PNG analysis, terminal transcript/stdin reconstruction, and bounded PTY child capture. Supply the actual screen font for recognition. Keep the PNG, decoded text and JSON report together when handing a result to a vision model. Include ambiguity/unknown-glyph information rather than presenting nearest matches as established text.
 
-Native snapshots and terminal reconstructions intentionally need not have identical RGB: the terminal uses a finite palette and can apply the user's default foreground/background. Compare against the documented terminal palette policy, not an assumption of lossless display transport.
+Native snapshots and terminal reconstructions intentionally need not have identical RGB. Blocks/ASCII can use terminal-default foreground/background only with at most three distinct source bitmap colours, all black, white, or neutral grey with equal channels in 129..254; classification includes every source pixel before sampling. Sixel uses explicit source RGB (integer-percentage channel precision, at most 256 colours), never theme substitutions. Native dumps preserve exact submitted/resolved RGB and are independent of the selected graphics mode. Compare against the documented terminal palette policy, not an assumption of lossless display transport.
 
 Display technology can also intentionally change cursor presentation. With `TIGT_DISPLAY_MDA` / `DisplayTechnology::Mda`, initial cursor wandering is hidden in terminal output until the first visibly nonblank text submission. Equal foreground/background RAM fills and un-underlined blanks do not release suppression; an underlined blank with distinct colours does. A cursor flag alone is not first output. Every accepted text submission is observed, including frames too short-lived for the renderer to sample. Later clears and suspend/resume preserve the released latch; only a real technology change or a new session resets it.
 
@@ -154,6 +154,8 @@ Native PNG, ANSI and attributes snapshots keep the original cursor flags and att
 cargo test --all-features
 cargo test --no-default-features
 ```
+
+The `--all-features` build requires the libcaca development package (`libcaca-dev` on Debian/Ubuntu, `libcaca` on Homebrew); default builds do not depend on it.
 
 The comprehensive suite runs real C and Rust consumers in PTYs and compares their native dumps, decoded PNG pixels and structured attributes. Tests also exercise actual terminal replay, signal configuration/restoration, file/FIFO behavior, copied/padded frames, mode transitions, and error paths. The analyzer has an independent unit/CLI suite, so neither project relies on a circular runtime dependency.
 

@@ -15,7 +15,9 @@ xcode-select --install
 brew install cmake libpng pkg-config
 ```
 
-The macOS SDK supplies curses. Linux needs wide-character curses. Use a UTF-8 locale and a terminal with Unicode sextants and 256-colour support for best output. A current stable Rust toolchain is required for Rust consumers and the complete test suite.
+The macOS SDK supplies curses. Linux needs wide-character curses. For block graphics, use a UTF-8 locale and a terminal with Unicode sextants and 256-colour support. Sixel-capable terminals can display raster graphics; non-UTF-8 terminals can use optional libcaca ASCII conversion. A current stable Rust toolchain is required for Rust consumers and the complete test suite.
+
+Libcaca is **off by default** and is not needed by normal builds. To enable ASCII graphics or run `cargo test --all-features`, install `libcaca-dev` on Debian/Ubuntu or `brew install libcaca` on macOS. Enabling the feature requires pkg-config metadata named `caca`; configuration fails if it is missing.
 
 ## Clone
 
@@ -31,7 +33,7 @@ The repository and its analyzer development dependency are private. Your GitHub 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build --parallel
-./build/tigt-demo
+./build/tigt-demo --graphics auto
 ```
 
 Install to a chosen prefix, rather than modifying the system installation:
@@ -50,6 +52,8 @@ target_link_libraries(my-terminal PRIVATE tigt::tigt)
 
 Set `CMAKE_PREFIX_PATH` to the installation prefix when configuring that consumer. Curses, threads and libpng are propagated by the imported target. `-DTIGT_BUILD_EXAMPLES=OFF` disables example executables.
 
+Enable the optional ASCII backend with `-DTIGT_WITH_LIBCACA=ON`; the installed target then also discovers and propagates libcaca through pkg-config. The default OFF build has no libcaca dependency.
+
 A minimal text session:
 
 ```c
@@ -58,7 +62,7 @@ A minimal text session:
 
 int main(void)
 {
-    const tigt_config config = { TIGT_ABI_VERSION, NULL, NULL };
+    const tigt_config config = { TIGT_ABI_VERSION, NULL, NULL, TIGT_GRAPHICS_AUTO };
     const tigt_text_cell cells[] = {
         { 'H', 0xffffff, 0, 0 },
         { 'i', 0xffffff, 0, 0 }
@@ -84,6 +88,8 @@ For a sibling local consumer, use:
 tigt = { path = "../tigt" }
 ```
 
+For ASCII graphics, add `features = ["libcaca"]` to that dependency. This feature only enables the converter; use `GraphicsMode::Ascii` to require ASCII or let Auto choose based on terminal capabilities and locale.
+
 A session owns and restores terminal state:
 
 ```rust
@@ -106,12 +112,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 Existing runnable examples:
 
 ```sh
-cargo run --example demo
+cargo run --example demo -- --graphics auto
+cargo run --example demo --features libcaca -- --graphics ascii
 cargo run --example keyboard --features keyboard
 cargo run --example snapshot -- /tmp/tigt-snapshot.json
 ```
 
 The keyboard example demonstrates physical PC key press/release events, decoded independently of a display session. The snapshot example demonstrates instrumentation; see its printed process information and [the instrumentation guide](instrumentation.md).
+
+Both C and Rust demos accept `--graphics auto|blocks|sixel|ascii`; the C demo also accepts `--once`. For API selection, set `tigt_config.graphics_mode` or call `Session::new_with_graphics(GraphicsMode::Blocks)` / `Session::with_input_and_graphics(mode, handler)`. Read the requested and resolved selections through `tigt_get_requested_graphics_mode()` / `tigt_get_graphics_mode()` or the corresponding session methods. Explicit choices never silently fall back. Auto probes for sixel only with an input callback and the same input/output terminal; output-only sessions use UTF-8 blocks or libcaca ASCII directly. See [bitmap frames](reference.md#bitmap-frames) for detection, theme eligibility and explicit sixel colour policy.
 
 ## Glass-TTY output without curses
 
@@ -263,4 +272,4 @@ cargo test --no-default-features
 cargo fmt --all --check
 ```
 
-`--all-features` includes the development-only `test-fixtures` consumer used for C/Rust parity. The comprehensive tests compile C fixtures, run real PTYs, replay rendered output with tigt-gfxreader, decode PNGs and compare native C/Rust snapshot outputs. The development fixture binary is not built by ordinary library consumers.
+`--all-features` enables libcaca (requiring its development package) and includes the development-only `test-fixtures` consumer used for C/Rust parity. The comprehensive tests compile C fixtures, run real PTYs, replay rendered output with tigt-gfxreader, decode PNGs and compare native C/Rust snapshot outputs. The development fixture binary is not built by ordinary library consumers.

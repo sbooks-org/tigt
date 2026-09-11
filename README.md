@@ -10,7 +10,7 @@ The C library is the implementation. The Rust crate wraps that same library with
 
 ## Build and test
 
-Requires macOS or Linux, a C compiler, CMake, curses, libpng and pkg-config. Rust builds and tests also require a current stable Rust toolchain.
+Requires macOS or Linux, a C compiler, CMake, curses, libpng and pkg-config. Rust builds and tests also require a current stable Rust toolchain. Optional ASCII graphics use libcaca (`libcaca-dev` on Debian/Ubuntu or `brew install libcaca`); it is required for `--all-features` tests but not default builds.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
@@ -18,7 +18,7 @@ cmake --build build --parallel
 cargo test --all-features
 ```
 
-Run `./build/tigt-demo` or `cargo run --example demo` in a real terminal. Both stdin and stdout must be TTYs. Instrumentation outputs can be regular files or pipes; they do not replace the terminal used for rendering.
+Run `./build/tigt-demo --graphics auto` or `cargo run --example demo -- --graphics auto` in a real terminal. Both demos accept `auto|blocks|sixel|ascii`; explicit modes never silently fall back. Enable ASCII conversion with `-DTIGT_WITH_LIBCACA=ON` in CMake or `--features libcaca` in Cargo (off by default). Both stdin and stdout must be TTYs. Instrumentation outputs can be regular files or pipes; they do not replace the terminal used for rendering.
 
 ## Analyzer
 
@@ -30,6 +30,7 @@ Both repositories are currently private. Development tests require read access t
 
 - One active process-wide curses session; POSIX terminals.
 - Bitmap source frames: 320×200 or 640×200, with horizontal pixel duplication described explicitly. Logical snapshots can be 160×200, 320×200 or 640×200.
+- Selectable Auto, Unicode blocks, sixel raster, or libcaca ASCII bitmap output, with exact RGB or custom indexed palettes. Theme substitutions require at most three source colours, all black/white or neutral grey129..254; sixel always emits explicit RGB.
 - Text frames: resolved single-column Unicode cells and RGB colours.
 - Optional register/VRAM adapter: headless MDA/CGA standard text and basic CGA graphics decoding; PCjr exposes CGA compatibility only. C `tigt_video.h` and Rust `tigt::video` need no terminal session for tests.
 - Overscan metadata is retained but not drawn.

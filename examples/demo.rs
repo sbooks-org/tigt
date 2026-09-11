@@ -2,19 +2,40 @@
 // Copyright (C) 2026 Simplebooks Foundation
 // Copyright (C) 2026 Josh Rodd
 
-//! Run in a terminal with `cargo run --example demo`. The animation ends after
-//! five seconds; Escape or Ctrl+C also quits. Quit policy belongs here, not C.
+//! Run in a terminal with `cargo run --example demo -- --graphics auto`.
+//! The animation ends after five seconds; Escape or Ctrl+C also quits.
+//! Quit policy belongs here, not C.
 
 use std::{
     sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
-use tigt::{InputKey, InputKind, Modifiers, Session};
+use tigt::{GraphicsMode, InputKey, InputKind, Modifiers, Session};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut graphics = GraphicsMode::Auto;
+    let mut args = std::env::args().skip(1);
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--graphics" => {
+                graphics = match args.next().as_deref() {
+                    Some("auto") => GraphicsMode::Auto,
+                    Some("blocks") => GraphicsMode::Blocks,
+                    Some("sixel") => GraphicsMode::Sixel,
+                    Some("ascii") => GraphicsMode::Ascii,
+                    _ => return Err("--graphics requires auto|blocks|sixel|ascii".into()),
+                };
+            }
+            "--help" => {
+                println!("usage: demo [--graphics auto|blocks|sixel|ascii]");
+                return Ok(());
+            }
+            _ => return Err(format!("unknown argument: {argument}").into()),
+        }
+    }
     let (send, receive) = mpsc::channel();
-    let session = Session::with_input(move |event| {
+    let session = Session::with_input_and_graphics(graphics, move |event| {
         let _ = send.send(event);
     })?;
     let mut pixels = vec![0_u32; 320 * 200];

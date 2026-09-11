@@ -309,7 +309,9 @@ int main(int argc, char **argv)
 {
     assert(argc == 2);
     directory = argv[1];
-    tigt_config config = {.abi_version = TIGT_ABI_VERSION};
+    tigt_config config = {
+        .abi_version = TIGT_ABI_VERSION, .graphics_mode = TIGT_GRAPHICS_AUTO
+    };
     assert(tigt_init(&config) == TIGT_OK);
     expect_handler(SIGUSR1, SIG_DFL);
     expect_handler(SIGUSR2, SIG_DFL);

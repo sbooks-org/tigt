@@ -25,4 +25,10 @@ cmake --install build --prefix /work/installed
 cmake -S ci/consumer -B /work/consumer -DCMAKE_PREFIX_PATH=/work/installed
 cmake --build /work/consumer --parallel 2
 /work/consumer/consumer
+cmake -S . -B build-caca -DCMAKE_BUILD_TYPE=Debug -DTIGT_WITH_LIBCACA=ON
+cmake --build build-caca --parallel 2
+cmake --install build-caca --prefix /work/installed-caca
+cmake -S ci/consumer -B /work/consumer-caca -DCMAKE_PREFIX_PATH=/work/installed-caca
+cmake --build /work/consumer-caca --parallel 2
+/work/consumer-caca/consumer
 printf '\nPASS Linux analyzer, C/Rust snapshots, renderer PTYs and installed C consumer\n'

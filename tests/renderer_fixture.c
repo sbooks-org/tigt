@@ -46,19 +46,24 @@ static void check_cell(int row, int column, const uint8_t expected[6], enum poli
     assert(pair >= 0 && pair <= 255);
     assert(pair_content(pair, &fg, &bg) == OK);
     assert(!(style & (A_REVERSE | A_STANDOUT | A_INVIS)));
-    if (policy != INTENSE)
+    bool normal = false, intense = false;
+    for (unsigned bit = 0; bit < 6; bit++) {
+        normal |= expected[bit] == 7;
+        intense |= expected[bit] == 15;
+    }
+    const bool themed = policy != EXPLICIT && !(normal && intense);
+    if (!themed || !intense)
         assert(!(style & A_BOLD));
     const unsigned mask = glyph_mask(glyph[0]);
     for (unsigned bit = 0; bit < 6; bit++) {
         const bool foreground = (mask & (1u << bit)) != 0;
         const short actual = foreground ? fg : bg;
         const uint8_t color = expected[bit];
-        if (color == 0 && policy != EXPLICIT) {
+        if (color == 0 && themed) {
             assert(!foreground && actual == -1);
-        } else if ((color == 15 && policy == INTENSE) ||
-                   (color == 7 && policy == NORMAL)) {
+        } else if ((color == 15 || color == 7) && themed) {
             assert(foreground && actual == -1);
-            assert(!!(style & A_BOLD) == (policy == INTENSE));
+            assert(!!(style & A_BOLD) == (color == 15));
         } else {
             assert(actual == cga_5153_xterm[color]);
         }
@@ -109,8 +114,48 @@ static void check_transition(unsigned ink, unsigned rare, enum policy themed)
 
 static void check_policy(void)
 {
-    check_transition(15, 7, INTENSE);
-    check_transition(7, 15, NORMAL);
+    check_transition(15, 2, INTENSE);
+    check_transition(7, 2, NORMAL);
+
+    /* All three theme roles may coexist, including regular/emphasized cells.
+       The latter retain explicit contrast because bold cannot style a background. */
+    fill(0);
+    for (unsigned mask = 0; mask < 64; mask++) {
+        set_cell(0, mask, mask, 15, 7);
+        set_cell(1, mask, mask, 7, 0);
+    }
+    render_bitmap_graphics(pixels, 640, 200, 2, true);
+    check_masks(15, 7, NORMAL);
+    for (unsigned mask = 0; mask < 64; mask++) {
+        uint8_t expected[6];
+        for (unsigned bit = 0; bit < 6; bit++)
+            expected[bit] = (mask >> bit) & 1 ? 7 : 0;
+        check_cell(1, mask, expected, NORMAL);
+    }
+
+    /* Exact RGB classification precedes quantization and sees unsampled pixels.
+       A fourth distinct neutral gray also disables theming for the whole frame. */
+    const uint32_t regular[] = { 0x818181, 0xaaaaaa, 0xcccccc, 0xfefefe };
+    const uint8_t gray[6] = { 7, 7, 7, 7, 7, 7 };
+    for (unsigned index = 0; index < sizeof(regular) / sizeof(regular[0]); index++) {
+        fill(0);
+        for (unsigned y = 0; y < 3; y++)
+            for (unsigned x = 0; x < 4; x++) pixels[y * 640 + x] = regular[index];
+        render_bitmap_graphics(pixels, 640, 200, 2, true);
+        check_cell(0, 0, gray, NORMAL);
+    }
+    fill(7);
+    pixels[199 * 640 + 639] = 0xc4c5c4;
+    render_bitmap_graphics(pixels, 640, 200, 2, true);
+    check_cell(0, 0, gray, EXPLICIT);
+    pixels[199 * 640 + 639] = 0x808080;
+    render_bitmap_graphics(pixels, 640, 200, 2, true);
+    check_cell(0, 0, gray, EXPLICIT);
+    pixels[199 * 640 + 638] = 0;
+    pixels[199 * 640 + 639] = 0xffffff;
+    pixels[199 * 640 + 637] = 0xcccccc;
+    render_bitmap_graphics(pixels, 640, 200, 2, true);
+    check_cell(0, 0, gray, EXPLICIT);
 
     /* Every unordered pair (including both orientations and same-color cells)
        shares the bounded bank without losing exact C colors. */
@@ -127,14 +172,14 @@ static void check_policy(void)
             check_cell(1 + fg, bg, expected, EXPLICIT);
         }
 
-    /* Neither is also thematic for black, but not for other colors. */
+    /* One chromatic color rules out even default black for the whole frame. */
     for (unsigned fg = 0; fg < 16; fg++) {
         if (fg == 7 || fg == 15) continue;
         fill(0);
         for (unsigned mask = 0; mask < 64; mask++)
             set_cell(0, mask, mask, fg, 0);
         render_bitmap_graphics(pixels, 640, 200, 2, true);
-        check_masks(fg, 0, NEITHER);
+        check_masks(fg, 0, fg == 0 ? NEITHER : EXPLICIT);
     }
 
     /* Last scanline remains distinct; only the nonexistent 201st is repeated. */
@@ -164,6 +209,30 @@ static void check_policy(void)
         memset(expected, ink, sizeof(expected));
         check_cell(0, 0, expected, ink == 15 ? INTENSE : NORMAL);
     }
+#if defined(TIGT_HAVE_LIBCACA) && TIGT_HAVE_LIBCACA
+    /* libcaca may assign an unused regular foreground to a white space.
+       Only its visible background should determine theme eligibility/style. */
+    renderer_ascii = tigt_ascii_create();
+    assert(renderer_ascii != NULL);
+    renderer_graphics_mode = TIGT_GRAPHICS_ASCII;
+    rendered_cells_valid = false;
+    for (unsigned ink = 7; ink <= 15; ink += 8) {
+        fill(ink);
+        render_bitmap_graphics(pixels, 640, 200, 2, true);
+        cchar_t cell;
+        wchar_t glyph[CCHARW_MAX];
+        attr_t style;
+        short pair, foreground, background;
+        assert(mvwin_wch(stdscr, 0, 0, &cell) == OK);
+        assert(getcchar(&cell, glyph, &style, &pair, NULL) == OK);
+        assert(pair_content(pair, &foreground, &background) == OK);
+        assert(foreground == -1 && background == -1);
+        assert(!!(style & A_BOLD) == (ink == 15));
+    }
+    tigt_ascii_destroy(renderer_ascii);
+    renderer_ascii = NULL;
+    renderer_graphics_mode = TIGT_GRAPHICS_BLOCKS;
+#endif
 }
 
 static void synthetic_font(uint8_t font[128][8])
@@ -178,7 +247,9 @@ static void synthetic_font(uint8_t font[128][8])
 
 static int check_unsampled_output(void)
 {
-    const tigt_config config = { .abi_version = TIGT_ABI_VERSION };
+    const tigt_config config = {
+        .abi_version = TIGT_ABI_VERSION, .graphics_mode = TIGT_GRAPHICS_BLOCKS
+    };
     assert(tigt_init(&config) == TIGT_OK);
     /* Hold sampling, not submission: a transient output frame must release the
      * cursor even when the terminal only ever receives the subsequent clear. */

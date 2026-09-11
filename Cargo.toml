@@ -4,7 +4,7 @@
 
 [package]
 name = "tigt"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "tty-in-glass-tty: terminal rendering and transport-neutral input"
 license = "MIT-0"
@@ -22,6 +22,8 @@ path = "rust/lib.rs"
 [features]
 default = []
 keyboard = ["dep:pc-xt-keyboard"]
+# Optional libcaca bitmap-to-ASCII converter; requires pkg-config package caca.
+libcaca = []
 # Opt-in development consumer used by cross-language integration tests.
 test-fixtures = []
 

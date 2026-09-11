@@ -38,7 +38,9 @@ int main(int argc, char **argv)
             return 2;
         }
     }
-    tigt_config config = {.abi_version = TIGT_ABI_VERSION};
+    tigt_config config = {
+        .abi_version = TIGT_ABI_VERSION, .graphics_mode = TIGT_GRAPHICS_AUTO
+    };
     int result = tigt_init(&config);
     if (result != TIGT_OK) {
         fprintf(stderr, "tigt_init: %d\n", result);

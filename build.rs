@@ -22,11 +22,18 @@ fn main() {
         .cargo_metadata(false)
         .probe("libpng")
         .expect("tigt snapshots require the libpng development package and pkg-config metadata");
+    let caca = env::var_os("CARGO_FEATURE_LIBCACA").map(|_| {
+        pkg_config::Config::new()
+            .cargo_metadata(false)
+            .probe("caca")
+            .expect("the libcaca feature requires the libcaca development package and pkg-config metadata")
+    });
     let mut build = cc::Build::new();
     build
         .files([
             "src/tigt.c",
             "src/input.c",
+            "src/graphics.c",
             "src/snapshot.c",
             "src/video.c",
             "src/presenter.c",
@@ -41,6 +48,15 @@ fn main() {
     }
     for (name, value) in &png.defines {
         build.define(name, value.as_deref());
+    }
+    if let Some(library) = &caca {
+        build.define("TIGT_HAVE_LIBCACA", "1");
+        for path in &library.include_paths {
+            build.include(path);
+        }
+        for (name, value) in &library.defines {
+            build.define(name, value.as_deref());
+        }
     }
     if let Some((_, library)) = &curses {
         for path in &library.include_paths {
@@ -59,6 +75,11 @@ fn main() {
     pkg_config::Config::new()
         .probe("libpng")
         .expect("the selected libpng pkg-config package disappeared");
+    if caca.is_some() {
+        pkg_config::Config::new()
+            .probe("caca")
+            .expect("the selected libcaca pkg-config package disappeared");
+    }
     if let Some((name, _)) = curses {
         pkg_config::Config::new()
             .probe(name)
@@ -79,6 +100,9 @@ fn main() {
     for path in [
         "src/tigt.c",
         "src/input.c",
+        "src/input.h",
+        "src/graphics.c",
+        "src/graphics.h",
         "src/snapshot.c",
         "src/snapshot.h",
         "src/video.c",

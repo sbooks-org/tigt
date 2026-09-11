@@ -2,7 +2,7 @@
 # Copyright (C) 2026 Simplebooks Foundation
 # Copyright (C) 2026 Josh Rodd
 cmake_minimum_required(VERSION 3.20)
-project(tigt VERSION 0.2.0 DESCRIPTION "tty-in-glass-tty" LANGUAGES C)
+project(tigt VERSION 0.3.0 DESCRIPTION "tty-in-glass-tty" LANGUAGES C)
 
 if(NOT UNIX)
     message(FATAL_ERROR "tigt currently requires POSIX terminals and curses")
@@ -10,11 +10,16 @@ endif()
 find_package(Curses REQUIRED)
 find_package(Threads REQUIRED)
 find_package(PNG REQUIRED)
+option(TIGT_WITH_LIBCACA "Enable libcaca bitmap-to-ASCII conversion" OFF)
+if(TIGT_WITH_LIBCACA)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(CACA REQUIRED IMPORTED_TARGET caca)
+endif()
 add_library(tigt::curses INTERFACE IMPORTED)
 set_target_properties(tigt::curses PROPERTIES
     INTERFACE_LINK_LIBRARIES "${CURSES_LIBRARIES}"
     INTERFACE_INCLUDE_DIRECTORIES "${CURSES_INCLUDE_DIRS}")
-add_library(tigt src/tigt.c src/input.c src/snapshot.c src/video.c src/presenter.c)
+add_library(tigt src/tigt.c src/input.c src/graphics.c src/snapshot.c src/video.c src/presenter.c)
 add_library(tigt::tigt ALIAS tigt)
 target_compile_features(tigt PUBLIC c_std_11)
 target_compile_definitions(tigt PRIVATE _XOPEN_SOURCE_EXTENDED=1)
@@ -22,7 +27,11 @@ target_include_directories(tigt PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
 target_link_libraries(tigt PUBLIC tigt::curses Threads::Threads PNG::PNG)
-set_target_properties(tigt PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION 2 POSITION_INDEPENDENT_CODE ON)
+if(TIGT_WITH_LIBCACA)
+    target_compile_definitions(tigt PRIVATE TIGT_HAVE_LIBCACA=1)
+    target_link_libraries(tigt PUBLIC PkgConfig::CACA)
+endif()
+set_target_properties(tigt PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION 3 POSITION_INDEPENDENT_CODE ON)
 
 option(TIGT_BUILD_EXAMPLES "Build standalone C consumer examples" ${PROJECT_IS_TOP_LEVEL})
 if(TIGT_BUILD_EXAMPLES)

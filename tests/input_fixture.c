@@ -147,6 +147,23 @@ static void check_ss3(void)
     }
 }
 
+static void check_terminal_reports(void)
+{
+    const char stream[] = "a\033[?62;4;22c\033[?2;0;640;400S\033[6;16;8tb";
+    struct events events = {0};
+    tigt_input *input = tigt_input_create(collect, &events);
+    assert(input != NULL);
+    for (size_t index = 0; index < sizeof(stream) - 1; index++)
+        tigt_input_feed(input, (const uint8_t *) stream + index, 1);
+    tigt_input_flush(input);
+    assert(events.count == 4);
+    check(&events, 0, TIGT_KEY_CHAR, 'a', 0, TIGT_PRESS);
+    check(&events, 1, TIGT_KEY_CHAR, 'a', 0, TIGT_RELEASE);
+    check(&events, 2, TIGT_KEY_CHAR, 'b', 0, TIGT_PRESS);
+    check(&events, 3, TIGT_KEY_CHAR, 'b', 0, TIGT_RELEASE);
+    tigt_input_destroy(input);
+}
+
 int main(void)
 {
     assert(signal(SIGINT, signal_seen) != SIG_ERR);
@@ -155,6 +172,7 @@ int main(void)
     check_incremental();
     check_escape_and_modifier();
     check_ss3();
+    check_terminal_reports();
     assert(signals_seen == 0);
     puts("PASS semantic controls, incremental CSI/Kitty events, Escape timeout, modifier release");
     return 0;

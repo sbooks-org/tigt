@@ -9,7 +9,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#define TIGT_ABI_VERSION 2u
+#define TIGT_ABI_VERSION 3u
 #define TIGT_OK 0
 #define TIGT_ERROR_ARGUMENT -1
 #define TIGT_ERROR_TERMINAL -2
@@ -92,10 +92,19 @@ void tigt_input_feed(tigt_input *input, const uint8_t *bytes, size_t length);
 void tigt_input_flush(tigt_input *input);
 void tigt_input_destroy(tigt_input *input);
 
+/* Bitmap output policy. Explicit modes never silently fall back. */
+typedef enum {
+    TIGT_GRAPHICS_AUTO = 0,
+    TIGT_GRAPHICS_BLOCKS = 1,
+    TIGT_GRAPHICS_SIXEL = 2,
+    TIGT_GRAPHICS_ASCII = 3,
+} tigt_graphics_mode;
+
 typedef struct tigt_config {
     uint32_t abi_version;
     tigt_input_callback on_input; /* NULL makes this an output-only session. */
     void *user;
+    uint32_t graphics_mode; /* tigt_graphics_mode; AUTO selects available output. */
 } tigt_config;
 /* One process-wide curses session. Lifecycle calls must be serialized on the
  * owning thread. Init/resume return errors rather than exiting the application.
@@ -107,6 +116,12 @@ int tigt_init(const tigt_config *config);
 int tigt_resume(void);
 void tigt_suspend(void);
 void tigt_shutdown(void);
+/* Resolved mode: AUTO before resolution and after shutdown. Resume resolves
+ * again. The requested mode remains unchanged for the lifetime of a session.
+ * Explicit unavailable modes return TIGT_ERROR_TERMINAL at init/resume. */
+uint32_t tigt_get_graphics_mode(void);
+/* AUTO when no session exists. There is no runtime mode setter. */
+uint32_t tigt_get_requested_graphics_mode(void);
 typedef struct {
     uint32_t codepoint;
     uint32_t foreground;
@@ -139,15 +154,29 @@ typedef struct {
  *
  * RGB values use 0x00RRGGBB. Text and overscan require a zero high byte;
  * bitmap pixels ignore the high byte for compatibility with native buffers.
- * Rendered colours are quantized to the existing 16-colour PC display palette,
- * then approximated by the terminal's available colours.
+ * Native bitmap RGB is retained exactly. Sixel preserves up to 256 colours
+ * within its percentage-channel precision and quantizes larger colour sets;
+ * cell backends approximate colours using terminal capabilities.
  *
  * Bitmap stride is in pixels. Width320/640, height200, pixel_width1/2
- * (backing pixels per terminal logical pixel). The existing bitmap policy
- * uses terminal defaults for black/white when its frame palette permits.
+ * (backing pixels per terminal logical pixel). Blocks/ASCII may use terminal
+ * defaults only with at most three distinct source RGB values, all black,
+ * white, or neutral grey with R=G=B in 129..254. All source pixels participate,
+ * including horizontally skipped pixels. Grey maps to regular foreground and
+ * white to intense foreground. Sixel always uses explicit RGB, never theme
+ * foreground/bold colours.
  * 160x200 can be expanded horizontally by the caller, as for PCjr video. */
 int tigt_present_bitmap(const uint32_t *pixels, uint16_t width, uint16_t height,
                         uint16_t stride, uint8_t pixel_width);
+/* Indexed counterpart, with the same dimensions/stride/pixel-width rules.
+ * NULL palette with palette_size 0 selects the standard IBM16 palette and
+ * requires indices 0..15. Otherwise supply 1..256 exact 0x00RRGGBB entries;
+ * high bytes must be zero. Every visible source index must be in range.
+ * Indices and palette are copied/resolved before return; invalid input leaves
+ * stored state unchanged. Native snapshots preserve resolved RGB exactly. */
+int tigt_present_indexed_bitmap(const uint8_t *indices, uint16_t width, uint16_t height,
+                                uint16_t stride, uint8_t pixel_width,
+                                const uint32_t *palette, uint16_t palette_size);
 /* Text stride is in cells and must be >= columns. Columns1..320, rows1..128,
  * with at most 21440 visible cells; stride padding is ignored. Each codepoint
  * must be a Unicode scalar occupying exactly one terminal column according

@@ -8,10 +8,14 @@
 
 #include "tigt.h"
 #include "snapshot.h"
+#include "graphics.h"
+#include "input.h"
+#include "palette.h"
 
 #include <curses.h>
 #include <errno.h>
 #include <locale.h>
+#include <langinfo.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -20,6 +24,8 @@
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -61,12 +67,19 @@ static bool terminal_keyboard_enabled;
 static uint64_t renderer_frame_serial;
 static uint64_t rendered_frame_serial;
 static bool terminal_default_colors_available;
+static uint32_t renderer_graphics_mode;
+static tigt_ascii *renderer_ascii;
+static bool rendered_sixel;
+static struct winsize rendered_window;
+static struct {
+    bool pending, sixel;
+    uint16_t pixel_width, pixel_height, cell_width, cell_height;
+    uint16_t max_width, max_height;
+} terminal_graphics;
 typedef enum {
     TERMINAL_PALETTE_INVALID,
     TERMINAL_PALETTE_TEXT,
-    TERMINAL_PALETTE_BITMAP_NEITHER,
-    TERMINAL_PALETTE_BITMAP_INTENSE,
-    TERMINAL_PALETTE_BITMAP_NORMAL,
+    TERMINAL_PALETTE_BITMAP_THEMED,
     TERMINAL_PALETTE_BITMAP_EXPLICIT
 } terminal_palette_t;
 
@@ -201,11 +214,14 @@ text_cell_attributes(uint8_t foreground, uint8_t background)
 static chtype
 bitmap_cell_attributes(uint8_t foreground, uint8_t background, terminal_palette_t palette)
 {
-    const bool themed_foreground = terminal_default_colors_available &&
-                                  ((palette == TERMINAL_PALETTE_BITMAP_INTENSE && foreground == 15) ||
-                                   (palette == TERMINAL_PALETTE_BITMAP_NORMAL && foreground == 7));
-    const bool themed_background = terminal_default_colors_available && background == 0 &&
-                                  palette != TERMINAL_PALETTE_BITMAP_EXPLICIT;
+    /* A text cell cannot emphasize its background independently. Preserve
+     * contrast with explicit colors when 7 and 15 share the same cell. */
+    const bool themed = terminal_default_colors_available &&
+                        palette == TERMINAL_PALETTE_BITMAP_THEMED &&
+                        !((foreground == 7 && background == 15) ||
+                          (foreground == 15 && background == 7));
+    const bool themed_foreground = themed && (foreground == 7 || foreground == 15);
+    const bool themed_background = themed && background == 0;
     const chtype intensity = themed_foreground && foreground == 15 ? A_BOLD : A_NORMAL;
 
     if (has_colors()) {
@@ -322,6 +338,157 @@ set_cursor(bool visible)
         fflush(stdout);
     return changed;
 }
+
+/* Raw images and curses share one writer. Invalidate curses' physical-screen
+ * model whenever an image is removed; erase() alone cannot remove a sixel. */
+static void
+leave_sixel_graphics(void)
+{
+    if (!rendered_sixel)
+        return;
+    fputs("\033[?80;1070r\033[0m\033[2J\033[H", stdout);
+    rendered_sixel = false;
+    rendered_cells_valid = false;
+    terminal_cursor_position_valid = false;
+    clearok(stdscr, true);
+}
+
+static void
+render_sixel_graphics(const uint32_t *pixels, uint16_t width, uint16_t height, uint8_t pixel_width)
+{
+    uint16_t output_width = width / pixel_width, output_height = height;
+    uint16_t available_width = rendered_window.ws_xpixel;
+    uint16_t available_height = rendered_window.ws_ypixel;
+    if (available_width == 0 && terminal_graphics.cell_width != 0)
+        available_width = (uint16_t) ((uint32_t) rendered_window.ws_col *
+                                     terminal_graphics.cell_width > 4096 ? 4096 :
+                                     rendered_window.ws_col * terminal_graphics.cell_width);
+    if (available_height == 0 && terminal_graphics.cell_height != 0)
+        available_height = (uint16_t) ((uint32_t) rendered_window.ws_row *
+                                      terminal_graphics.cell_height > 4096 ? 4096 :
+                                      rendered_window.ws_row * terminal_graphics.cell_height);
+    if (available_width == 0) available_width = terminal_graphics.pixel_width;
+    if (available_height == 0) available_height = terminal_graphics.pixel_height;
+    if (terminal_graphics.max_width != 0 &&
+        (available_width == 0 || terminal_graphics.max_width < available_width))
+        available_width = terminal_graphics.max_width;
+    if (terminal_graphics.max_height != 0 &&
+        (available_height == 0 || terminal_graphics.max_height < available_height))
+        available_height = terminal_graphics.max_height;
+    if (available_width != 0 && output_width > available_width) {
+        output_height = (uint16_t) ((uint32_t) output_height * available_width / output_width);
+        output_width = available_width;
+    }
+    if (available_height != 0 && output_height > available_height) {
+        output_width = (uint16_t) ((uint32_t) output_width * available_height / output_height);
+        output_height = available_height;
+    }
+    if (output_width == 0) output_width = 1;
+    if (output_height == 0) output_height = 1;
+    if (!rendered_sixel || !rendered_cells_valid ||
+        rendered_columns != output_width || rendered_rows != output_height) {
+        erase();
+        clearok(stdscr, true);
+        refresh();
+    }
+    set_cursor(false);
+    if (!rendered_sixel)
+        fputs("\033[?80;1070s\033[?80;1070h", stdout);
+    rendered_sixel = true;
+    fputs("\0337\033[H", stdout);
+    const int result = tigt_sixel_write(stdout, pixels, width, height,
+                                       pixel_width, output_width, output_height);
+    fputs("\0338", stdout);
+    const int flushed = fflush(stdout);
+    rendered_columns = output_width;
+    rendered_rows = output_height;
+    rendered_cells_valid = result == TIGT_OK && flushed == 0;
+    terminal_cursor_position_valid = false;
+}
+
+static void
+render_ascii_graphics(const uint32_t *pixels, uint16_t width, uint16_t height, uint8_t pixel_width,
+                      terminal_palette_t palette)
+{
+    uint16_t columns = COLS > TERMINAL_MAX_COLUMNS ? TERMINAL_MAX_COLUMNS : COLS;
+    uint16_t rows = LINES > TERMINAL_MAX_ROWS ? TERMINAL_MAX_ROWS : LINES;
+    if (columns == 0 || rows == 0)
+        return;
+    if ((uint32_t) columns * rows > TERMINAL_MAX_CELLS)
+        rows = TERMINAL_MAX_CELLS / columns;
+    const tigt_ascii_cell *cells;
+    if (tigt_ascii_render(renderer_ascii, pixels, width, height, pixel_width,
+                          columns, rows, palette == TERMINAL_PALETTE_BITMAP_THEMED, &cells) != TIGT_OK)
+        return;
+    bool changed = false;
+    if (!rendered_cells_valid || rendered_columns != columns || rendered_rows != rows) {
+        erase();
+        rendered_cells_valid = false;
+        rendered_columns = columns;
+        rendered_rows = rows;
+        changed = true;
+    }
+    for (uint16_t row = 0; row < rows; row++) {
+        for (uint16_t column = 0; column < columns; column++) {
+            const size_t index = (size_t) row * columns + column;
+            uint8_t foreground = cells[index].foreground, background = cells[index].background;
+            uint8_t glyph = cells[index].glyph;
+            if (foreground == background) glyph = ' ';
+            /* A space has no ink. Do not let libcaca's unused foreground
+             * falsely turn a solid themed background into a 7/15 mixed cell. */
+            if (glyph == ' ') foreground = 0;
+            const bool reverse = (foreground == 0 && background != 0) ||
+                                 (background != 0 &&
+                                  (palette == TERMINAL_PALETTE_BITMAP_THEMED ?
+                                   foreground == 7 && background == 15 : foreground > background));
+            if (reverse) {
+                const uint8_t swap = foreground;
+                foreground = background;
+                background = swap;
+            }
+            const terminal_cell_t cell = {
+                .glyph = { (char) glyph, '\0' },
+                .style = bitmap_cell_attributes(foreground, background, palette) |
+                         (reverse ? A_REVERSE : A_NORMAL)
+            };
+            if (!rendered_cells_valid || cell.style != rendered_cells[index].style ||
+                strcmp(cell.glyph, rendered_cells[index].glyph) != 0) {
+                attrset(cell.style);
+                mvaddstr(row, column, cell.glyph);
+                attrset(A_NORMAL);
+                rendered_cells[index] = cell;
+                changed = true;
+            }
+        }
+    }
+    terminal_cursor_position_valid = false;
+    changed |= set_cursor(false);
+    if (changed) refresh();
+    rendered_cells_valid = true;
+}
+/* Eligibility is a property of the full native image, not of its quantized or
+ * sampled projection. Multiple regular gray values still count separately. */
+static bool
+bitmap_is_themed(const uint32_t *pixels, size_t count)
+{
+    uint32_t unique[3];
+    size_t used = 0;
+    for (size_t index = 0; index < count; index++) {
+        const uint32_t rgb = pixels[index] & 0xffffff;
+        const uint8_t level = rgb & 0xff;
+        if (rgb != 0 && rgb != 0xffffff &&
+            (level <= 128 || rgb != (uint32_t) level * 0x010101))
+            return false;
+        size_t color = 0;
+        while (color < used && unique[color] != rgb) color++;
+        if (color == used) {
+            if (used == 3) return false;
+            unique[used++] = rgb;
+        }
+    }
+    return true;
+}
+
 static void
 render_bitmap_graphics(const uint32_t *pixels, uint16_t width, uint16_t height,
                        uint8_t pixel_width, bool display_enabled)
@@ -338,21 +505,28 @@ render_bitmap_graphics(const uint32_t *pixels, uint16_t width, uint16_t height,
     if (columns == 0 || rows == 0 || columns * rows > TERMINAL_MAX_CELLS)
         return;
 
-    /* Scan every visible pixel, including pixels skipped by horizontal sampling
-       or sextant color reduction. Padding below the last scanline is excluded. */
+    static const uint32_t black[640 * 200];
+    if (!display_enabled) pixels = black;
+    const bool themed = bitmap_is_themed(pixels, (size_t) width * height);
+    const terminal_palette_t palette = themed ? TERMINAL_PALETTE_BITMAP_THEMED :
+                                               TERMINAL_PALETTE_BITMAP_EXPLICIT;
+    if (renderer_graphics_mode == TIGT_GRAPHICS_SIXEL) {
+        render_sixel_graphics(pixels, width, height, pixel_width);
+        return;
+    }
+    leave_sixel_graphics();
+    select_terminal_palette(palette);
+    if (renderer_graphics_mode == TIGT_GRAPHICS_ASCII) {
+        render_ascii_graphics(pixels, width, height, pixel_width, palette);
+        return;
+    }
     for (size_t pixel = 0; pixel < (size_t) width * height; pixel++) {
-        const uint8_t color = display_enabled ? cga_rendered_color_index(pixels[pixel]) : 0;
-
+        const uint32_t rgb = pixels[pixel] & 0xffffff;
+        const uint8_t color = themed ? (rgb == 0 ? 0 : rgb == 0xffffff ? 15 : 7) :
+                                      cga_rendered_color_index(rgb);
         renderer_bitmap_indices[pixel] = color;
         presence |= 1u << color;
     }
-    const bool has_normal = (presence & (1u << 7)) != 0;
-    const bool has_intense = (presence & (1u << 15)) != 0;
-    const terminal_palette_t palette = has_normal && has_intense ? TERMINAL_PALETTE_BITMAP_EXPLICIT :
-                                       has_intense ? TERMINAL_PALETTE_BITMAP_INTENSE :
-                                       has_normal ? TERMINAL_PALETTE_BITMAP_NORMAL :
-                                       TERMINAL_PALETTE_BITMAP_NEITHER;
-    select_terminal_palette(palette);
     if (!rendered_cells_valid || rendered_columns != columns || rendered_rows != rows) {
         erase();
         rendered_cells_valid = false;
@@ -412,8 +586,8 @@ render_bitmap_graphics(const uint32_t *pixels, uint16_t width, uint16_t height,
 
             foreground = colors[foreground];
             background = colors[background];
-            const uint8_t preferred_foreground = palette == TERMINAL_PALETTE_BITMAP_INTENSE ? 15 :
-                                                 palette == TERMINAL_PALETTE_BITMAP_NORMAL ? 7 : 0;
+            const uint8_t preferred_foreground = palette == TERMINAL_PALETTE_BITMAP_THEMED ?
+                                                 ((presence & (1u << 15)) != 0 ? 15 : 7) : 0;
             if (foreground == background) {
                 /* Black uses the background role; all other solid colors use ink. */
                 mask = foreground == 0 ? 0 : 0x3f;
@@ -453,6 +627,7 @@ render_text(const tigt_text_cell *cells, uint16_t columns, uint16_t rows, bool c
 {
     bool changed = false;
     uint16_t cursor_position = UINT16_MAX;
+    leave_sixel_graphics();
 
     select_terminal_palette(TERMINAL_PALETTE_TEXT);
     if (!rendered_cells_valid || rendered_columns != columns || rendered_rows != rows) {
@@ -548,6 +723,15 @@ render_frame(void)
 {
     /* Only the renderer thread owns this copy; keep it off small pthread stacks. */
     static tigt_native_frame snapshot;
+    struct winsize window = { 0 };
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &window) == 0 && window.ws_col != 0 && window.ws_row != 0 &&
+        (window.ws_col != rendered_window.ws_col || window.ws_row != rendered_window.ws_row ||
+         window.ws_xpixel != rendered_window.ws_xpixel || window.ws_ypixel != rendered_window.ws_ypixel)) {
+        if (window.ws_col != rendered_window.ws_col || window.ws_row != rendered_window.ws_row)
+            resizeterm(window.ws_row, window.ws_col);
+        rendered_window = window;
+        rendered_cells_valid = false;
+    }
     pthread_mutex_lock(&renderer_mutex);
     if (!renderer_has_frame ||
         (rendered_cells_valid && renderer_frame_serial == rendered_frame_serial)) {
@@ -649,18 +833,125 @@ stop_session(void)
         terminal_keyboard_enabled = false;
     }
     if (renderer_screen != NULL) {
+        leave_sixel_graphics();
         fputs("\033[0 q", stdout);
         curs_set(1);
         endwin();
         delscreen(renderer_screen);
         renderer_screen = NULL;
     }
+    tigt_ascii_destroy(renderer_ascii);
+    renderer_ascii = NULL;
     fflush(stdout);
     if (terminal_modes_saved) {
         restore_terminal_mode(STDOUT_FILENO, &saved_output_termios);
         restore_terminal_mode(STDIN_FILENO, &saved_input_termios);
         terminal_modes_saved = false;
     }
+}
+
+static void
+terminal_report(const char *parameters, uint8_t final, void *user)
+{
+    (void) user;
+    const bool private = *parameters == '?';
+    if (private) parameters++;
+    unsigned values[32];
+    size_t count = 0;
+    while (*parameters != '\0') {
+        if (count == 32 || *parameters < '0' || *parameters > '9') return;
+        unsigned value = 0;
+        do {
+            value = value * 10 + (unsigned) (*parameters++ - '0');
+            if (value > 65535) return;
+        } while (*parameters >= '0' && *parameters <= '9');
+        values[count++] = value;
+        if (*parameters == '\0') break;
+        if (*parameters++ != ';' || *parameters == '\0') return;
+    }
+    pthread_mutex_lock(&renderer_mutex);
+    if (terminal_graphics.pending) {
+        if (private && final == 'c' && count >= 2 &&
+            (values[0] == 12 || (values[0] >= 62 && values[0] <= 65))) {
+            for (size_t index = 1; index < count; index++)
+                if (values[index] == 4) terminal_graphics.sixel = true;
+        } else if (private && final == 'S' && count == 4 &&
+                   values[0] == 2 && values[1] == 0 && values[2] != 0 && values[3] != 0) {
+            terminal_graphics.sixel = true;
+            terminal_graphics.max_width = values[2];
+            terminal_graphics.max_height = values[3];
+        } else if (!private && final == 't' && count == 3 && values[1] != 0 && values[2] != 0) {
+            if (values[0] == 4) {
+                terminal_graphics.pixel_height = values[1];
+                terminal_graphics.pixel_width = values[2];
+            } else if (values[0] == 6) {
+                terminal_graphics.cell_height = values[1];
+                terminal_graphics.cell_width = values[2];
+            }
+        }
+    }
+    pthread_mutex_unlock(&renderer_mutex);
+}
+
+static int
+resolve_graphics_mode(void)
+{
+    uint32_t selected = renderer_config.graphics_mode;
+    const char *codeset = nl_langinfo(CODESET);
+    const bool utf8 = strcmp(codeset, "UTF-8") == 0 || strcmp(codeset, "UTF8") == 0;
+    struct stat input, output;
+    const bool probe = selected == TIGT_GRAPHICS_AUTO && renderer_input != NULL &&
+                       fstat(STDIN_FILENO, &input) == 0 && fstat(STDOUT_FILENO, &output) == 0 &&
+                       input.st_rdev == output.st_rdev && input.st_ino == output.st_ino;
+    if (probe) {
+        pthread_mutex_lock(&renderer_mutex);
+        terminal_graphics.pending = true;
+        pthread_mutex_unlock(&renderer_mutex);
+        if (fputs("\033[16t\033[14t\033[?2;1;0S\033[c", stdout) == EOF || fflush(stdout) == EOF)
+            return TIGT_ERROR_SYSTEM;
+        struct timespec start, now;
+        if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) return TIGT_ERROR_SYSTEM;
+        const struct timespec interval = { .tv_nsec = 5000000 };
+        do {
+            nanosleep(&interval, NULL);
+            if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return TIGT_ERROR_SYSTEM;
+        } while ((now.tv_sec - start.tv_sec) * 1000000000LL + now.tv_nsec - start.tv_nsec < 150000000);
+    }
+    pthread_mutex_lock(&renderer_mutex);
+    terminal_graphics.pending = false;
+    if (selected == TIGT_GRAPHICS_AUTO)
+        selected = terminal_graphics.sixel ? TIGT_GRAPHICS_SIXEL :
+                   utf8 ? TIGT_GRAPHICS_BLOCKS : TIGT_GRAPHICS_ASCII;
+    pthread_mutex_unlock(&renderer_mutex);
+    if (selected == TIGT_GRAPHICS_BLOCKS && !utf8)
+        return TIGT_ERROR_TERMINAL;
+    if (selected == TIGT_GRAPHICS_ASCII) {
+        if (!tigt_ascii_available()) return TIGT_ERROR_TERMINAL;
+        renderer_ascii = tigt_ascii_create();
+        if (renderer_ascii == NULL) return TIGT_ERROR_SYSTEM;
+    }
+    pthread_mutex_lock(&renderer_mutex);
+    renderer_graphics_mode = selected;
+    pthread_mutex_unlock(&renderer_mutex);
+    return TIGT_OK;
+}
+
+uint32_t
+tigt_get_graphics_mode(void)
+{
+    pthread_mutex_lock(&renderer_mutex);
+    const uint32_t mode = renderer_graphics_mode;
+    pthread_mutex_unlock(&renderer_mutex);
+    return mode;
+}
+
+uint32_t
+tigt_get_requested_graphics_mode(void)
+{
+    pthread_mutex_lock(&renderer_mutex);
+    const uint32_t mode = renderer_config.graphics_mode;
+    pthread_mutex_unlock(&renderer_mutex);
+    return mode;
 }
 
 int
@@ -696,6 +987,9 @@ tigt_resume(void)
         sigaction(application_signals[index], &saved_signals[index], NULL);
     if (renderer_screen == NULL)
         goto failure;
+    memset(&terminal_graphics, 0, sizeof(terminal_graphics));
+    memset(&rendered_window, 0, sizeof(rendered_window));
+    ioctl(STDOUT_FILENO, TIOCGWINSZ, &rendered_window);
     rendered_cells_valid = false;
     terminal_palette = TERMINAL_PALETTE_INVALID;
     memset(cga_pair_initialized, 0, sizeof(cga_pair_initialized));
@@ -711,6 +1005,7 @@ tigt_resume(void)
             result = TIGT_ERROR_SYSTEM;
             goto failure;
         }
+        tigt_input_set_terminal_report_callback(renderer_input, terminal_report, NULL);
         if (raw() == ERR || noecho() == ERR)
             goto failure;
         terminal_keyboard_enabled = true;
@@ -720,6 +1015,18 @@ tigt_resume(void)
     curs_set(0);
     if (refresh() == ERR)
         goto failure;
+    if (renderer_input != NULL) {
+        atomic_store_explicit(&input_running, true, memory_order_relaxed);
+        thread_error = pthread_create(&input_thread, NULL, input_main, NULL);
+        if (thread_error != 0) {
+            errno = thread_error;
+            result = TIGT_ERROR_SYSTEM;
+            goto failure;
+        }
+        input_thread_created = true;
+    }
+    result = resolve_graphics_mode();
+    if (result != TIGT_OK) goto failure;
     atomic_store_explicit(&renderer_running, true, memory_order_relaxed);
     thread_error = pthread_create(&renderer_thread, NULL, renderer_main, NULL);
     if (thread_error != 0) {
@@ -732,16 +1039,6 @@ tigt_resume(void)
     renderer_active = true;
     pthread_mutex_unlock(&renderer_mutex);
     tigt_snapshot_session_start();
-    if (renderer_input != NULL) {
-        atomic_store_explicit(&input_running, true, memory_order_relaxed);
-        thread_error = pthread_create(&input_thread, NULL, input_main, NULL);
-        if (thread_error != 0) {
-            errno = thread_error;
-            result = TIGT_ERROR_SYSTEM;
-            goto failure;
-        }
-        input_thread_created = true;
-    }
     return TIGT_OK;
 
 failure:
@@ -759,7 +1056,8 @@ tigt_suspend(void)
 int
 tigt_init(const tigt_config *config)
 {
-    if (config == NULL || config->abi_version != TIGT_ABI_VERSION)
+    if (config == NULL || config->abi_version != TIGT_ABI_VERSION ||
+        config->graphics_mode > TIGT_GRAPHICS_ASCII)
         return TIGT_ERROR_ARGUMENT;
     if (renderer_initialized)
         return TIGT_ERROR_BUSY;
@@ -784,6 +1082,7 @@ tigt_init(const tigt_config *config)
         tigt_snapshot_session_stop(true);
         renderer_initialized = false;
         memset(&renderer_config, 0, sizeof(renderer_config));
+        renderer_graphics_mode = TIGT_GRAPHICS_AUTO;
     }
     return result;
 }
@@ -802,6 +1101,7 @@ tigt_shutdown(void)
     memset(&renderer_overscan, 0, sizeof(renderer_overscan));
     renderer_display_technology = TIGT_DISPLAY_GENERIC;
     renderer_text_output_seen = false;
+    renderer_graphics_mode = TIGT_GRAPHICS_AUTO;
     memset(&renderer_config, 0, sizeof(renderer_config));
     pthread_mutex_unlock(&renderer_mutex);
 }
@@ -822,6 +1122,43 @@ tigt_present_bitmap(const uint32_t *pixels, uint16_t width, uint16_t height,
     }
     for (uint16_t row = 0; row < height; row++)
         memcpy(renderer_bitmap_pixels + row * width, pixels + (size_t) row * stride, width * sizeof(*pixels));
+    renderer_bitmap_width = width;
+    renderer_bitmap_pixel_width = pixel_width;
+    renderer_bitmap_valid = true;
+    renderer_has_frame = true;
+    renderer_frame_serial++;
+    pthread_mutex_unlock(&renderer_mutex);
+    return TIGT_OK;
+}
+
+int
+tigt_present_indexed_bitmap(const uint8_t *indices, uint16_t width, uint16_t height,
+                            uint16_t stride, uint8_t pixel_width,
+                            const uint32_t *palette, uint16_t palette_size)
+{
+    if (indices == NULL || (width != 320 && width != 640) || height != 200 ||
+        stride < width || (pixel_width != 1 && pixel_width != 2) ||
+        (palette == NULL ? palette_size != 0 : palette_size == 0 || palette_size > 256))
+        return TIGT_ERROR_ARGUMENT;
+    if (palette == NULL) {
+        palette = tigt_ibm16_palette;
+        palette_size = 16;
+    }
+    for (uint16_t index = 0; index < palette_size; index++)
+        if ((palette[index] & 0xff000000) != 0) return TIGT_ERROR_ARGUMENT;
+    for (uint16_t row = 0; row < height; row++)
+        for (uint16_t column = 0; column < width; column++)
+            if (indices[(size_t) row * stride + column] >= palette_size)
+                return TIGT_ERROR_ARGUMENT;
+    pthread_mutex_lock(&renderer_mutex);
+    if (!renderer_active) {
+        pthread_mutex_unlock(&renderer_mutex);
+        return TIGT_ERROR_BUSY;
+    }
+    for (uint16_t row = 0; row < height; row++)
+        for (uint16_t column = 0; column < width; column++)
+            renderer_bitmap_pixels[(size_t) row * width + column] =
+                palette[indices[(size_t) row * stride + column]];
     renderer_bitmap_width = width;
     renderer_bitmap_pixel_width = pixel_width;
     renderer_bitmap_valid = true;

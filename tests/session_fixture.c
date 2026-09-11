@@ -275,7 +275,7 @@ static int check_display_technology(const tigt_config *config, const struct term
 
 int main(int argc, char **argv)
 {
-    const tigt_config config = { TIGT_ABI_VERSION, on_input, controls };
+    const tigt_config config = { TIGT_ABI_VERSION, on_input, controls, TIGT_GRAPHICS_BLOCKS };
     if (argc == 2 && strcmp(argv[1], "--no-terminal") == 0) {
         assert(tigt_init(&config) == TIGT_ERROR_TERMINAL);
         tigt_shutdown();

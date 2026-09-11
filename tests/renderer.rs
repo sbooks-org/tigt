@@ -109,6 +109,7 @@ impl Fixture {
         }
         if renderer {
             command
+                .arg(root.join("src/graphics.c"))
                 .arg(root.join("src/snapshot.c"))
                 .arg(root.join("src/video.c"))
                 .arg(root.join("src/presenter.c"));
@@ -124,6 +125,34 @@ impl Fixture {
             }
             for library in png.libs {
                 command.arg(format!("-l{library}"));
+            }
+            if cfg!(feature = "libcaca") {
+                let caca = pkg_config::Config::new()
+                    .cargo_metadata(false)
+                    .probe("caca")
+                    .expect("the libcaca feature requires libcaca development headers and library");
+                command.arg("-DTIGT_HAVE_LIBCACA=1");
+                for path in caca.include_paths {
+                    command.arg("-I").arg(path);
+                }
+                for (name, value) in caca.defines {
+                    command.arg(match value {
+                        Some(value) => format!("-D{name}={value}"),
+                        None => format!("-D{name}"),
+                    });
+                }
+                for path in caca.link_paths {
+                    command.arg("-L").arg(path);
+                }
+                for path in caca.framework_paths {
+                    command.arg("-F").arg(path);
+                }
+                for library in caca.libs {
+                    command.arg(format!("-l{library}"));
+                }
+                for framework in caca.frameworks {
+                    command.arg("-framework").arg(framework);
+                }
             }
             let curses = ["ncursesw", "ncurses"].into_iter().find_map(|name| {
                 pkg_config::Config::new()
@@ -374,7 +403,10 @@ fn options() -> Options {
 }
 
 fn rendered_rgb(color: usize, fg: usize, bg: usize) -> [u8; 3] {
-    if (color == 15 && fg != 7 && bg != 7) || (color == 7 && fg != 15 && bg != 15) {
+    if [fg, bg].iter().all(|color| matches!(color, 0 | 7 | 15))
+        && !([fg, bg].contains(&7) && [fg, bg].contains(&15))
+        && matches!(color, 7 | 15)
+    {
         return [192; 3]; // Terminal theme foreground; bold is not an RGB promise.
     }
     let index = XTERM[color];
@@ -387,14 +419,30 @@ fn rendered_rgb(color: usize, fg: usize, bg: usize) -> [u8; 3] {
 }
 
 fn expected_pixels(font: &[u8], fg: usize, bg: usize) -> Vec<u8> {
-    let foreground = rendered_rgb(fg, fg, bg);
-    let background = rendered_rgb(bg, fg, bg);
+    let source = |x: usize, y: usize| {
+        let code = (y / 8 * 40 + x / 8) % 128;
+        if font[FONT_OFFSET + code * 8 + y % 8] & (0x80 >> (x % 8)) != 0 {
+            fg
+        } else {
+            bg
+        }
+    };
     let mut rgba = Vec::with_capacity(320 * 200 * 4);
     for y in 0..200 {
         for x in 0..320 {
-            let code = (y / 8 * 40 + x / 8) % 128;
-            let ink = font[FONT_OFFSET + code * 8 + y % 8] & (0x80 >> (x % 8)) != 0;
-            rgba.extend_from_slice(if ink { &foreground } else { &background });
+            let color = source(x, y);
+            let mut local_fg = fg;
+            let mut local_bg = bg;
+            if [fg, bg].contains(&7) && [fg, bg].contains(&15) {
+                let first = source(x / 2 * 2, y / 3 * 3);
+                if (0..6)
+                    .all(|bit| source(x / 2 * 2 + bit % 2, (y / 3 * 3 + bit / 2).min(199)) == first)
+                {
+                    local_fg = first;
+                    local_bg = first;
+                }
+            }
+            rgba.extend_from_slice(&rendered_rgb(color, local_fg, local_bg));
             rgba.push(255);
         }
     }
@@ -403,6 +451,13 @@ fn expected_pixels(font: &[u8], fg: usize, bg: usize) -> Vec<u8> {
 
 fn check_frame(capture: &[u8], font: &[u8], fg: usize, bg: usize) {
     let analysis = analyze(capture, font, &options()).expect("valid font and dimensions");
+    if [fg, bg].contains(&7) && [fg, bg].contains(&15) {
+        // A sextant cannot emphasize only its background. Solid cells use
+        // defaults, mixed cells retain explicit contrast: more than two RGB
+        // values per guest glyph is now valid, so compare the actual raster.
+        assert_eq!(analysis.rgba, expected_pixels(font, fg, bg));
+        return;
+    }
     let report = &analysis.report;
     assert!(
         report.success && report.diagnostics.is_empty(),

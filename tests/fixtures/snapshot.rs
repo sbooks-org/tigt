@@ -438,7 +438,7 @@ fn display_technology(directory: &Path) {
     let (sender, receiver) = std::sync::mpsc::channel();
     let start = || {
         let sender = sender.clone();
-        Session::with_input(move |event| {
+        Session::with_input_and_graphics(tigt::GraphicsMode::Blocks, move |event| {
             if event.key == InputKey::Char('n') && event.kind == InputKind::Press {
                 sender.send(()).unwrap();
             }

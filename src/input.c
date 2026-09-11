@@ -2,7 +2,7 @@
  * Copyright (C) 2026 Simplebooks Foundation
  * Copyright (C) 2026 Josh Rodd
  */
-#include "tigt.h"
+#include "input.h"
 
 #include <errno.h>
 #include <stdbool.h>
@@ -11,6 +11,8 @@
 struct tigt_input {
     tigt_input_callback callback;
     void *user;
+    tigt_terminal_report_callback on_report;
+    void *report_user;
     char sequence[64];
     size_t sequence_length;
     bool discard_sequence;
@@ -265,6 +267,16 @@ tigt_input_create(tigt_input_callback callback, void *user)
 }
 
 void
+tigt_input_set_terminal_report_callback(tigt_input *input,
+                                       tigt_terminal_report_callback callback, void *user)
+{
+    if (input != NULL) {
+        input->on_report = callback;
+        input->report_user = user;
+    }
+}
+
+void
 tigt_input_feed(tigt_input *input, const uint8_t *bytes, size_t length)
 {
     if (input == NULL || bytes == NULL)
@@ -294,6 +306,8 @@ tigt_input_feed(tigt_input *input, const uint8_t *bytes, size_t length)
         } else if (byte >= 0x40 && byte <= 0x7e) {
             input->sequence[input->sequence_length] = '\0';
             if (!input->discard_sequence) {
+                if (input->on_report != NULL && (byte == 'c' || byte == 'S' || byte == 't'))
+                    input->on_report(input->sequence + 2, byte, input->report_user);
                 if (byte == 'u')
                     handle_kitty_key(input, input->sequence + 2);
                 else
@@ -301,7 +315,8 @@ tigt_input_feed(tigt_input *input, const uint8_t *bytes, size_t length)
             }
             input->sequence_length = 0;
             input->discard_sequence = false;
-        } else if ((byte >= '0' && byte <= '9') || byte == ';' || byte == ':') {
+        } else if ((byte >= '0' && byte <= '9') || byte == ';' || byte == ':' ||
+                   (byte == '?' && input->sequence_length == 2)) {
             if (input->sequence_length < sizeof(input->sequence) - 1)
                 input->sequence[input->sequence_length++] = (char) byte;
             else
