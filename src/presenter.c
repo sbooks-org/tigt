@@ -801,11 +801,9 @@ analyze(tigt_presenter *p, const tigt_presenter_frame *frame, glass_cursor *curs
         if (!screen_blank(p->image, (size_t) p->columns * p->rows))
             return TIGT_ERROR_UNREPRESENTABLE;
         /* No visible text needs relocation. Adopt the new geometry at the
-         * current output line without inventing a clear, and never index the
-         * old image using the new geometry (which may have more rows/columns). */
+         * current output line without inventing a clear. */
         cursor->row = 0;
         left(p, cursor, 0);
-        cursor->empty_baseline = true;
     }
     for (unsigned y = 0; y < frame->rows; y++) {
         const tigt_text_cell *row = p->candidate + (size_t) y * frame->columns;
@@ -872,12 +870,14 @@ analyze(tigt_presenter *p, const tigt_presenter_frame *frame, glass_cursor *curs
 }
 
 static void
-prepare_plan(tigt_presenter *p, const tigt_presenter_frame *frame, const glass_cursor *cursor)
+prepare_plan(tigt_presenter *p, const tigt_presenter_frame *frame, glass_cursor *cursor)
 {
     p->trial_echo_consumed = 0;
     p->matching_echo = true;
     p->trial_queue = p->queue;
     p->trial_mapping = p->mapping;
+    bool resized = p->initialized && (p->columns != frame->columns || p->rows != frame->rows);
+    bool blank_baseline = resized && screen_blank(p->image, (size_t) p->columns * p->rows);
     if (p->fullscreen && screen_blank(p->image, (size_t) p->columns * p->rows))
         memset(&p->trial_mapping, 0, sizeof(p->trial_mapping));
     memset(p->boundary_proof, 0, sizeof(p->boundary_proof));
@@ -885,12 +885,19 @@ prepare_plan(tigt_presenter *p, const tigt_presenter_frame *frame, const glass_c
     p->buffer_error = TIGT_OK;
     if (((frame->hints & TIGT_PRESENT_VIDEO_DISABLED) && clear_frame(p, frame)) ||
         (p->initialized &&
-         ((p->columns != frame->columns || p->rows != frame->rows) ||
+         ((resized && !blank_baseline) ||
           (clear_frame(p, frame) && !screen_blank(p->image, (size_t) p->columns * p->rows))))) {
         discard_expectations(&p->trial_queue);
         p->trial_echo_consumed = p->echo_count;
         memset(&p->trial_mapping, 0, sizeof(p->trial_mapping));
         return;
+    }
+    if (blank_baseline) {
+        /* Match new-geometry predictions against the same blank baseline as
+         * analysis, never cells indexed with the old dimensions. The matcher
+         * still rejects each prediction carrying the previous geometry. */
+        cursor->empty_baseline = true;
+        memset(&p->trial_mapping, 0, sizeof(p->trial_mapping));
     }
     if (cursor->scroll_count) {
         for (unsigned y = cursor->scroll_top; y <= cursor->scroll_bottom; y++) {

@@ -242,7 +242,11 @@ fn real_cga_disabled_scroll_preserves_history_until_the_copy_finishes() {
     let mut expected = replay(baseline, false, |_| {});
     expected.extend_from_slice(b"\nBAC");
     let actual = replay(&trace, false, |_| {});
-    assert_bytes(&actual, &expected, "disabled copy must not blank or replay DIR history");
+    assert_bytes(
+        &actual,
+        &expected,
+        "disabled copy must not blank or replay DIR history",
+    );
 }
 
 #[test]
@@ -262,7 +266,11 @@ fn real_mda_scroll_holds_a_copied_prefix_after_finishing_the_source_line() {
     let coherent = format!("{}\n{}\n", frames[0], frames[2]);
     let expected = replay(&coherent, false, |_| {});
     let actual = replay(&trace, false, |_| {});
-    assert_bytes(&actual, &expected, "partial copy must not alter the completed DIR transcript");
+    assert_bytes(
+        &actual,
+        &expected,
+        "partial copy must not alter the completed DIR transcript",
+    );
     let transcript = std::str::from_utf8(&actual).unwrap();
     assert_eq!(transcript.matches("SYS").count(), 2); // ANSI.SYS and SYS.COM.
     assert!(transcript.trim_end().ends_with("DISKCOPY COM"));
@@ -284,7 +292,10 @@ fn real_mda_successive_directory_scrolls_preserve_every_file_once() {
         .unwrap();
     let actual = replay(&trace, false, |_| {});
     let transcript = std::str::from_utf8(&actual).unwrap().replace("\r\n", "\n");
-    assert!(!transcript.contains('\x0c'), "DIR must not clear retained history");
+    assert!(
+        !transcript.contains('\x0c'),
+        "DIR must not clear retained history"
+    );
     assert!(transcript.ends_with("A>"));
     let listings: Vec<Vec<Vec<String>>> = transcript
         .split("A>DIR\n")
@@ -299,7 +310,9 @@ fn real_mda_successive_directory_scrolls_preserve_every_file_once() {
             // interpreting overwritten digits as additional file-size text.
             let terminal = Terminal::replay(listing.as_bytes());
             assert!(terminal.errors.is_empty(), "{:?}", terminal.errors);
-            terminal.cells().0
+            terminal
+                .cells()
+                .0
                 .chunks_exact(COLS)
                 .map(|row| {
                     row.iter()
@@ -318,7 +331,9 @@ fn real_mda_successive_directory_scrolls_preserve_every_file_once() {
         first
             .iter()
             .filter(|fields| {
-                fields.get(1).is_some_and(|extension| matches!(extension.as_str(), "COM" | "SYS" | "EXE" | "BAS"))
+                fields.get(1).is_some_and(|extension| {
+                    matches!(extension.as_str(), "COM" | "SYS" | "EXE" | "BAS")
+                })
             })
             .count(),
         39,
@@ -331,7 +346,13 @@ fn real_mda_successive_directory_scrolls_preserve_every_file_once() {
             "BASICA COM 26112 10-20-83 12:00p",
         ] {
             assert_eq!(
-                listing.iter().filter(|fields| fields.iter().map(String::as_str).eq(expected.split_whitespace())).count(),
+                listing
+                    .iter()
+                    .filter(|fields| fields
+                        .iter()
+                        .map(String::as_str)
+                        .eq(expected.split_whitespace()))
+                    .count(),
                 1,
                 "cursor-lagged directory field changed: {expected}",
             );
@@ -465,8 +486,14 @@ fn real_dos_directory_history_survives_scrolls_and_the_observed_cls_outcome() {
                 // later TAB. Compare complete ordered directory fields here;
                 // the independent byte oracle above checks the control stream.
                 assert_eq!(
-                    listing.lines().map(|line| line.split_whitespace().collect::<Vec<_>>()).collect::<Vec<_>>(),
-                    first_listing.lines().map(|line| line.split_whitespace().collect::<Vec<_>>()).collect::<Vec<_>>(),
+                    listing
+                        .lines()
+                        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+                        .collect::<Vec<_>>(),
+                    first_listing
+                        .lines()
+                        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+                        .collect::<Vec<_>>(),
                     "{case}: incomplete listing {phase}"
                 );
             }

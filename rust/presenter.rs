@@ -308,17 +308,9 @@ impl Frame<'_> {
 unsafe extern "C" {
     fn tigt_presenter_create(config: *const RawConfig, output: *mut *mut c_void) -> c_int;
     fn tigt_presenter_present(presenter: *mut c_void, frame: *const RawFrame) -> c_int;
-    fn tigt_presenter_observe_cursor(
-        presenter: *mut c_void,
-        column: c_uint,
-        row: c_uint,
-    ) -> c_int;
+    fn tigt_presenter_observe_cursor(presenter: *mut c_void, column: c_uint, row: c_uint) -> c_int;
     fn tigt_presenter_forget_cursor(presenter: *mut c_void) -> c_int;
-    fn tigt_presenter_local_echo(
-        presenter: *mut c_void,
-        text: *const u32,
-        length: usize,
-    ) -> c_int;
+    fn tigt_presenter_local_echo(presenter: *mut c_void, text: *const u32, length: usize) -> c_int;
     fn tigt_presenter_present_nonblocking(presenter: *mut c_void, frame: *const RawFrame) -> c_int;
     fn tigt_presenter_resume(presenter: *mut c_void) -> c_int;
     fn tigt_presenter_fullscreen_output_started(presenter: *const c_void) -> c_int;
@@ -455,9 +447,7 @@ impl<'fd> Presenter<'fd> {
     /// Returns [`Error::Busy`] without mutation while output is pending.
     pub fn local_echo(&mut self, text: &[u32]) -> Result<(), Error> {
         // The slice remains live for this call; C validates and copies its data.
-        match unsafe {
-            tigt_presenter_local_echo(self.raw.as_ptr(), text.as_ptr(), text.len())
-        } {
+        match unsafe { tigt_presenter_local_echo(self.raw.as_ptr(), text.as_ptr(), text.len()) } {
             0 => Ok(()),
             other => Err(Error::from_status(other)),
         }

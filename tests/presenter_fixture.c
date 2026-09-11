@@ -604,12 +604,23 @@ geometry_from_blank_baseline(void)
     create_file(&f, 80, 25, 60, TIGT_ENCODING_ASCII);
     CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
     EXPECT(&f, "");
+    const char wrapped[] = "0123456789012345678901234567890123456789tail";
+    const tigt_presenter_boundary old_boundaries[] = {
+        { 40, TIGT_BOUNDARY_NEWLINE }, { sizeof(wrapped) - 1, TIGT_BOUNDARY_NEWLINE }
+    };
+    notify(&f, 1, 0, 0, wrapped, old_boundaries, 2);
     f.frame.columns = f.frame.stride = 40;
     blank_screen(&f);
-    text(&f, 0, 0, "M0");
-    position(&f, 1, 0);
+    const tigt_presenter_boundary new_boundaries[] = {
+        { 40, TIGT_BOUNDARY_SOFT_WRAP }, { sizeof(wrapped) - 1, TIGT_BOUNDARY_NEWLINE }
+    };
+    notify(&f, 2, 0, 0, wrapped, new_boundaries, 2);
+    text(&f, 0, 0, "0123456789012345678901234567890123456789");
+    text(&f, 1, 0, "tail");
+    position(&f, 2, 0);
     CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
-    EXPECT(&f, "M0\n"); /* No invented clear between observed blank and new text. */
+    EXPECT(&f, "0123456789012345678901234567890123456789tail\n");
+    notification_stats(&f, 1, 1, 0, 0); /* Old geometry cannot override the new wrap. */
     destroy(&f);
 
     create_file(&f, 40, 1, 60, TIGT_ENCODING_ASCII);
@@ -621,6 +632,48 @@ geometry_from_blank_baseline(void)
     position(&f, 1, 1);
     CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
     EXPECT(&f, "\nW"); /* New rows/columns compare against a blank baseline. */
+    destroy(&f);
+
+    /* Seed cells beyond a later narrow baseline. Matching a wider frame must
+     * not use that stale storage to reject an as-yet-unpainted prediction. */
+    create_file(&f, 132, 3, 60, TIGT_ENCODING_ASCII);
+    text(&f, 0, 40, "X");
+    text(&f, 1, 0, "X");
+    position(&f, 1, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "\t\t\t\t\tX\nX");
+    f.frame.columns = f.frame.stride = 40;
+    f.frame.rows = 1;
+    blank_screen(&f);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "\f");
+    f.frame.columns = f.frame.stride = 132;
+    f.frame.rows = 3;
+    blank_screen(&f);
+    char wide_message[94];
+    memset(wide_message, 'B', 92);
+    wide_message[92] = 'Z';
+    wide_message[93] = '\0';
+    const tigt_presenter_boundary wide_boundaries[] = {
+        { 92, TIGT_BOUNDARY_SOFT_WRAP }, { 93, TIGT_BOUNDARY_NEWLINE }
+    };
+    notify(&f, 1, 0, 40, wide_message, wide_boundaries, 2);
+    text(&f, 0, 0, "A");
+    position(&f, 0, 1);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    EXPECT(&f, "A"); /* Predictions still cannot emit unobserved text. */
+    notification_stats(&f, 0, 0, 0, 1);
+    for (unsigned x = 40; x < 132; x++)
+        f.cells[x].codepoint = 'B';
+    text(&f, 1, 0, "Z");
+    position(&f, 2, 0);
+    CHECK(tigt_presenter_present(f.presenter, &f.frame) == TIGT_OK);
+    char wide_output[99];
+    memset(wide_output, '\t', 5);
+    memcpy(wide_output + 5, wide_message, 93);
+    wide_output[98] = '\n';
+    expect_bytes(&f, wide_output, sizeof(wide_output));
+    notification_stats(&f, 1, 0, 0, 0);
     destroy(&f);
 
     create_file(&f, 80, 25, 60, TIGT_ENCODING_ASCII);
