@@ -18,7 +18,9 @@ cmake --build build --parallel
 cargo test --all-features
 ```
 
-Run `./build/tigt-demo --graphics auto` or `cargo run --example demo -- --graphics auto` in a real terminal. Both demos accept `auto|blocks|sixel|ascii`; explicit modes never silently fall back. Enable ASCII conversion with `-DTIGT_WITH_LIBCACA=ON` in CMake or `--features libcaca` in Cargo (off by default). Both stdin and stdout must be TTYs. Instrumentation outputs can be regular files or pipes; they do not replace the terminal used for rendering.
+Run `./build/tigt-demo --graphics auto` or `cargo run --example demo -- --graphics auto` in a real terminal. Both demos accept `auto|blocks|sixel|ascii|iterm2`; explicit modes never silently fall back. Enable ASCII conversion with `-DTIGT_WITH_LIBCACA=ON` in CMake or `--features libcaca` in Cargo (off by default). Both stdin and stdout must be TTYs. Instrumentation outputs can be regular files or pipes; they do not replace the terminal used for rendering.
+
+Sixel and iTerm2 target 80 terminal columns at a 4:3 display aspect, fitting the known pixel bounds. Sixel resamples on the host; iTerm2 normalizes logical widths 160/320/640 to a 320×200 RGB PNG for terminal-side enlargement: duplicate 160-wide pixels, preserve 320-wide pixels, and average adjacent 640-wide pairs. Without usable pixel-width metrics they fall back to a 640-pixel target width. Override the target with C `tigt_set_image_layout(columns, aspect_width, aspect_height)` or Rust `session.set_image_layout(...)`; native frame snapshots are unaffected. Identical resolved bitmap submissions do not redraw. See the [bitmap reference](docs/reference.md#bitmap-frames) for geometry, input ownership, and resize behavior.
 
 ## Analyzer
 
@@ -30,7 +32,7 @@ Both repositories are currently private. Development tests require read access t
 
 - One active process-wide curses session; POSIX terminals.
 - Bitmap source frames: 320×200 or 640×200, with horizontal pixel duplication described explicitly. Logical snapshots can be 160×200, 320×200 or 640×200.
-- Selectable Auto, Unicode blocks, sixel raster, or libcaca ASCII bitmap output, with exact RGB or custom indexed palettes. Theme substitutions require at most three source colours, all black/white or neutral grey129..254; sixel always emits explicit RGB.
+- Selectable Auto, Unicode blocks, sixel raster, iTerm2 inline PNG, or libcaca ASCII bitmap output, with exact RGB or custom indexed palettes. Theme substitutions require at most three source colours, all black/white or neutral grey129..254; sixel and iTerm2 always emit explicit RGB.
 - Text frames: resolved single-column Unicode cells and RGB colours.
 - Optional register/VRAM adapter: headless MDA/CGA standard text and basic CGA graphics decoding; PCjr exposes CGA compatibility only. C `tigt_video.h` and Rust `tigt::video` need no terminal session for tests.
 - Overscan metadata is retained but not drawn.

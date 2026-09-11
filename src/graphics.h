@@ -70,4 +70,26 @@ int tigt_sixel_write(FILE *output, const uint32_t *pixels,
                      uint16_t width, uint16_t height, uint8_t pixel_width,
                      uint16_t output_width, uint16_t output_height);
 
+/* Write one complete OSC 1337 inline image terminated by 7-bit ST. Bounds and
+ * source layout match the ASCII contract. First sample one backing pixel per
+ * logical pixel, then normalize logical widths 160/320/640 to a 320-wide RGB8
+ * PNG: duplicate 160-wide pixels, keep 320-wide pixels, and average adjacent
+ * 640-wide pairs per channel (rounded up). Other widths and height are unchanged.
+ * No palette quantization or theme substitution is performed.
+ * Output dimensions specify the terminal's display rectangle in pixels, with
+ * preserveAspectRatio=0 and doNotMoveCursor=1. No cursor or terminal mode
+ * changes, capability probes or terminal reads are performed.
+ *
+ * Calls must be serialized: bounded static workspace holds one presentation row,
+ * a base64 remainder and 4 KiB of output. PNG bytes are base64-encoded as libpng
+ * produces them; no complete PNG or expanded image is staged. Only libpng/zlib
+ * allocate per-frame encoding state. The stream remains owned by the caller
+ * and is flushed on success. Returns TIGT_OK, TIGT_ERROR_ARGUMENT (before any
+ * output), or TIGT_ERROR_SYSTEM on allocation, encoding or stream failure.
+ * A failure can leave an incomplete OSC on the stream.
+ */
+int tigt_iterm2_write(FILE *output, const uint32_t *pixels,
+                      uint16_t width, uint16_t height, uint8_t pixel_width,
+                      uint16_t output_width, uint16_t output_height);
+
 #endif

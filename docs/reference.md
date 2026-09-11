@@ -12,6 +12,7 @@ The installed `include/tigt.h`, `include/tigt_video.h`, `include/tigt_presenter.
 | `tigt_shutdown()` | `Drop` | Stop/join workers, restore terminal state, release session resources. |
 | `tigt_get_requested_graphics_mode()` | `session.requested_graphics_mode()` | Read the session's configured bitmap policy. |
 | `tigt_get_graphics_mode()` | `session.graphics_mode()` | Read the resolved bitmap backend. |
+| `tigt_set_image_layout(columns, aspect_width, aspect_height)` | `session.set_image_layout(columns, aspect_width, aspect_height)` | Set sixel/iTerm2 target width in terminal cells and display aspect ratio. |
 
 `config.abi_version` must equal `TIGT_ABI_VERSION` (3). The ABI-3 config appends `uint32_t graphics_mode`; rebuild C consumers against the matching header/library. A NULL input callback selects output-only mode. Both standard input and standard output must be terminals even in output-only mode. Lifecycle calls are serialized on the owning thread. Frame producers must not race lifecycle operations. Do not mix raw C lifecycle calls with a live Rust `Session`.
 
@@ -25,6 +26,8 @@ The application owns SIGINT/SIGTSTP policy. Normal initialization does not reser
 
 `tigt_present_indexed_bitmap(indices, width, height, stride, pixel_width, palette, palette_size)` / `Session::present_indexed_bitmap(indices, width, height, stride, pixel_width, palette)` accept byte indices with the same geometry and stride rules. C `palette = NULL, palette_size = 0`, or Rust `None`, selects the standard IBM16 palette and indices 0..15. Otherwise provide 1..256 exact `0x00RRGGBB` entries (Rust `Some(&colors)`); palette high bytes must be zero and every used index must be in range. Stride padding is ignored, but all visible source pixels are validated, including horizontally skipped pixels. Invalid input returns Argument without changing the frame. The implementation resolves/copies indices and palette before return; neither slice needs to remain alive. Native snapshots retain exact resolved RGB, not the indices.
 
+Repeated submissions with identical resolved RGB and geometry do not schedule redraws. Ignored pixel high bytes, row padding, equivalent index/palette remappings, and unused palette changes do not count as content changes. All backing pixels participate, including horizontally skipped pixels. Text/bitmap transitions, source geometry, layout changes, resize and resume still invalidate the display.
+
 Select the bitmap output policy with `config.graphics_mode` in C, or `Session::new_with_graphics(mode)` / `Session::with_input_and_graphics(mode, handler)` in Rust. Existing Rust constructors select `GraphicsMode::Auto`.
 
 | C | Rust | Bitmap output |
@@ -33,14 +36,33 @@ Select the bitmap output policy with `config.graphics_mode` in C, or `Session::n
 | `TIGT_GRAPHICS_BLOCKS` (1) | `GraphicsMode::Blocks` | Unicode sextant cells; requires a UTF-8 locale. |
 | `TIGT_GRAPHICS_SIXEL` (2) | `GraphicsMode::Sixel` | Sixel raster output, explicitly chosen without a capability probe. |
 | `TIGT_GRAPHICS_ASCII` (3) | `GraphicsMode::Ascii` | Printable ASCII cells converted by optional libcaca. |
+| `TIGT_GRAPHICS_ITERM2` (4) | `GraphicsMode::Iterm2` | Aspect-normalized 320×200 RGB8 PNG through the iTerm2 inline image protocol, enlarged by the terminal. Explicit only. |
 
 Auto performs a bounded 150 ms capability probe only when an input callback exists and stdin/stdout refer to the same terminal. This uses the existing input decoder and worker, preserving application input; output-only sessions and split terminal descriptors use locale fallback immediately. A primary-device-attributes response advertising feature 4, or a successful XTSM sixel geometry response, selects sixel. A timeout or unrecognized reply uses locale fallback. Selection is resolved at initialization and again on resume; the requested policy stays unchanged and there is no runtime setter. The C requested-mode getter returns Auto without a session; the resolved-mode getter returns Auto before resolution and after shutdown.
 
-Explicit modes do not probe or silently fall back. Blocks without UTF-8 and ASCII without a libcaca-enabled build return `TIGT_ERROR_TERMINAL` / `Error::Terminal`; Auto also fails in a non-UTF-8 locale when libcaca is absent. Explicit sixel is an application assertion of terminal support: use it only with a sixel-capable terminal.
+Explicit modes never silently fall back. Blocks without UTF-8 and ASCII without a libcaca-enabled build return `TIGT_ERROR_TERMINAL` / `Error::Terminal`; Auto also fails in a non-UTF-8 locale when libcaca is absent. Explicit sixel/iTerm2 assert terminal support; neither backend is selected based on replies. Sixel uses Auto's bounded geometry-query path when tigt owns input on the same terminal. iTerm2 queries only cell/text-area geometry (`16t`/`14t`), never sixel capabilities or limits. Output-only sessions never query or read stdin. Explicit blocks/ASCII do not probe. Auto selection is unchanged and never selects iTerm2.
 
-Bitmap RGB, including custom indexed palettes, is retained without first quantizing to CGA/IBM16. Sixel emits exact colours for images with at most 256 unique RGB values, within the protocol's integer-percentage channel precision; larger colour sets are quantized to 256 colours. Blocks and ASCII approximate colours using terminal capabilities. Native PNG snapshots preserve original RGB and remain independent of the selected graphics mode.
+Bitmap RGB, including custom indexed palettes, is retained without first quantizing to CGA/IBM16. Sixel emits exact colours for images with at most 256 unique RGB values, within the protocol's integer-percentage channel precision; larger colour sets are quantized to 256 colours. iTerm2 sends RGB8 without palette quantization or theme substitutions, after the horizontal normalization described below. Blocks and ASCII approximate colours using terminal capabilities. Native PNG snapshots preserve original RGB and dimensions independently of the selected graphics mode.
 
-Sixel starts at the upper-left of the screen at the logical source resolution, shrinking proportionally when the available pixel area is smaller; it does not enlarge small sources. Window pixel sizes come from `TIOCGWINSZ`, with queried cell/window geometry and sixel limits used when available. If pixel geometry is unknown, native logical dimensions are used. Resizing invalidates the display; leaving graphics removes the image and repaints text. ASCII conversion fills the bounded terminal cell area. Both sample the first backing pixel of each logical pixel when `pixel_width = 2`.
+Sixel and iTerm2 start at the upper-left of the screen and default to **80 terminal columns wide at a 4:3 display aspect ratio**. Both 320×200 and 640×200 source modes request the same destination rectangle. Sixel uses nearest-neighbor resampling. iTerm2 normalizes the source to a **320×200 presentation PNG**, so all modes share the same encoded aspect rather than relying solely on terminal stretching. Logical width means `width / pixel_width`: duplicate each pixel at 160, leave 320 unchanged, and average adjacent pixel pairs at 640. Averages are per 8-bit RGB channel, rounded up; thin lines remain visible instead of disappearing through alternate-column sampling, at the cost of horizontal detail and intermediate colours. Native snapshots retain their original geometry and RGB.
+
+iTerm2 requests an explicit pixel-sized rectangle with `preserveAspectRatio=0` and `doNotMoveCursor=1`; further enlargement and interpolation belong to the terminal. PNG bytes are streamed through base64 without staging a full image. The rectangle fits the available terminal pixel bounds and a 4096-pixel limit per axis; sixel additionally respects reported sixel limits. Dimensions round down, with a minimum of one pixel per axis.
+
+The target width uses the `TIOCGWINSZ` pixel-width/column ratio, then a queried cell width, then the queried text-area pixel-width/column ratio. No physical-monitor DPI or assumed Mac point scale is needed. If no usable width metrics exist, tigt uses a fixed **640-pixel target width** (640×480 at the default aspect), constrained by any known bounds; this is a fallback, not a measured 80-column rectangle. Output-only sessions never probe or read stdin and rely on ioctl metrics. Grid or pixel-only resizing redraws even an unchanged frame. Query-only geometry is converted to cell metrics for grid resizing; it is refreshed on resume, not re-probed during resize.
+
+Override the layout after initialization in C or Rust:
+
+```c
+int status = tigt_set_image_layout(60, 16, 9);
+```
+
+```rust
+session.set_image_layout(60, 16, 9)?;
+```
+
+Columns must be 1–320; both aspect components must be 1–65535. An initialized active or suspended session is required. Invalid requests return Argument without changing the layout. A successful change schedules the latest sixel/iTerm2 frame for redraw without another frame submission. Layout survives suspend/resume and resets to 80 columns at 4:3 for a new session. Native framebuffer dimensions, RGB snapshots, and blocks/ASCII rendering are unchanged.
+
+Same-size image updates overwrite the current placement without clearing the screen. Resizing, leaving graphics, suspension and shutdown remove stale images; returning to text repaints its cells. iTerm2 never changes sixel DEC private modes. ASCII conversion fills the bounded terminal cell area. Sixel, iTerm2 and ASCII sample the first backing pixel of each logical pixel when `pixel_width = 2`.
 
 Blocks and ASCII may substitute terminal-default background/foreground only when the entire source frame uses **at most three distinct RGB values**, each black (`0x000000`), white (`0xffffff`), or a neutral grey with equal channels in **129..254**. Classification happens before resampling or cell reduction and includes horizontally skipped source pixels. Every qualifying grey maps to regular foreground, white to intense foreground, and black to background; there is no additional restriction requiring a unique grey value. Thus OS/2 grey `0xcccccc` is eligible, while dark grey `0x808080`, any chromatic colour, or four distinct qualifying colours disable all theme substitutions. Standard IBM16 indexed input satisfies this policy only when its used indices belong to `{0,7,15}`. Sixel always emits explicit source RGB, never terminal foreground or bold colours, because those have no portable sixel mapping.
 

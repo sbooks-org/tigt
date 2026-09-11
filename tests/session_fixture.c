@@ -4,13 +4,16 @@
  * Public API consumer: linked to production sources, never source-included.
  */
 #include "tigt.h"
+#include "../src/graphics.h"
 #include <assert.h>
 #include <errno.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -273,8 +276,229 @@ static int check_display_technology(const tigt_config *config, const struct term
     return 0;
 }
 
+static void sixel_window(unsigned columns, unsigned rows, unsigned width, unsigned height)
+{
+    const struct winsize size = {
+        .ws_col = columns, .ws_row = rows, .ws_xpixel = width, .ws_ypixel = height
+    };
+    assert(ioctl(STDOUT_FILENO, TIOCSWINSZ, &size) == 0);
+}
+
+static void sixel_scene(unsigned pixel_width, unsigned scene)
+{
+    const uint32_t colors[] = { 0xff0000, 0x00ff00, 0x0000ff, 0xffffff };
+    for (unsigned y = 0; y < 200; y++)
+        for (unsigned x = 0; x < 648; x++)
+            pixels[y * 648 + x] = x < 640
+                ? colors[((y >= 100) * 2 + (x >= 320)) ^ scene] : 0x555555;
+    assert(tigt_present_bitmap(pixels, 640, 200, 648, pixel_width) == TIGT_OK);
+    /* Layout changes and resizes must redraw the retained copy. */
+    memset(pixels, 0, sizeof(pixels));
+}
+
+static void sixel_acknowledge(bool owns_input, unsigned stage)
+{
+    if (owns_input) {
+        wait_for_stage(stage);
+    } else {
+        /* Canonical stdin belongs to the application, not the renderer. */
+        assert(getchar() == 'n');
+        assert(getchar() == '\n');
+    }
+}
+
+static int check_sixel(const char *scenario)
+{
+    const bool geometry = strcmp(scenario, "geometry") == 0;
+    const bool owns_input = strcmp(scenario, "query-cell") == 0 ||
+                            strcmp(scenario, "query-window") == 0;
+    assert(geometry || owns_input || strcmp(scenario, "fallback") == 0);
+    const tigt_config config = {
+        TIGT_ABI_VERSION, owns_input ? on_input : NULL, controls, TIGT_GRAPHICS_SIXEL
+    };
+    struct termios original;
+    assert(tcgetattr(STDIN_FILENO, &original) == 0);
+    sixel_window(320, 80, geometry ? 3840 : 0, geometry ? 1920 : 0);
+    assert(tigt_set_image_layout(80, 4, 3) == TIGT_ERROR_ARGUMENT);
+    if (!owns_input) {
+        /* Queue application input before init without consuming it. A renderer
+         * probe/input thread must neither steal this line nor require replies. */
+        puts("SIXEL APPLICATION INPUT");
+        assert(fflush(stdout) == 0);
+        struct pollfd input = { .fd = STDIN_FILENO, .events = POLLIN };
+        assert(poll(&input, 1, 20000) == 1);
+    }
+    assert(tigt_init(&config) == TIGT_OK);
+    assert(tigt_get_graphics_mode() == TIGT_GRAPHICS_SIXEL);
+    if (!owns_input) {
+        char line[16];
+        assert(fgets(line, sizeof(line), stdin) != NULL);
+        assert(strcmp(line, "owned\n") == 0);
+    }
+    sixel_scene(2, 0);
+    sixel_acknowledge(owns_input, 1);
+    if (geometry) {
+        /* 320- and 640-dot modes must fill the same display rectangle. */
+        sixel_scene(1, 1);
+        sixel_acknowledge(false, 2);
+        assert(tigt_set_image_layout(40, 16, 9) == TIGT_OK);
+        sixel_acknowledge(false, 3);
+
+        assert(tigt_set_image_layout(0, 4, 3) == TIGT_ERROR_ARGUMENT);
+        assert(tigt_set_image_layout(321, 4, 3) == TIGT_ERROR_ARGUMENT);
+        assert(tigt_set_image_layout(80, 0, 3) == TIGT_ERROR_ARGUMENT);
+        assert(tigt_set_image_layout(80, 4, 0) == TIGT_ERROR_ARGUMENT);
+        /* Force observable output after rejection; no valid setter can conceal
+         * partial mutation of either the requested columns or the aspect. */
+        tigt_suspend();
+        check_termios(&original);
+        assert(tigt_resume() == TIGT_OK);
+        sixel_acknowledge(false, 4);
+
+        tigt_suspend();
+        assert(tigt_set_image_layout(320, UINT16_MAX, UINT16_MAX) == TIGT_OK);
+        assert(tigt_resume() == TIGT_OK);
+        sixel_acknowledge(false, 5);
+        tigt_suspend();
+        assert(tigt_set_image_layout(80, 4, 3) == TIGT_OK);
+        assert(tigt_resume() == TIGT_OK);
+        sixel_acknowledge(false, 6);
+
+        /* Pixel-only resize, then height fit with fractional rounding, width
+         * fit, and encoder limits on each axis. No new frame is submitted. */
+        sixel_window(320, 80, 1920, 960);
+        sixel_acknowledge(false, 7);
+        sixel_window(80, 20, 960, 241);
+        sixel_acknowledge(false, 8);
+        sixel_window(40, 80, 480, 1920);
+        sixel_acknowledge(false, 9);
+        sixel_window(80, 80, UINT16_MAX, UINT16_MAX);
+        sixel_acknowledge(false, 10);
+        assert(tigt_set_image_layout(80, 3, 4) == TIGT_OK);
+        sixel_acknowledge(false, 11);
+        assert(tigt_set_image_layout(1, UINT16_MAX, 1) == TIGT_OK);
+        sixel_acknowledge(false, 12);
+
+        tigt_shutdown();
+        check_termios(&original);
+        assert(tigt_set_image_layout(80, 4, 3) == TIGT_ERROR_ARGUMENT);
+        sixel_window(320, 80, 3840, 1920);
+        assert(tigt_init(&config) == TIGT_OK);
+        sixel_scene(2, 0);
+        sixel_acknowledge(false, 13);
+    } else if (owns_input) {
+        /* Queried whole-window pixels describe the original grid only. A
+         * smaller grid must use reported/derived cell metrics, not stale bounds. */
+        sixel_window(320, 10, 0, 0);
+        sixel_acknowledge(true, 2);
+        if (strcmp(scenario, "query-cell") == 0) {
+            sixel_window(40, 80, 0, 0);
+            sixel_acknowledge(true, 3);
+        }
+    }
+    tigt_shutdown();
+    check_termios(&original);
+    assert(tigt_set_image_layout(80, 4, 3) == TIGT_ERROR_ARGUMENT);
+    return 0;
+}
+
+static void image_progress(const char *path, unsigned stage)
+{
+    FILE *file = fopen(path, "w");
+    assert(file != NULL);
+    assert(fprintf(file, "%u\n", stage) > 0);
+    assert(fclose(file) == 0);
+}
+
+static int check_image_updates(uint32_t mode, const char *progress)
+{
+    if (mode == TIGT_GRAPHICS_ITERM2) {
+        FILE *output = tmpfile();
+        assert(output != NULL);
+        assert(tigt_iterm2_write(output, pixels, 320, 200, 3, 1280, 960) == TIGT_ERROR_ARGUMENT);
+        assert(ftell(output) == 0);
+        assert(fclose(output) == 0);
+        output = fopen("/dev/null", "r");
+        assert(output != NULL);
+        assert(tigt_iterm2_write(output, pixels, 320, 200, 1, 1280, 960) == TIGT_ERROR_SYSTEM);
+        assert(fclose(output) == 0);
+    }
+    const uint32_t colors[] = { 0x123456, 0xabcdef, 0x102030, 0xfedcba };
+    static uint8_t indices[648 * 200];
+    uint32_t palette[] = { colors[3], colors[2], colors[1], colors[0], 0 };
+    struct termios original;
+    assert(tcgetattr(STDIN_FILENO, &original) == 0);
+    sixel_window(100, 60, 1600, 1800);
+    const tigt_config config = { TIGT_ABI_VERSION, NULL, NULL, mode };
+    assert(tigt_init(&config) == TIGT_OK);
+    assert(tigt_get_graphics_mode() == mode);
+    for (unsigned y = 0; y < 200; y++)
+        for (unsigned x = 0; x < 648; x++) {
+            const unsigned color = (x >= 160) + 2 * (y >= 100);
+            pixels[y * 648 + x] = 0xaa000000 | colors[color];
+            indices[y * 648 + x] = 3 - color;
+        }
+    assert(tigt_present_bitmap(pixels, 320, 200, 648, 1) == TIGT_OK);
+    sixel_acknowledge(false, 0);
+    const struct timespec tick = { .tv_nsec = 5000000 };
+    for (unsigned repeat = 0; repeat < 16; repeat++) {
+        for (unsigned y = 0; y < 200; y++)
+            for (unsigned x = 0; x < 648; x++)
+                pixels[y * 648 + x] ^= x < 320 ? 0xff000000 : 0x00ffffff;
+        palette[4] ^= 0xffffff; /* Unused palette entries do not change RGB. */
+        assert(tigt_present_bitmap(pixels, 320, 200, 648, 1) == TIGT_OK);
+        assert(tigt_present_indexed_bitmap(indices, 320, 200, 648, 1, palette, 5) == TIGT_OK);
+        indices[199 * 648 + 319] = 255;
+        assert(tigt_present_indexed_bitmap(indices, 320, 200, 648, 1, palette, 5) == TIGT_ERROR_ARGUMENT);
+        indices[199 * 648 + 319] = 0;
+        nanosleep(&tick, NULL);
+    }
+    image_progress(progress, 1);
+    sixel_acknowledge(false, 0);
+    pixels[0] ^= 0x010101;
+    assert(tigt_present_bitmap(pixels, 320, 200, 648, 1) == TIGT_OK);
+    sixel_acknowledge(false, 0);
+    assert(tigt_set_image_layout(40, 16, 9) == TIGT_OK);
+    sixel_acknowledge(false, 0);
+    sixel_window(100, 60, 2000, 1800);
+    sixel_acknowledge(false, 0);
+    tigt_suspend();
+    check_termios(&original);
+    assert(tigt_resume() == TIGT_OK);
+    sixel_acknowledge(false, 0);
+    const tigt_text_cell text = { 'X', 0xffffff, 0, 0 };
+    assert(tigt_present_text(&text, 1, 1, 1) == TIGT_OK);
+    image_progress(progress, 2);
+    sixel_acknowledge(false, 0);
+    assert(tigt_present_bitmap(pixels, 320, 200, 648, 1) == TIGT_OK);
+    sixel_acknowledge(false, 0);
+    assert(tigt_present_bitmap(pixels, 320, 200, 648, 2) == TIGT_OK);
+    sixel_acknowledge(false, 0);
+    for (unsigned y = 0; y < 200; y++)
+        for (unsigned x = 0; x < 640; x++)
+            pixels[y * 648 + x] = colors[(x >= 320) + 2 * (y >= 100)];
+    /* One-pixel stripes must survive reduction, not disappear by decimation. */
+    for (unsigned x = 0; x < 640; x++)
+        pixels[x] = x & 1 ? 0xffffff : 0;
+    pixels[648] = 0x112233;
+    pixels[649] = 0xaaccff;
+    assert(tigt_present_bitmap(pixels, 640, 200, 648, 1) == TIGT_OK);
+    sixel_acknowledge(false, 0);
+    assert(tigt_present_bitmap(pixels, 640, 200, 648, 2) == TIGT_OK);
+    sixel_acknowledge(false, 0);
+    tigt_shutdown();
+    check_termios(&original);
+    puts("PASS IMAGE UPDATES");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 4 && strcmp(argv[1], "--image-tests") == 0)
+        return check_image_updates(strcmp(argv[2], "iterm2") == 0 ?
+                                   TIGT_GRAPHICS_ITERM2 : TIGT_GRAPHICS_SIXEL, argv[3]);
+    if (argc == 3 && strcmp(argv[1], "--sixel-tests") == 0)
+        return check_sixel(argv[2]);
     const tigt_config config = { TIGT_ABI_VERSION, on_input, controls, TIGT_GRAPHICS_BLOCKS };
     if (argc == 2 && strcmp(argv[1], "--no-terminal") == 0) {
         assert(tigt_init(&config) == TIGT_ERROR_TERMINAL);

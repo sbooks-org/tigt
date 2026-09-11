@@ -24,11 +24,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some("blocks") => GraphicsMode::Blocks,
                     Some("sixel") => GraphicsMode::Sixel,
                     Some("ascii") => GraphicsMode::Ascii,
-                    _ => return Err("--graphics requires auto|blocks|sixel|ascii".into()),
+                    Some("iterm2") => GraphicsMode::Iterm2,
+                    _ => return Err("--graphics requires auto|blocks|sixel|ascii|iterm2".into()),
                 };
             }
             "--help" => {
-                println!("usage: demo [--graphics auto|blocks|sixel|ascii]");
+                println!("usage: demo [--graphics auto|blocks|sixel|ascii|iterm2]");
                 return Ok(());
             }
             _ => return Err(format!("unknown argument: {argument}").into()),

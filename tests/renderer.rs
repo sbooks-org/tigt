@@ -677,6 +677,453 @@ fn public_session_copies_frames_dispatches_controls_and_restores_terminal() {
     );
 }
 
+fn sixel_number(bytes: &[u8], cursor: &mut usize) -> Result<usize, String> {
+    let start = *cursor;
+    let mut number = 0usize;
+    while let Some(digit) = bytes.get(*cursor).filter(|byte| byte.is_ascii_digit()) {
+        number = number
+            .checked_mul(10)
+            .and_then(|number| number.checked_add((digit - b'0') as usize))
+            .ok_or("overflowing sixel parameter")?;
+        *cursor += 1;
+    }
+    if *cursor == start {
+        return Err("missing sixel parameter".into());
+    }
+    Ok(number)
+}
+
+fn sixel_parameters<const N: usize>(
+    bytes: &[u8],
+    cursor: &mut usize,
+) -> Result<[usize; N], String> {
+    let mut values = [0; N];
+    for (index, value) in values.iter_mut().enumerate() {
+        if index != 0 {
+            if bytes.get(*cursor) != Some(&b';') {
+                return Err("missing sixel parameter separator".into());
+            }
+            *cursor += 1;
+        }
+        *value = sixel_number(bytes, cursor)?;
+    }
+    Ok(values)
+}
+
+fn next_sixel<'a>(bytes: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
+    while let Some(start) = bytes[*cursor..]
+        .windows(2)
+        .position(|pair| pair == b"\x1bP")
+        .map(|offset| *cursor + offset + 2)
+    {
+        let Some(end) = bytes[start..]
+            .windows(2)
+            .position(|pair| pair == b"\x1b\\")
+            .map(|offset| start + offset)
+        else {
+            // Keep an incomplete DCS until its terminating ST arrives.
+            *cursor = start - 2;
+            return None;
+        };
+        *cursor = end + 2;
+        if let Some(header) = bytes[start..end].iter().position(|byte| *byte == b'q') {
+            return Some(&bytes[start + header + 1..end]);
+        }
+    }
+    None
+}
+
+fn check_sixel_raster(
+    bytes: &[u8],
+    expected_width: usize,
+    expected_height: usize,
+    scene: usize,
+) -> Result<(), String> {
+    if bytes.first() != Some(&b'"') {
+        return Err("sixel frame has no raster attributes".into());
+    }
+    let mut cursor = 1;
+    let [pan, pad, width, height] = sixel_parameters(bytes, &mut cursor)?;
+    if (pan, pad) != (1, 1) || (width, height) != (expected_width, expected_height) {
+        return Err(format!(
+            "sixel raster {pan}:{pad} {width}x{height}, expected square pixels {expected_width}x{expected_height}"
+        ));
+    }
+    // Independently decode actual palette definitions, runs and bitplanes.
+    // The sentinel catches holes: raster attributes alone are not a frame.
+    let mut pixels = vec![u32::MAX; width * height];
+    let mut palette = [u32::MAX; 256];
+    let (mut x, mut y, mut color) = (0usize, 0usize, 0usize);
+    while cursor < bytes.len() {
+        let command = bytes[cursor];
+        cursor += 1;
+        match command {
+            b'#' => {
+                color = sixel_number(bytes, &mut cursor)?;
+                if color >= palette.len() {
+                    return Err("sixel palette index exceeds 255".into());
+                }
+                if bytes.get(cursor) == Some(&b';') {
+                    cursor += 1;
+                    let [space, red, green, blue] = sixel_parameters(bytes, &mut cursor)?;
+                    if space != 2 || red > 100 || green > 100 || blue > 100 {
+                        return Err("invalid sixel RGB definition".into());
+                    }
+                    palette[color] = ((red * 255 / 100) << 16
+                        | (green * 255 / 100) << 8
+                        | blue * 255 / 100) as u32;
+                }
+            }
+            b'$' => x = 0,
+            b'-' => {
+                x = 0;
+                y += 6;
+            }
+            b'!' | b'?'..=b'~' => {
+                let (count, mask) = if command == b'!' {
+                    let count = sixel_number(bytes, &mut cursor)?;
+                    let mask = *bytes.get(cursor).ok_or("missing repeated sixel")?;
+                    cursor += 1;
+                    (count, mask)
+                } else {
+                    (1, command)
+                };
+                if !(b'?'..=b'~').contains(&mask)
+                    || count == 0
+                    || count > width.saturating_sub(x)
+                    || palette[color] == u32::MAX
+                {
+                    return Err("invalid sixel run or undefined color".into());
+                }
+                for bit in 0..6 {
+                    if (mask - b'?') & (1 << bit) == 0 {
+                        continue;
+                    }
+                    if y + bit >= height {
+                        return Err("sixel paints beyond declared raster height".into());
+                    }
+                    pixels[(y + bit) * width + x..(y + bit) * width + x + count]
+                        .fill(palette[color]);
+                }
+                x += count;
+            }
+            _ => return Err(format!("unexpected sixel command {command:#x}")),
+        }
+    }
+    let colors = [0xff0000, 0x00ff00, 0x0000ff, 0xffffff];
+    for (index, actual) in pixels.into_iter().enumerate() {
+        let (x, y) = (index % width, index / width);
+        let quadrant = usize::from(y * 2 >= height) * 2 + usize::from(x * 2 >= width);
+        let expected = colors[quadrant ^ scene];
+        if actual != expected {
+            return Err(format!(
+                "sixel pixel ({x},{y}) = {actual:#x}, expected {expected:#x}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn capture_sixel(fixture: &Fixture, scenario: &str, expected: &[(usize, usize, usize)]) {
+    let owns_input = scenario.starts_with("query-");
+    let mut queued_input = false;
+    let mut queried = [false; 2];
+    let (mut cursor, mut stage) = (0, 0);
+    let capture =
+        fixture.capture_observing(scenario, &["--sixel-tests", scenario], |bytes, master| {
+            if !owns_input
+                && !queued_input
+                && bytes
+                    .windows(b"SIXEL APPLICATION INPUT".len())
+                    .any(|part| part == b"SIXEL APPLICATION INPUT")
+            {
+                master
+                    .write_all(b"owned\n")
+                    .map_err(|error| error.to_string())?;
+                queued_input = true;
+            }
+            if owns_input {
+                for (index, query) in [b"\x1b[16t", b"\x1b[14t"].into_iter().enumerate() {
+                    if !queried[index] && bytes.windows(query.len()).any(|part| part == query) {
+                        queried[index] = true;
+                        let reply: &[u8] = match (index, scenario) {
+                            (0, "query-cell") => b"\x1b[6;24;12t",
+                            (0, _) => b"",
+                            // Deliberately distinct ratios establish cell-report
+                            // precedence over a whole-window report.
+                            (1, "query-cell") => b"\x1b[4;1600;3200t",
+                            _ => b"\x1b[4;1920;3840t",
+                        };
+                        master.write_all(reply).map_err(|error| error.to_string())?;
+                    }
+                }
+            }
+            if stage < expected.len() {
+                if let Some(raster) = next_sixel(bytes, &mut cursor) {
+                    let (width, height, scene) = expected[stage];
+                    check_sixel_raster(raster, width, height, scene)
+                        .map_err(|error| format!("{scenario} stage {stage}: {error}"))?;
+                    master
+                        .write_all(if owns_input { b"n" } else { b"n\n" })
+                        .map_err(|error| error.to_string())?;
+                    stage += 1;
+                }
+            }
+            Ok(())
+        });
+    assert_eq!(
+        stage,
+        expected.len(),
+        "{scenario}: missing complete sixel frame"
+    );
+    if owns_input {
+        assert_eq!(
+            queried, [true; 2],
+            "explicit SIXEL must query pixel metrics"
+        );
+    } else {
+        assert!(queued_input, "application-owned input was never queued");
+        for query in [
+            b"\x1b[16t".as_slice(),
+            b"\x1b[14t",
+            b"\x1b[?2;1;0S",
+            b"\x1b[c",
+        ] {
+            assert!(
+                !capture.windows(query.len()).any(|part| part == query),
+                "output-only session emitted probe {query:?}"
+            );
+        }
+    }
+}
+
+fn next_iterm2<'a>(bytes: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
+    let prefix = b"\x1b]1337;File=";
+    let start = *cursor
+        + bytes[*cursor..]
+            .windows(prefix.len())
+            .position(|p| p == prefix)?;
+    let payload = start + prefix.len();
+    let end = payload + bytes[payload..].windows(2).position(|p| p == b"\x1b\\")?;
+    *cursor = end + 2;
+    Some(&bytes[payload..end])
+}
+
+fn decode_base64(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    if bytes.len() % 4 != 0 {
+        return Err("incomplete image base64".into());
+    }
+    let mut decoded = Vec::with_capacity(bytes.len() / 4 * 3);
+    for group in bytes.chunks_exact(4) {
+        let mut value = 0u32;
+        for byte in group {
+            let digit = match byte {
+                b'A'..=b'Z' => byte - b'A',
+                b'a'..=b'z' => byte - b'a' + 26,
+                b'0'..=b'9' => byte - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                b'=' => 0,
+                _ => return Err("invalid image base64".into()),
+            };
+            value = value << 6 | u32::from(digit);
+        }
+        decoded.push((value >> 16) as u8);
+        if group[2] != b'=' {
+            decoded.push((value >> 8) as u8);
+        }
+        if group[3] != b'=' {
+            decoded.push(value as u8);
+        }
+    }
+    Ok(decoded)
+}
+
+fn check_iterm2_image(bytes: &[u8], stage: usize) -> Result<(), String> {
+    let separator = bytes
+        .iter()
+        .position(|byte| *byte == b':')
+        .ok_or("missing PNG payload")?;
+    let fields: std::collections::BTreeMap<_, _> = std::str::from_utf8(&bytes[..separator])
+        .map_err(|e| e.to_string())?
+        .split(';')
+        .filter_map(|field| field.split_once('='))
+        .collect();
+    let (width, height) = match stage {
+        0 | 1 => ("1280px", "960px"),
+        2 => ("640px", "360px"),
+        _ => ("800px", "450px"),
+    };
+    for (key, value) in [
+        ("inline", "1"),
+        ("width", width),
+        ("height", height),
+        ("preserveAspectRatio", "0"),
+        ("doNotMoveCursor", "1"),
+    ] {
+        if fields.get(key) != Some(&value) {
+            return Err(format!(
+                "iTerm2 stage {stage}: {key} = {:?}, expected {value}",
+                fields.get(key)
+            ));
+        }
+    }
+    let encoded = decode_base64(&bytes[separator + 1..])?;
+    let mut reader = png::Decoder::new(encoded.as_slice())
+        .read_info()
+        .map_err(|e| e.to_string())?;
+    let mut rgb = vec![0; reader.output_buffer_size()];
+    let frame = reader.next_frame(&mut rgb).map_err(|e| e.to_string())?;
+    if frame.width != 320
+        || frame.height != 200
+        || frame.color_type != png::ColorType::Rgb
+        || frame.bit_depth != png::BitDepth::Eight
+    {
+        return Err(format!(
+            "iTerm2 PNG did not normalize to a 320x200 RGB image: {frame:?}"
+        ));
+    }
+    let colors = [0x123456u32, 0xabcdef, 0x102030, 0xfedcba];
+    for (index, actual) in rgb[..frame.buffer_size()].chunks_exact(3).enumerate() {
+        let x = index % 320;
+        let y = index / 320;
+        let mut expected = colors[usize::from(x >= 160) + 2 * usize::from(y >= 100)];
+        if (index == 0 && (1..=5).contains(&stage)) || (stage == 6 && index < 2) {
+            expected ^= 0x010101;
+        }
+        if stage >= 7 && y == 0 {
+            expected = if stage == 7 { 0x808080 } else { 0 };
+        }
+        if stage >= 7 && y == 1 && x == 0 {
+            expected = if stage == 7 { 0x5e7799 } else { 0x112233 };
+        }
+        if actual != &expected.to_be_bytes()[1..] {
+            return Err(format!(
+                "iTerm2 stage {stage}: pixel {x},{y} = {actual:?}, expected {expected:#x}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn bitmap_images_idle_until_rgb_or_presentation_changes() {
+    let fixture = Fixture::build("session_fixture", true, false);
+    for backend in ["sixel", "iterm2"] {
+        let progress = fixture.path(&format!("{backend}-progress"));
+        let (mut cursor, mut frames) = (0, 0);
+        let (mut idle_since, mut text_since) = (None, None);
+        let (mut idle_released, mut text_released) = (false, false);
+        let capture = fixture.capture_observing(
+            &format!("{backend}-updates"),
+            &["--image-tests", backend, progress.to_str().unwrap()],
+            |bytes, master| {
+                while let Some(image) = if backend == "sixel" {
+                    next_sixel(bytes, &mut cursor)
+                } else {
+                    next_iterm2(bytes, &mut cursor)
+                } {
+                    if frames >= 9 || frames == 1 && !idle_released || frames == 5 && !text_released
+                    {
+                        return Err(format!("{backend}: redundant image after {frames} frames"));
+                    }
+                    if backend == "iterm2" {
+                        check_iterm2_image(image, frames)?;
+                    }
+                    frames += 1;
+                    master.write_all(b"n\n").map_err(|e| e.to_string())?;
+                }
+                let stage = fs::read_to_string(&progress)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u8>().ok());
+                if !idle_released && stage == Some(1) {
+                    let since = idle_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= Duration::from_millis(120) {
+                        if frames != 1 {
+                            return Err("initial image missing".into());
+                        }
+                        master.write_all(b"n\n").map_err(|e| e.to_string())?;
+                        idle_released = true;
+                    }
+                }
+                if !text_released && stage == Some(2) {
+                    let since = text_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= Duration::from_millis(120) {
+                        if frames != 5 || !bytes[cursor..].windows(4).any(|p| p == b"\x1b[2J") {
+                            return Err("image not cleared on return to text".into());
+                        }
+                        master.write_all(b"n\n").map_err(|e| e.to_string())?;
+                        text_released = true;
+                    }
+                }
+                Ok(())
+            },
+        );
+        assert_eq!(
+            frames, 9,
+            "{backend}: missed RGB/geometry/layout/resize/resume/kind invalidation"
+        );
+        for query in [
+            b"\x1b[16t".as_slice(),
+            b"\x1b[14t",
+            b"\x1b[?2;1;0S",
+            b"\x1b[c",
+        ] {
+            assert!(
+                !capture.windows(query.len()).any(|p| p == query),
+                "output-only input ownership"
+            );
+        }
+        if backend == "iterm2" {
+            assert!(
+                !capture.windows(8).any(|p| p == b"?80;1070"),
+                "iTerm2 changed sixel modes"
+            );
+        }
+    }
+}
+
+#[test]
+fn public_sixel_layout_resamples_both_modes_and_redraws_retained_frames() {
+    let fixture = Fixture::build("session_fixture", true, false);
+    capture_sixel(
+        &fixture,
+        "geometry",
+        &[
+            (960, 720, 0),   // 80 cells at 12 pixels per cell, not native 320x200.
+            (960, 720, 1),   // 640-dot mode occupies exactly the same rectangle.
+            (480, 270, 1),   // Active layout-only change redraws retained pixels.
+            (480, 270, 1),   // Invalid setters are atomic; resume preserves layout.
+            (1920, 1920, 1), // Suspended setter accepts maximum columns/aspect.
+            (960, 720, 1),   // Suspended update survives resume.
+            (480, 360, 1),   // Pixel-only resize without a new submission.
+            (321, 241, 1),   // Height fit rounds down, including partial sixel band.
+            (480, 360, 1),   // Width fit when fewer than 80 cells are available.
+            (4096, 3072, 1), // Huge pixel metrics respect the encoder width limit.
+            (3072, 4096, 1), // Portrait layout respects the encoder height limit.
+            (819, 1, 1),     // Extreme valid aspect cannot round height to zero.
+            (960, 720, 0),   // A new session restores all default layout values.
+        ],
+    );
+}
+
+#[test]
+fn public_sixel_output_only_falls_back_without_probes_or_consuming_input() {
+    let fixture = Fixture::build("session_fixture", true, false);
+    capture_sixel(&fixture, "fallback", &[(640, 480, 0)]);
+}
+
+#[test]
+fn explicit_sixel_queries_metrics_and_refits_after_grid_resize() {
+    let fixture = Fixture::build("session_fixture", true, false);
+    capture_sixel(
+        &fixture,
+        "query-cell",
+        &[(960, 720, 0), (320, 240, 0), (480, 360, 0)],
+    );
+    capture_sixel(&fixture, "query-window", &[(960, 720, 0), (320, 240, 0)]);
+}
+
 fn resolved_text_matches(terminal: &Terminal, stage: usize) -> bool {
     let (cells, source) = terminal.cells();
     if source != "active_alternate" {

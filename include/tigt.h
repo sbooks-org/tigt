@@ -92,12 +92,14 @@ void tigt_input_feed(tigt_input *input, const uint8_t *bytes, size_t length);
 void tigt_input_flush(tigt_input *input);
 void tigt_input_destroy(tigt_input *input);
 
-/* Bitmap output policy. Explicit modes never silently fall back. */
+/* Bitmap output policy. Explicit modes never silently fall back. AUTO probes
+ * for sixel, then selects Blocks for UTF-8 or ASCII; it never selects iTerm2. */
 typedef enum {
     TIGT_GRAPHICS_AUTO = 0,
     TIGT_GRAPHICS_BLOCKS = 1,
     TIGT_GRAPHICS_SIXEL = 2,
     TIGT_GRAPHICS_ASCII = 3,
+    TIGT_GRAPHICS_ITERM2 = 4,
 } tigt_graphics_mode;
 
 typedef struct tigt_config {
@@ -118,10 +120,33 @@ void tigt_suspend(void);
 void tigt_shutdown(void);
 /* Resolved mode: AUTO before resolution and after shutdown. Resume resolves
  * again. The requested mode remains unchanged for the lifetime of a session.
- * Explicit unavailable modes return TIGT_ERROR_TERMINAL at init/resume. */
+ * Unavailable cell modes return TIGT_ERROR_TERMINAL at init/resume. Explicit
+ * SIXEL/ITERM2 trust the caller's choice of a supporting terminal; iTerm2
+ * support is not probed. */
 uint32_t tigt_get_graphics_mode(void);
 /* AUTO when no session exists. There is no runtime mode setter. */
 uint32_t tigt_get_requested_graphics_mode(void);
+/* Sixel and iTerm2 presentation only: native frames/snapshots and Blocks/ASCII
+ * are unchanged. Request columns 1..320 and a nonzero display aspect ratio
+ * (aspect_width:aspect_height, each 1..65535). Defaults are 80 columns and 4:3.
+ * Both native bitmap widths fill the same target rectangle. Sixel resamples
+ * with nearest-neighbor scaling; iTerm2 sends a native logical-resolution PNG
+ * for terminal-side scaling. The target uses ioctl pixel width/columns, then a
+ * queried cell width, then queried text-area pixel width/columns. Without width
+ * metrics, it uses a fixed 640-pixel target width, not a measured 80-column
+ * rectangle. The target is aspect-corrected and fitted to known terminal pixel
+ * bounds and 4096 pixels per axis, rounding down to at least 1. Reported sixel
+ * limits apply only to sixel. Queries require owned input on the output TTY:
+ * AUTO/SIXEL query geometry and sixel capabilities/limits; ITERM2 queries only
+ * geometry (14t/16t). Output-only sessions use ioctl geometry without probing
+ * or reading stdin.
+ *
+ * An initialized active OR suspended session is required; otherwise ARGUMENT.
+ * Invalid arguments return ARGUMENT atomically. Changes schedule the unchanged
+ * current image frame for redraw. Serialize with submissions when ordering
+ * matters; updates are synchronized with rendering and may run on a producer thread.
+ * Suspend/resume preserve the layout; init/shutdown restore the defaults. */
+int tigt_set_image_layout(uint16_t columns, uint16_t aspect_width, uint16_t aspect_height);
 typedef struct {
     uint32_t codepoint;
     uint32_t foreground;
@@ -156,15 +181,20 @@ typedef struct {
  * bitmap pixels ignore the high byte for compatibility with native buffers.
  * Native bitmap RGB is retained exactly. Sixel preserves up to 256 colours
  * within its percentage-channel precision and quantizes larger colour sets;
- * cell backends approximate colours using terminal capabilities.
+ * iTerm2 normalizes to a 320x200 RGB PNG (640-wide pairs averaged per channel,
+ * rounded up; 160-wide pixels duplicated). Native snapshots remain unchanged.
+ * Cell backends approximate colours using terminal capabilities. Identical resolved bitmap
+ * submissions do not schedule redraws: high bytes and row padding are ignored,
+ * but all backing pixels, dimensions, pixel_width and text/bitmap transitions
+ * participate. Layout changes, resize and resume still invalidate the display.
  *
  * Bitmap stride is in pixels. Width320/640, height200, pixel_width1/2
  * (backing pixels per terminal logical pixel). Blocks/ASCII may use terminal
  * defaults only with at most three distinct source RGB values, all black,
  * white, or neutral grey with R=G=B in 129..254. All source pixels participate,
  * including horizontally skipped pixels. Grey maps to regular foreground and
- * white to intense foreground. Sixel always uses explicit RGB, never theme
- * foreground/bold colours.
+ * white to intense foreground. Sixel and iTerm2 always use explicit RGB, never
+ * theme foreground/bold colours.
  * 160x200 can be expanded horizontally by the caller, as for PCjr video. */
 int tigt_present_bitmap(const uint32_t *pixels, uint16_t width, uint16_t height,
                         uint16_t stride, uint8_t pixel_width);

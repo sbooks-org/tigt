@@ -15,7 +15,7 @@ xcode-select --install
 brew install cmake libpng pkg-config
 ```
 
-The macOS SDK supplies curses. Linux needs wide-character curses. For block graphics, use a UTF-8 locale and a terminal with Unicode sextants and 256-colour support. Sixel-capable terminals can display raster graphics; non-UTF-8 terminals can use optional libcaca ASCII conversion. A current stable Rust toolchain is required for Rust consumers and the complete test suite.
+The macOS SDK supplies curses. Linux needs wide-character curses. For block graphics, use a UTF-8 locale and a terminal with Unicode sextants and 256-colour support. Terminals supporting sixel or the iTerm2 image protocol can display raster graphics; non-UTF-8 terminals can use optional libcaca ASCII conversion. A current stable Rust toolchain is required for Rust consumers and the complete test suite.
 
 Libcaca is **off by default** and is not needed by normal builds. To enable ASCII graphics or run `cargo test --all-features`, install `libcaca-dev` on Debian/Ubuntu or `brew install libcaca` on macOS. Enabling the feature requires pkg-config metadata named `caca`; configuration fails if it is missing.
 
@@ -113,6 +113,7 @@ Existing runnable examples:
 
 ```sh
 cargo run --example demo -- --graphics auto
+cargo run --example demo -- --graphics iterm2
 cargo run --example demo --features libcaca -- --graphics ascii
 cargo run --example keyboard --features keyboard
 cargo run --example snapshot -- /tmp/tigt-snapshot.json
@@ -120,7 +121,9 @@ cargo run --example snapshot -- /tmp/tigt-snapshot.json
 
 The keyboard example demonstrates physical PC key press/release events, decoded independently of a display session. The snapshot example demonstrates instrumentation; see its printed process information and [the instrumentation guide](instrumentation.md).
 
-Both C and Rust demos accept `--graphics auto|blocks|sixel|ascii`; the C demo also accepts `--once`. For API selection, set `tigt_config.graphics_mode` or call `Session::new_with_graphics(GraphicsMode::Blocks)` / `Session::with_input_and_graphics(mode, handler)`. Read the requested and resolved selections through `tigt_get_requested_graphics_mode()` / `tigt_get_graphics_mode()` or the corresponding session methods. Explicit choices never silently fall back. Auto probes for sixel only with an input callback and the same input/output terminal; output-only sessions use UTF-8 blocks or libcaca ASCII directly. See [bitmap frames](reference.md#bitmap-frames) for detection, theme eligibility and explicit sixel colour policy.
+Both C and Rust demos accept `--graphics auto|blocks|sixel|ascii|iterm2`; the C demo also accepts `--once`. For API selection, set `tigt_config.graphics_mode` or call `Session::new_with_graphics(GraphicsMode::Iterm2)` / `Session::with_input_and_graphics(mode, handler)`. Read the requested and resolved selections through `tigt_get_requested_graphics_mode()` / `tigt_get_graphics_mode()` or the corresponding session methods. Explicit choices never silently fall back. Auto probes for sixel only with an input callback and the same input/output terminal; output-only sessions use UTF-8 blocks or libcaca ASCII directly. iTerm2 is explicit only. See [bitmap frames](reference.md#bitmap-frames) for detection, theme eligibility and image colour policies.
+
+Sixel and iTerm2 default to an 80-column-wide, 4:3 display rectangle, fitted to the terminal. Set a different target after initialization with `tigt_set_image_layout(60, 16, 9)` in C or `session.set_image_layout(60, 16, 9)?` in Rust. Sixel resamples on the host; iTerm2 sends 320×200 RGB PNGs for terminal-side enlargement, averaging 640-wide pixel pairs and duplicating 160-wide pixels. This changes presentation, not the native framebuffer or snapshots. Identical bitmap submissions do not redraw. Without usable pixel-width metrics, the target falls back to 640 pixels; see the reference for output-only ownership and resize behavior.
 
 ## Glass-TTY output without curses
 

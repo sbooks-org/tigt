@@ -51,6 +51,8 @@ pub enum GraphicsMode {
     Blocks = 1,
     Sixel = 2,
     Ascii = 3,
+    /// Aspect-normalized 320x200 PNG; requires iTerm2 image support.
+    Iterm2 = 4,
 }
 
 impl GraphicsMode {
@@ -60,6 +62,7 @@ impl GraphicsMode {
             1 => Self::Blocks,
             2 => Self::Sixel,
             3 => Self::Ascii,
+            4 => Self::Iterm2,
             _ => unreachable!("C returned an invalid graphics mode"),
         }
     }
@@ -281,6 +284,28 @@ impl Session {
         GraphicsMode::from_raw(unsafe { ffi::tigt_get_graphics_mode() })
     }
 
+    /// Sets sixel/iTerm2 target width in terminal columns and display aspect ratio.
+    ///
+    /// Defaults to 80 columns at 4:3, independently of the source resolution.
+    /// Output fits the terminal's known pixel bounds and a 4096-pixel limit:
+    /// sixel uses nearest-neighbor resampling, iTerm2 scales in the terminal.
+    /// Without usable pixel metrics, the target width
+    /// is 640 pixels rather than an assumed character-cell measurement.
+    ///
+    /// `columns` must be 1..=320 and both aspect components must be nonzero.
+    /// Invalid values leave the layout unchanged. Changes redraw the latest
+    /// frame without another submission, survive suspend/resume, and do not
+    /// affect native snapshots or the blocks/ASCII backends.
+    pub fn set_image_layout(
+        &self,
+        columns: u16,
+        aspect_width: u16,
+        aspect_height: u16,
+    ) -> Result<(), Error> {
+        self.input_status()?;
+        check_status(unsafe { ffi::tigt_set_image_layout(columns, aspect_width, aspect_height) })
+    }
+
     /// Reports asynchronous input-handler failure without touching curses.
     /// A successful result is a snapshot, not a promise about future callbacks.
     pub fn input_status(&self) -> Result<(), Error> {
@@ -306,6 +331,11 @@ impl Session {
     /// logical terminal pixel. Padding after the last row is not required.
     /// Native snapshots retain exact RGB. Sixel preserves up to 256 colours
     /// within its percentage-channel precision; larger sets are quantized.
+    /// iTerm2 sends 320x200 RGB8: 640-wide logical pixels are averaged in pairs
+    /// (per channel, rounded up), 160-wide pixels duplicated, 320-wide unchanged.
+    /// Further display scaling belongs to the terminal; native snapshots are unaffected.
+    /// Identical resolved RGB/geometry does not redraw; padding and high bytes
+    /// are ignored. Layout, resize, resume and text/bitmap transitions still redraw.
     pub fn present_bitmap(
         &self,
         pixels: &[u32],

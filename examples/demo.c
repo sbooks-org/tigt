@@ -31,12 +31,13 @@ int main(int argc, char **argv)
             else if (!strcmp(mode, "blocks")) graphics = TIGT_GRAPHICS_BLOCKS;
             else if (!strcmp(mode, "sixel")) graphics = TIGT_GRAPHICS_SIXEL;
             else if (!strcmp(mode, "ascii")) graphics = TIGT_GRAPHICS_ASCII;
+            else if (!strcmp(mode, "iterm2")) graphics = TIGT_GRAPHICS_ITERM2;
             else {
                 fprintf(stderr, "unknown graphics mode: %s\n", mode);
                 return 2;
             }
         } else {
-            fprintf(stderr, "usage: %s [--once] [--graphics auto|blocks|sixel|ascii]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--once] [--graphics auto|blocks|sixel|ascii|iterm2]\n", argv[0]);
             return !strcmp(argv[i], "--help") ? 0 : 2;
         }
     }

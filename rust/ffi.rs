@@ -46,6 +46,11 @@ unsafe extern "C" {
     pub(crate) fn tigt_shutdown();
     pub(crate) fn tigt_get_graphics_mode() -> u32;
     pub(crate) fn tigt_get_requested_graphics_mode() -> u32;
+    pub(crate) fn tigt_set_image_layout(
+        columns: u16,
+        aspect_width: u16,
+        aspect_height: u16,
+    ) -> c_int;
     pub(crate) fn tigt_present_bitmap(
         pixels: *const u32,
         width: u16,

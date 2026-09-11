@@ -6,6 +6,7 @@
 #include "tigt.h"
 
 #include <errno.h>
+#include <png.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -433,7 +434,7 @@ prepare_palette(const uint32_t *pixels, size_t count)
 /* Buffer protocol bytes ourselves: a run incurs neither a formatted-I/O call
  * nor stream locking per pixel.
  */
-struct sixel_writer {
+struct image_writer {
     FILE *output;
     size_t used;
     bool failed;
@@ -441,7 +442,7 @@ struct sixel_writer {
 };
 
 static void
-sixel_flush(struct sixel_writer *writer)
+image_flush(struct image_writer *writer)
 {
     if (!writer->failed && writer->used != 0 &&
         fwrite(writer->buffer, 1, writer->used, writer->output) != writer->used)
@@ -450,12 +451,12 @@ sixel_flush(struct sixel_writer *writer)
 }
 
 static void
-sixel_byte(struct sixel_writer *writer, char byte)
+image_byte(struct image_writer *writer, char byte)
 {
     if (writer->failed)
         return;
     if (writer->used == sizeof(writer->buffer)) {
-        sixel_flush(writer);
+        image_flush(writer);
         if (writer->failed)
             return;
     }
@@ -463,14 +464,14 @@ sixel_byte(struct sixel_writer *writer, char byte)
 }
 
 static void
-sixel_string(struct sixel_writer *writer, const char *text)
+image_string(struct image_writer *writer, const char *text)
 {
     while (*text != '\0')
-        sixel_byte(writer, *text++);
+        image_byte(writer, *text++);
 }
 
 static void
-sixel_number(struct sixel_writer *writer, unsigned value)
+image_number(struct image_writer *writer, unsigned value)
 {
     char digits[10];
     unsigned count = 0;
@@ -479,19 +480,19 @@ sixel_number(struct sixel_writer *writer, unsigned value)
         value /= 10;
     } while (value != 0);
     while (count != 0)
-        sixel_byte(writer, digits[--count]);
+        image_byte(writer, digits[--count]);
 }
 
 static void
-sixel_run(struct sixel_writer *writer, uint8_t mask, unsigned length)
+sixel_run(struct image_writer *writer, uint8_t mask, unsigned length)
 {
     if (length > 3) {
-        sixel_byte(writer, '!');
-        sixel_number(writer, length);
-        sixel_byte(writer, (char) ('?' + mask));
+        image_byte(writer, '!');
+        image_number(writer, length);
+        image_byte(writer, (char) ('?' + mask));
     } else {
         while (length-- != 0)
-            sixel_byte(writer, (char) ('?' + mask));
+            image_byte(writer, (char) ('?' + mask));
     }
 }
 
@@ -506,7 +507,7 @@ tigt_sixel_write(FILE *output, const uint32_t *pixels,
     if (ferror(output))
         return TIGT_ERROR_SYSTEM;
 
-    struct sixel_writer writer = {.output = output};
+    struct image_writer writer = {.output = output};
     const unsigned colors_count = prepare_palette(pixels, (size_t) width * height);
     uint16_t source_x[GRAPHICS_MAX_OUTPUT];
     for (unsigned x = 0; x < output_width; x++)
@@ -515,20 +516,20 @@ tigt_sixel_write(FILE *output, const uint32_t *pixels,
     /* P2=1 leaves unpainted pixels untouched; every in-bounds pixel below is
      * explicitly painted, while padding in the final band is not touched.
      */
-    sixel_string(&writer, "\033P0;1;0q\"1;1;");
-    sixel_number(&writer, output_width);
-    sixel_byte(&writer, ';');
-    sixel_number(&writer, output_height);
+    image_string(&writer, "\033P0;1;0q\"1;1;");
+    image_number(&writer, output_width);
+    image_byte(&writer, ';');
+    image_number(&writer, output_height);
     for (unsigned color = 0; color < colors_count; color++) {
         const uint32_t rgb = sixel.palette[color];
-        sixel_byte(&writer, '#');
-        sixel_number(&writer, color);
-        sixel_string(&writer, ";2;");
-        sixel_number(&writer, (((rgb >> 16) & 255u) * 100u + 127u) / 255u);
-        sixel_byte(&writer, ';');
-        sixel_number(&writer, (((rgb >> 8) & 255u) * 100u + 127u) / 255u);
-        sixel_byte(&writer, ';');
-        sixel_number(&writer, ((rgb & 255u) * 100u + 127u) / 255u);
+        image_byte(&writer, '#');
+        image_number(&writer, color);
+        image_string(&writer, ";2;");
+        image_number(&writer, (((rgb >> 16) & 255u) * 100u + 127u) / 255u);
+        image_byte(&writer, ';');
+        image_number(&writer, (((rgb >> 8) & 255u) * 100u + 127u) / 255u);
+        image_byte(&writer, ';');
+        image_number(&writer, ((rgb & 255u) * 100u + 127u) / 255u);
     }
 
     for (unsigned y = 0; y < output_height && !writer.failed; y += 6) {
@@ -550,10 +551,10 @@ tigt_sixel_write(FILE *output, const uint32_t *pixels,
             if (ends[color] == 0)
                 continue;
             if (!first)
-                sixel_byte(&writer, '$');
+                image_byte(&writer, '$');
             first = false;
-            sixel_byte(&writer, '#');
-            sixel_number(&writer, color);
+            image_byte(&writer, '#');
+            image_number(&writer, color);
             const uint8_t *plane = sixel.planes[color];
             const unsigned end = ends[color];
             for (unsigned x = 0; x < end;) {
@@ -565,11 +566,166 @@ tigt_sixel_write(FILE *output, const uint32_t *pixels,
             }
         }
         if (y + 6 < output_height)
-            sixel_byte(&writer, '-');
+            image_byte(&writer, '-');
     }
-    sixel_string(&writer, "\033\\");
-    sixel_flush(&writer);
+    image_string(&writer, "\033\\");
+    image_flush(&writer);
     if (writer.failed || fflush(output) == EOF || ferror(output))
+        return TIGT_ERROR_SYSTEM;
+    return TIGT_OK;
+}
+
+/* Stream PNG chunks directly through base64, retaining only a presentation RGB row,
+ * a partial base64 triplet and the shared writer's 4 KiB output buffer. Static
+ * storage also keeps callback mutations well-defined after libpng longjmp.
+ */
+static struct {
+    struct image_writer writer;
+    uint8_t row[640 * 3];
+    uint8_t pending[3];
+    unsigned pending_count;
+} iterm2;
+
+static void
+iterm2_base64(const uint8_t *bytes, unsigned count)
+{
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const uint32_t value = (uint32_t) bytes[0] << 16 |
+                           (count > 1 ? (uint32_t) bytes[1] << 8 : 0) |
+                           (count > 2 ? bytes[2] : 0);
+    image_byte(&iterm2.writer, alphabet[value >> 18]);
+    image_byte(&iterm2.writer, alphabet[(value >> 12) & 63u]);
+    image_byte(&iterm2.writer, count > 1 ? alphabet[(value >> 6) & 63u] : '=');
+    image_byte(&iterm2.writer, count > 2 ? alphabet[value & 63u] : '=');
+}
+
+static void
+iterm2_png_write(png_structp png, png_bytep bytes, png_size_t length)
+{
+    if (iterm2.pending_count != 0) {
+        while (iterm2.pending_count < 3 && length != 0) {
+            iterm2.pending[iterm2.pending_count++] = *bytes++;
+            length--;
+        }
+        if (iterm2.pending_count == 3) {
+            iterm2_base64(iterm2.pending, 3);
+            iterm2.pending_count = 0;
+        }
+    }
+    while (length >= 3 && !iterm2.writer.failed) {
+        iterm2_base64(bytes, 3);
+        bytes += 3;
+        length -= 3;
+    }
+    if (iterm2.writer.failed)
+        png_error(png, "image write failed");
+    while (length != 0) {
+        iterm2.pending[iterm2.pending_count++] = *bytes++;
+        length--;
+    }
+}
+
+static void
+iterm2_png_flush(png_structp png)
+{
+    /* A libpng flush must not pad a partial triplet in the middle of base64. */
+    image_flush(&iterm2.writer);
+    if (iterm2.writer.failed || fflush(iterm2.writer.output) == EOF ||
+        ferror(iterm2.writer.output))
+        png_error(png, "image flush failed");
+}
+
+static void
+iterm2_png_failure(png_structp png, png_const_charp message)
+{
+    (void) message;
+    png_longjmp(png, 1);
+}
+
+static void
+iterm2_png_warning_ignore(png_structp png, png_const_charp message)
+{
+    (void) png;
+    (void) message;
+}
+
+int
+tigt_iterm2_write(FILE *output, const uint32_t *pixels,
+                  uint16_t width, uint16_t height, uint8_t pixel_width,
+                  uint16_t output_width, uint16_t output_height)
+{
+    if (output == NULL ||
+        !valid_bitmap(pixels, width, height, pixel_width, output_width, output_height, false))
+        return TIGT_ERROR_ARGUMENT;
+    if (ferror(output))
+        return TIGT_ERROR_SYSTEM;
+
+    png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL,
+                                              iterm2_png_failure, iterm2_png_warning_ignore);
+    if (png == NULL)
+        return TIGT_ERROR_SYSTEM;
+    png_infop info = png_create_info_struct(png);
+    if (info == NULL) {
+        png_destroy_write_struct(&png, NULL);
+        return TIGT_ERROR_SYSTEM;
+    }
+    if (setjmp(png_jmpbuf(png))) {
+        const int saved_errno = errno;
+        png_destroy_write_struct(&png, &info);
+        errno = saved_errno;
+        return TIGT_ERROR_SYSTEM;
+    }
+    iterm2.writer.output = output;
+    iterm2.writer.used = 0;
+    iterm2.writer.failed = false;
+    iterm2.pending_count = 0;
+    const unsigned logical_width = width / pixel_width;
+    /* Normalize CGA/PCjr pixel aspect in the PNG itself rather than relying
+     * solely on the terminal to stretch a 640x200 or 160x200 source. */
+    const unsigned duplicate = logical_width == 160;
+    const bool halve = logical_width == 640;
+    const unsigned png_width = halve ? logical_width / 2 : logical_width << duplicate;
+    const unsigned source_step = pixel_width * (halve ? 2 : 1);
+    png_set_write_fn(png, NULL, iterm2_png_write, iterm2_png_flush);
+    png_set_IHDR(png, info, png_width, height, 8, PNG_COLOR_TYPE_RGB,
+                 PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+    /* CGA presentation frames are small: avoid adaptive filtering and deep searches. */
+    png_set_filter(png, PNG_FILTER_TYPE_BASE, PNG_FILTER_NONE);
+    png_set_compression_level(png, 1);
+
+    image_string(&iterm2.writer, "\033]1337;File=inline=1;width=");
+    image_number(&iterm2.writer, output_width);
+    image_string(&iterm2.writer, "px;height=");
+    image_number(&iterm2.writer, output_height);
+    image_string(&iterm2.writer, "px;preserveAspectRatio=0;doNotMoveCursor=1:");
+    png_write_info(png, info);
+    for (unsigned y = 0; y < height; y++) {
+        const uint32_t *source = pixels + (size_t) y * width;
+        for (unsigned x = 0; x < png_width; x++) {
+            const unsigned source_x = (x >> duplicate) * source_step;
+            uint32_t rgb = source[source_x];
+            if (halve) {
+                /* Rounded RGB box average retains both halves of thin lines. */
+                const uint32_t next = source[source_x + pixel_width];
+                const unsigned red = (((rgb >> 16) & 255) + ((next >> 16) & 255) + 1) / 2;
+                const unsigned green = (((rgb >> 8) & 255) + ((next >> 8) & 255) + 1) / 2;
+                const unsigned blue = ((rgb & 255) + (next & 255) + 1) / 2;
+                rgb = (red << 16) | (green << 8) | blue;
+            }
+            iterm2.row[x * 3] = (uint8_t) (rgb >> 16);
+            iterm2.row[x * 3 + 1] = (uint8_t) (rgb >> 8);
+            iterm2.row[x * 3 + 2] = (uint8_t) rgb;
+        }
+        png_write_row(png, iterm2.row);
+    }
+    png_write_end(png, info);
+    png_destroy_write_struct(&png, &info);
+    if (iterm2.pending_count != 0)
+        iterm2_base64(iterm2.pending, iterm2.pending_count);
+    image_string(&iterm2.writer, "\033\\");
+    image_flush(&iterm2.writer);
+    if (iterm2.writer.failed || fflush(output) == EOF || ferror(output))
         return TIGT_ERROR_SYSTEM;
     return TIGT_OK;
 }

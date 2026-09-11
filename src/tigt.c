@@ -69,11 +69,19 @@ static uint64_t rendered_frame_serial;
 static bool terminal_default_colors_available;
 static uint32_t renderer_graphics_mode;
 static tigt_ascii *renderer_ascii;
-static bool rendered_sixel;
+static bool rendered_image;
 static struct winsize rendered_window;
+typedef struct {
+    uint16_t columns, aspect_width, aspect_height;
+} image_layout_t;
+static const image_layout_t default_image_layout = { 80, 4, 3 };
+static image_layout_t renderer_image_layout;
+/* Renderer-owned dimensions, calculated with the frame under renderer_mutex. */
+static uint16_t rendered_image_width, rendered_image_height;
 static struct {
     bool pending, sixel;
     uint16_t pixel_width, pixel_height, cell_width, cell_height;
+    uint16_t columns, rows;
     uint16_t max_width, max_height;
 } terminal_graphics;
 typedef enum {
@@ -340,69 +348,112 @@ set_cursor(bool visible)
 }
 
 /* Raw images and curses share one writer. Invalidate curses' physical-screen
- * model whenever an image is removed; erase() alone cannot remove a sixel. */
+ * model whenever an image is removed; erase() alone cannot remove raw images. */
 static void
-leave_sixel_graphics(void)
+leave_image_graphics(void)
 {
-    if (!rendered_sixel)
+    if (!rendered_image)
         return;
-    fputs("\033[?80;1070r\033[0m\033[2J\033[H", stdout);
-    rendered_sixel = false;
+    if (renderer_graphics_mode == TIGT_GRAPHICS_SIXEL)
+        fputs("\033[?80;1070r", stdout);
+    fputs("\033[0m\033[2J\033[H", stdout);
+    rendered_image = false;
     rendered_cells_valid = false;
     terminal_cursor_position_valid = false;
     clearok(stdscr, true);
 }
 
-static void
-render_sixel_graphics(const uint32_t *pixels, uint16_t width, uint16_t height, uint8_t pixel_width)
+/* Called under renderer_mutex. Whole-window reports belong to the dimensions
+ * at probe time: infer cell metrics rather than reuse stale bounds on resize. */
+static uint64_t
+queried_pixel_extent(uint16_t pixels, uint16_t cell_pixels, uint16_t cells,
+                     uint16_t queried_cells)
 {
-    uint16_t output_width = width / pixel_width, output_height = height;
-    uint16_t available_width = rendered_window.ws_xpixel;
-    uint16_t available_height = rendered_window.ws_ypixel;
-    if (available_width == 0 && terminal_graphics.cell_width != 0)
-        available_width = (uint16_t) ((uint32_t) rendered_window.ws_col *
-                                     terminal_graphics.cell_width > 4096 ? 4096 :
-                                     rendered_window.ws_col * terminal_graphics.cell_width);
-    if (available_height == 0 && terminal_graphics.cell_height != 0)
-        available_height = (uint16_t) ((uint32_t) rendered_window.ws_row *
-                                      terminal_graphics.cell_height > 4096 ? 4096 :
-                                      rendered_window.ws_row * terminal_graphics.cell_height);
-    if (available_width == 0) available_width = terminal_graphics.pixel_width;
-    if (available_height == 0) available_height = terminal_graphics.pixel_height;
-    if (terminal_graphics.max_width != 0 &&
-        (available_width == 0 || terminal_graphics.max_width < available_width))
-        available_width = terminal_graphics.max_width;
-    if (terminal_graphics.max_height != 0 &&
-        (available_height == 0 || terminal_graphics.max_height < available_height))
-        available_height = terminal_graphics.max_height;
-    if (available_width != 0 && output_width > available_width) {
-        output_height = (uint16_t) ((uint32_t) output_height * available_width / output_width);
-        output_width = available_width;
+    if (cell_pixels != 0 && cells != 0)
+        return (uint64_t) cell_pixels * cells;
+    if (pixels != 0 && queried_cells != 0 && cells != 0) {
+        const uint64_t extent = (uint64_t) pixels * cells / queried_cells;
+        return extent != 0 ? extent : 1;
     }
-    if (available_height != 0 && output_height > available_height) {
-        output_width = (uint16_t) ((uint32_t) output_width * available_height / output_height);
-        output_height = available_height;
+    return cells == queried_cells ? pixels : 0;
+}
+
+static void
+size_image_graphics(const struct winsize *window)
+{
+    const image_layout_t layout = renderer_image_layout;
+    uint64_t target_width = 640;
+    if (window->ws_xpixel != 0 && window->ws_col != 0)
+        target_width = (uint64_t) layout.columns * window->ws_xpixel / window->ws_col;
+    else if (terminal_graphics.cell_width != 0)
+        target_width = (uint64_t) layout.columns * terminal_graphics.cell_width;
+    else if (terminal_graphics.pixel_width != 0 && terminal_graphics.columns != 0)
+        target_width = (uint64_t) layout.columns * terminal_graphics.pixel_width /
+                       terminal_graphics.columns;
+
+    uint64_t available_width = window->ws_xpixel;
+    uint64_t available_height = window->ws_ypixel;
+    if (available_width == 0)
+        available_width = queried_pixel_extent(terminal_graphics.pixel_width,
+                                               terminal_graphics.cell_width,
+                                               window->ws_col, terminal_graphics.columns);
+    if (available_height == 0)
+        available_height = queried_pixel_extent(terminal_graphics.pixel_height,
+                                                terminal_graphics.cell_height,
+                                                window->ws_row, terminal_graphics.rows);
+    uint64_t width = target_width != 0 ? target_width : 1;
+    uint64_t height = 4096;
+    if (width > 4096) width = 4096;
+    if (available_width != 0 && width > available_width) width = available_width;
+    if (available_height != 0 && height > available_height) height = available_height;
+    if (renderer_graphics_mode == TIGT_GRAPHICS_SIXEL) {
+        if (terminal_graphics.max_width != 0 && width > terminal_graphics.max_width)
+            width = terminal_graphics.max_width;
+        if (terminal_graphics.max_height != 0 && height > terminal_graphics.max_height)
+            height = terminal_graphics.max_height;
     }
-    if (output_width == 0) output_width = 1;
-    if (output_height == 0) output_height = 1;
-    if (!rendered_sixel || !rendered_cells_valid ||
+    /* Fit using the requested ratio directly, avoiding compounded rounding. */
+    if (width * layout.aspect_height <= height * layout.aspect_width)
+        height = width * layout.aspect_height / layout.aspect_width;
+    else
+        width = height * layout.aspect_width / layout.aspect_height;
+    rendered_image_width = (uint16_t) (width != 0 ? width : 1);
+    rendered_image_height = (uint16_t) (height != 0 ? height : 1);
+}
+
+static void
+render_image_graphics(const uint32_t *pixels, uint16_t width, uint16_t height, uint8_t pixel_width)
+{
+    const uint16_t output_width = rendered_image_width;
+    const uint16_t output_height = rendered_image_height;
+    if (!rendered_image || !rendered_cells_valid ||
         rendered_columns != output_width || rendered_rows != output_height) {
-        erase();
-        clearok(stdscr, true);
-        refresh();
+        rendered_cells_valid = false;
+        if (erase() == ERR || clearok(stdscr, true) == ERR || refresh() == ERR)
+            return;
     }
     set_cursor(false);
-    if (!rendered_sixel)
-        fputs("\033[?80;1070s\033[?80;1070h", stdout);
-    rendered_sixel = true;
-    fputs("\0337\033[H", stdout);
-    const int result = tigt_sixel_write(stdout, pixels, width, height,
-                                       pixel_width, output_width, output_height);
-    fputs("\0338", stdout);
+    int result = TIGT_OK;
+    if (!rendered_image && renderer_graphics_mode == TIGT_GRAPHICS_SIXEL &&
+        fputs("\033[?80;1070s\033[?80;1070h", stdout) == EOF)
+        result = TIGT_ERROR_SYSTEM;
+    /* Track partial output too, so text/suspend/exit still remove it. */
+    rendered_image = true;
+    if (fputs("\0337\033[H", stdout) == EOF)
+        result = TIGT_ERROR_SYSTEM;
+    if (result == TIGT_OK) {
+        result = renderer_graphics_mode == TIGT_GRAPHICS_ITERM2 ?
+            tigt_iterm2_write(stdout, pixels, width, height, pixel_width,
+                              output_width, output_height) :
+            tigt_sixel_write(stdout, pixels, width, height, pixel_width,
+                             output_width, output_height);
+    }
+    if (fputs("\0338", stdout) == EOF)
+        result = TIGT_ERROR_SYSTEM;
     const int flushed = fflush(stdout);
     rendered_columns = output_width;
     rendered_rows = output_height;
-    rendered_cells_valid = result == TIGT_OK && flushed == 0;
+    rendered_cells_valid = result == TIGT_OK && flushed == 0 && !ferror(stdout);
     terminal_cursor_position_valid = false;
 }
 
@@ -507,14 +558,15 @@ render_bitmap_graphics(const uint32_t *pixels, uint16_t width, uint16_t height,
 
     static const uint32_t black[640 * 200];
     if (!display_enabled) pixels = black;
+    if (renderer_graphics_mode == TIGT_GRAPHICS_SIXEL ||
+        renderer_graphics_mode == TIGT_GRAPHICS_ITERM2) {
+        render_image_graphics(pixels, width, height, pixel_width);
+        return;
+    }
+    leave_image_graphics();
     const bool themed = bitmap_is_themed(pixels, (size_t) width * height);
     const terminal_palette_t palette = themed ? TERMINAL_PALETTE_BITMAP_THEMED :
                                                TERMINAL_PALETTE_BITMAP_EXPLICIT;
-    if (renderer_graphics_mode == TIGT_GRAPHICS_SIXEL) {
-        render_sixel_graphics(pixels, width, height, pixel_width);
-        return;
-    }
-    leave_sixel_graphics();
     select_terminal_palette(palette);
     if (renderer_graphics_mode == TIGT_GRAPHICS_ASCII) {
         render_ascii_graphics(pixels, width, height, pixel_width, palette);
@@ -627,7 +679,7 @@ render_text(const tigt_text_cell *cells, uint16_t columns, uint16_t rows, bool c
 {
     bool changed = false;
     uint16_t cursor_position = UINT16_MAX;
-    leave_sixel_graphics();
+    leave_image_graphics();
 
     select_terminal_palette(TERMINAL_PALETTE_TEXT);
     if (!rendered_cells_valid || rendered_columns != columns || rendered_rows != rows) {
@@ -742,6 +794,9 @@ render_frame(void)
     const bool cursor_allowed = renderer_display_technology != TIGT_DISPLAY_MDA ||
                                 renderer_text_output_seen;
     copy_native_frame(&snapshot);
+    if (snapshot.bitmap && (renderer_graphics_mode == TIGT_GRAPHICS_SIXEL ||
+                            renderer_graphics_mode == TIGT_GRAPHICS_ITERM2))
+        size_image_graphics(&rendered_window);
     pthread_mutex_unlock(&renderer_mutex);
 
     if (snapshot.bitmap)
@@ -749,7 +804,7 @@ render_frame(void)
                                snapshot.pixel_width, true);
     else
         render_text(snapshot.content.cells, snapshot.width, snapshot.height, cursor_allowed);
-    rendered_frame_serial = frame_serial;
+    if (rendered_cells_valid) rendered_frame_serial = frame_serial;
 }
 
 
@@ -833,7 +888,7 @@ stop_session(void)
         terminal_keyboard_enabled = false;
     }
     if (renderer_screen != NULL) {
-        leave_sixel_graphics();
+        leave_image_graphics();
         fputs("\033[0 q", stdout);
         curs_set(1);
         endwin();
@@ -871,11 +926,13 @@ terminal_report(const char *parameters, uint8_t final, void *user)
     }
     pthread_mutex_lock(&renderer_mutex);
     if (terminal_graphics.pending) {
-        if (private && final == 'c' && count >= 2 &&
+        if (renderer_config.graphics_mode != TIGT_GRAPHICS_ITERM2 &&
+            private && final == 'c' && count >= 2 &&
             (values[0] == 12 || (values[0] >= 62 && values[0] <= 65))) {
             for (size_t index = 1; index < count; index++)
                 if (values[index] == 4) terminal_graphics.sixel = true;
-        } else if (private && final == 'S' && count == 4 &&
+        } else if (renderer_config.graphics_mode != TIGT_GRAPHICS_ITERM2 &&
+                   private && final == 'S' && count == 4 &&
                    values[0] == 2 && values[1] == 0 && values[2] != 0 && values[3] != 0) {
             terminal_graphics.sixel = true;
             terminal_graphics.max_width = values[2];
@@ -900,14 +957,18 @@ resolve_graphics_mode(void)
     const char *codeset = nl_langinfo(CODESET);
     const bool utf8 = strcmp(codeset, "UTF-8") == 0 || strcmp(codeset, "UTF8") == 0;
     struct stat input, output;
-    const bool probe = selected == TIGT_GRAPHICS_AUTO && renderer_input != NULL &&
+    const bool probe = (selected == TIGT_GRAPHICS_AUTO || selected == TIGT_GRAPHICS_SIXEL ||
+                        selected == TIGT_GRAPHICS_ITERM2) &&
+                       renderer_input != NULL &&
                        fstat(STDIN_FILENO, &input) == 0 && fstat(STDOUT_FILENO, &output) == 0 &&
                        input.st_rdev == output.st_rdev && input.st_ino == output.st_ino;
     if (probe) {
         pthread_mutex_lock(&renderer_mutex);
         terminal_graphics.pending = true;
         pthread_mutex_unlock(&renderer_mutex);
-        if (fputs("\033[16t\033[14t\033[?2;1;0S\033[c", stdout) == EOF || fflush(stdout) == EOF)
+        const char *query = selected == TIGT_GRAPHICS_ITERM2 ?
+                            "\033[16t\033[14t" : "\033[16t\033[14t\033[?2;1;0S\033[c";
+        if (fputs(query, stdout) == EOF || fflush(stdout) == EOF)
             return TIGT_ERROR_SYSTEM;
         struct timespec start, now;
         if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) return TIGT_ERROR_SYSTEM;
@@ -955,6 +1016,29 @@ tigt_get_requested_graphics_mode(void)
 }
 
 int
+tigt_set_image_layout(uint16_t columns, uint16_t aspect_width, uint16_t aspect_height)
+{
+    if (columns == 0 || columns > TERMINAL_MAX_COLUMNS ||
+        aspect_width == 0 || aspect_height == 0)
+        return TIGT_ERROR_ARGUMENT;
+    pthread_mutex_lock(&renderer_mutex);
+    if (!renderer_initialized) {
+        pthread_mutex_unlock(&renderer_mutex);
+        return TIGT_ERROR_ARGUMENT;
+    }
+    if (renderer_image_layout.columns != columns ||
+        renderer_image_layout.aspect_width != aspect_width ||
+        renderer_image_layout.aspect_height != aspect_height) {
+        renderer_image_layout = (image_layout_t) { columns, aspect_width, aspect_height };
+        if (renderer_graphics_mode == TIGT_GRAPHICS_SIXEL ||
+            renderer_graphics_mode == TIGT_GRAPHICS_ITERM2)
+            renderer_frame_serial++;
+    }
+    pthread_mutex_unlock(&renderer_mutex);
+    return TIGT_OK;
+}
+
+int
 tigt_resume(void)
 {
     static const int application_signals[] = { SIGINT, SIGQUIT, SIGTSTP };
@@ -987,9 +1071,15 @@ tigt_resume(void)
         sigaction(application_signals[index], &saved_signals[index], NULL);
     if (renderer_screen == NULL)
         goto failure;
-    memset(&terminal_graphics, 0, sizeof(terminal_graphics));
     memset(&rendered_window, 0, sizeof(rendered_window));
     ioctl(STDOUT_FILENO, TIOCGWINSZ, &rendered_window);
+    if (rendered_window.ws_col == 0) rendered_window.ws_col = COLS;
+    if (rendered_window.ws_row == 0) rendered_window.ws_row = LINES;
+    pthread_mutex_lock(&renderer_mutex);
+    memset(&terminal_graphics, 0, sizeof(terminal_graphics));
+    terminal_graphics.columns = rendered_window.ws_col;
+    terminal_graphics.rows = rendered_window.ws_row;
+    pthread_mutex_unlock(&renderer_mutex);
     rendered_cells_valid = false;
     terminal_palette = TERMINAL_PALETTE_INVALID;
     memset(cga_pair_initialized, 0, sizeof(cga_pair_initialized));
@@ -1057,7 +1147,7 @@ int
 tigt_init(const tigt_config *config)
 {
     if (config == NULL || config->abi_version != TIGT_ABI_VERSION ||
-        config->graphics_mode > TIGT_GRAPHICS_ASCII)
+        config->graphics_mode > TIGT_GRAPHICS_ITERM2)
         return TIGT_ERROR_ARGUMENT;
     if (renderer_initialized)
         return TIGT_ERROR_BUSY;
@@ -1069,6 +1159,7 @@ tigt_init(const tigt_config *config)
     memset(&renderer_overscan, 0, sizeof(renderer_overscan));
     renderer_display_technology = TIGT_DISPLAY_GENERIC;
     renderer_text_output_seen = false;
+    renderer_image_layout = default_image_layout;
     renderer_frame_serial = 0;
     rendered_frame_serial = 0;
     renderer_initialized = true;
@@ -1080,9 +1171,12 @@ tigt_init(const tigt_config *config)
     if (result != TIGT_OK) {
         stop_session();
         tigt_snapshot_session_stop(true);
+        pthread_mutex_lock(&renderer_mutex);
         renderer_initialized = false;
+        renderer_image_layout = default_image_layout;
         memset(&renderer_config, 0, sizeof(renderer_config));
         renderer_graphics_mode = TIGT_GRAPHICS_AUTO;
+        pthread_mutex_unlock(&renderer_mutex);
     }
     return result;
 }
@@ -1102,6 +1196,7 @@ tigt_shutdown(void)
     renderer_display_technology = TIGT_DISPLAY_GENERIC;
     renderer_text_output_seen = false;
     renderer_graphics_mode = TIGT_GRAPHICS_AUTO;
+    renderer_image_layout = default_image_layout;
     memset(&renderer_config, 0, sizeof(renderer_config));
     pthread_mutex_unlock(&renderer_mutex);
 }
@@ -1120,13 +1215,23 @@ tigt_present_bitmap(const uint32_t *pixels, uint16_t width, uint16_t height,
         pthread_mutex_unlock(&renderer_mutex);
         return TIGT_ERROR_BUSY;
     }
-    for (uint16_t row = 0; row < height; row++)
-        memcpy(renderer_bitmap_pixels + row * width, pixels + (size_t) row * stride, width * sizeof(*pixels));
+    bool changed = !renderer_bitmap_valid || renderer_bitmap_width != width ||
+                   renderer_bitmap_pixel_width != pixel_width;
+    for (uint16_t row = 0; row < height; row++) {
+        for (uint16_t column = 0; column < width; column++) {
+            const size_t index = (size_t) row * width + column;
+            const uint32_t rgb = pixels[(size_t) row * stride + column] & 0xffffff;
+            if (renderer_bitmap_pixels[index] != rgb) {
+                renderer_bitmap_pixels[index] = rgb;
+                changed = true;
+            }
+        }
+    }
     renderer_bitmap_width = width;
     renderer_bitmap_pixel_width = pixel_width;
     renderer_bitmap_valid = true;
     renderer_has_frame = true;
-    renderer_frame_serial++;
+    if (changed) renderer_frame_serial++;
     pthread_mutex_unlock(&renderer_mutex);
     return TIGT_OK;
 }
@@ -1155,15 +1260,23 @@ tigt_present_indexed_bitmap(const uint8_t *indices, uint16_t width, uint16_t hei
         pthread_mutex_unlock(&renderer_mutex);
         return TIGT_ERROR_BUSY;
     }
-    for (uint16_t row = 0; row < height; row++)
-        for (uint16_t column = 0; column < width; column++)
-            renderer_bitmap_pixels[(size_t) row * width + column] =
-                palette[indices[(size_t) row * stride + column]];
+    bool changed = !renderer_bitmap_valid || renderer_bitmap_width != width ||
+                   renderer_bitmap_pixel_width != pixel_width;
+    for (uint16_t row = 0; row < height; row++) {
+        for (uint16_t column = 0; column < width; column++) {
+            const size_t index = (size_t) row * width + column;
+            const uint32_t rgb = palette[indices[(size_t) row * stride + column]];
+            if (renderer_bitmap_pixels[index] != rgb) {
+                renderer_bitmap_pixels[index] = rgb;
+                changed = true;
+            }
+        }
+    }
     renderer_bitmap_width = width;
     renderer_bitmap_pixel_width = pixel_width;
     renderer_bitmap_valid = true;
     renderer_has_frame = true;
-    renderer_frame_serial++;
+    if (changed) renderer_frame_serial++;
     pthread_mutex_unlock(&renderer_mutex);
     return TIGT_OK;
 }
