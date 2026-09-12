@@ -64,6 +64,16 @@ static struct termios saved_input_termios;
 static struct termios saved_output_termios;
 static bool terminal_modes_saved;
 static bool terminal_keyboard_enabled;
+static bool terminal_mouse_enabled;
+/* Negotiated protocol and published display geometry are protected by renderer_mutex. */
+static uint32_t terminal_mouse_mode;
+static bool terminal_mouse_pixels;
+static struct {
+    bool valid, pixels;
+    uint16_t width, height, columns, rows;
+    double scale_x, scale_y, cell_width, cell_height;
+} pointer_projection;
+static const char mouse_modes_reset[] = "\033[?9;1000;1002;1003;1005;1006;1015;1016l";
 static uint64_t renderer_frame_serial;
 static uint64_t rendered_frame_serial;
 static bool terminal_default_colors_available;
@@ -357,6 +367,9 @@ leave_image_graphics(void)
     if (renderer_graphics_mode == TIGT_GRAPHICS_SIXEL)
         fputs("\033[?80;1070r", stdout);
     fputs("\033[0m\033[2J\033[H", stdout);
+    /* Curses can write directly to the fd: drain stdio first, so cleanup
+     * cannot erase replacement text or the restored shell screen. */
+    fflush(stdout);
     rendered_image = false;
     rendered_cells_valid = false;
     terminal_cursor_position_valid = false;
@@ -770,6 +783,74 @@ tigt_snapshot_capture(tigt_native_frame *frame)
     return TIGT_OK;
 }
 
+/* Publish only completed output, never a frame merely submitted by a caller.
+ * The block renderer packs 2x3 logical pixels per cell; its final partial row
+ * must not stretch the source height across a rounded-up cell count. */
+static void
+publish_pointer_projection(const tigt_native_frame *frame)
+{
+    pthread_mutex_lock(&renderer_mutex);
+    pointer_projection.valid = rendered_cells_valid && rendered_columns != 0 && rendered_rows != 0;
+    pointer_projection.pixels = rendered_image;
+    pointer_projection.width = frame->bitmap ? frame->width / frame->pixel_width : frame->width;
+    pointer_projection.height = frame->height;
+    pointer_projection.columns = rendered_window.ws_col;
+    pointer_projection.rows = rendered_window.ws_row;
+    if (pointer_projection.valid) {
+        pointer_projection.scale_x = (double) pointer_projection.width / rendered_columns;
+        pointer_projection.scale_y = (double) pointer_projection.height / rendered_rows;
+        if (frame->bitmap && renderer_graphics_mode == TIGT_GRAPHICS_BLOCKS) {
+            pointer_projection.scale_x = 2;
+            pointer_projection.scale_y = 3;
+        }
+    }
+    pointer_projection.cell_width = rendered_window.ws_xpixel && rendered_window.ws_col ?
+        (double) rendered_window.ws_xpixel / rendered_window.ws_col :
+        terminal_graphics.cell_width ? terminal_graphics.cell_width :
+        terminal_graphics.columns ? (double) terminal_graphics.pixel_width / terminal_graphics.columns : 0;
+    pointer_projection.cell_height = rendered_window.ws_ypixel && rendered_window.ws_row ?
+        (double) rendered_window.ws_ypixel / rendered_window.ws_row :
+        terminal_graphics.cell_height ? terminal_graphics.cell_height :
+        terminal_graphics.rows ? (double) terminal_graphics.pixel_height / terminal_graphics.rows : 0;
+    pthread_mutex_unlock(&renderer_mutex);
+}
+
+static void
+terminal_mouse(const tigt_mouse_event *event, void *user)
+{
+    (void) user;
+    tigt_mouse_event mapped = *event;
+    pthread_mutex_lock(&renderer_mutex);
+    if ((event->flags & TIGT_MOUSE_POSITION_VALID) && pointer_projection.valid) {
+        const bool pixels = event->coordinates == TIGT_MOUSE_COORD_PIXELS;
+        const bool metrics = pointer_projection.cell_width > 0 && pointer_projection.cell_height > 0;
+        if (pixels == pointer_projection.pixels || metrics) {
+            double x = (double) event->x + 0.5, y = (double) event->y + 0.5;
+            bool visible = true;
+            if (!pixels)
+                visible = x < pointer_projection.columns && y < pointer_projection.rows;
+            else if (metrics)
+                visible = x < pointer_projection.columns * pointer_projection.cell_width &&
+                          y < pointer_projection.rows * pointer_projection.cell_height;
+            if (pixels && !pointer_projection.pixels) {
+                x /= pointer_projection.cell_width;
+                y /= pointer_projection.cell_height;
+            } else if (!pixels && pointer_projection.pixels) {
+                x *= pointer_projection.cell_width;
+                y *= pointer_projection.cell_height;
+            }
+            mapped.frame_x = x * pointer_projection.scale_x;
+            mapped.frame_y = y * pointer_projection.scale_y;
+            mapped.flags |= TIGT_MOUSE_FRAME_VALID;
+            if (visible && mapped.frame_x >= 0 && mapped.frame_y >= 0 &&
+                mapped.frame_x < pointer_projection.width && mapped.frame_y < pointer_projection.height)
+                mapped.flags |= TIGT_MOUSE_INSIDE_FRAME;
+        }
+    }
+    pthread_mutex_unlock(&renderer_mutex);
+    renderer_config.on_mouse(&mapped, renderer_config.mouse_user);
+}
+
 static void
 render_frame(void)
 {
@@ -797,6 +878,7 @@ render_frame(void)
     if (snapshot.bitmap && (renderer_graphics_mode == TIGT_GRAPHICS_SIXEL ||
                             renderer_graphics_mode == TIGT_GRAPHICS_ITERM2))
         size_image_graphics(&rendered_window);
+    pointer_projection.valid = false;
     pthread_mutex_unlock(&renderer_mutex);
 
     if (snapshot.bitmap)
@@ -805,6 +887,8 @@ render_frame(void)
     else
         render_text(snapshot.content.cells, snapshot.width, snapshot.height, cursor_allowed);
     if (rendered_cells_valid) rendered_frame_serial = frame_serial;
+    if (renderer_config.on_mouse != NULL)
+        publish_pointer_projection(&snapshot);
 }
 
 
@@ -881,12 +965,25 @@ stop_session(void)
         pthread_join(renderer_thread, NULL);
         renderer_thread_created = false;
     }
+    pthread_mutex_lock(&renderer_mutex);
+    pointer_projection.valid = false;
+    terminal_mouse_mode = TIGT_MOUSE_OFF;
+    terminal_mouse_pixels = false;
+    terminal_graphics.pending = false;
+    pthread_mutex_unlock(&renderer_mutex);
     tigt_input_destroy(renderer_input);
     renderer_input = NULL;
     if (terminal_keyboard_enabled) {
         fputs("\033[<u", stdout);
         terminal_keyboard_enabled = false;
     }
+    if (terminal_mouse_enabled) {
+        fputs(mouse_modes_reset, stdout);
+        fputs("\033[?9;1000;1002;1003;1005;1006;1015;1016r", stdout);
+        terminal_mouse_enabled = false;
+    }
+    /* Input mode restoration must precede curses' direct terminal writes. */
+    fflush(stdout);
     if (renderer_screen != NULL) {
         leave_image_graphics();
         fputs("\033[0 q", stdout);
@@ -913,6 +1010,7 @@ terminal_report(const char *parameters, uint8_t final, void *user)
     if (private) parameters++;
     unsigned values[32];
     size_t count = 0;
+    bool mode_report = false;
     while (*parameters != '\0') {
         if (count == 32 || *parameters < '0' || *parameters > '9') return;
         unsigned value = 0;
@@ -922,10 +1020,16 @@ terminal_report(const char *parameters, uint8_t final, void *user)
         } while (*parameters >= '0' && *parameters <= '9');
         values[count++] = value;
         if (*parameters == '\0') break;
+        if (final == 'y' && parameters[0] == '$' && parameters[1] == '\0') {
+            mode_report = true;
+            break;
+        }
         if (*parameters++ != ';' || *parameters == '\0') return;
     }
     pthread_mutex_lock(&renderer_mutex);
     if (terminal_graphics.pending) {
+        if (mode_report && private && count == 2 && values[0] == 1016)
+            terminal_mouse_pixels = values[1] >= 1 && values[1] <= 3;
         if (renderer_config.graphics_mode != TIGT_GRAPHICS_ITERM2 &&
             private && final == 'c' && count >= 2 &&
             (values[0] == 12 || (values[0] >= 62 && values[0] <= 65))) {
@@ -951,24 +1055,27 @@ terminal_report(const char *parameters, uint8_t final, void *user)
 }
 
 static int
-resolve_graphics_mode(void)
+resolve_terminal_modes(void)
 {
     uint32_t selected = renderer_config.graphics_mode;
     const char *codeset = nl_langinfo(CODESET);
     const bool utf8 = strcmp(codeset, "UTF-8") == 0 || strcmp(codeset, "UTF8") == 0;
     struct stat input, output;
-    const bool probe = (selected == TIGT_GRAPHICS_AUTO || selected == TIGT_GRAPHICS_SIXEL ||
-                        selected == TIGT_GRAPHICS_ITERM2) &&
-                       renderer_input != NULL &&
+    const bool graphics_probe = selected == TIGT_GRAPHICS_AUTO || selected == TIGT_GRAPHICS_SIXEL ||
+                                selected == TIGT_GRAPHICS_ITERM2;
+    const bool mouse = renderer_config.on_mouse != NULL;
+    const bool probe = (graphics_probe || mouse) && renderer_input != NULL &&
                        fstat(STDIN_FILENO, &input) == 0 && fstat(STDOUT_FILENO, &output) == 0 &&
                        input.st_rdev == output.st_rdev && input.st_ino == output.st_ino;
     if (probe) {
         pthread_mutex_lock(&renderer_mutex);
         terminal_graphics.pending = true;
         pthread_mutex_unlock(&renderer_mutex);
-        const char *query = selected == TIGT_GRAPHICS_ITERM2 ?
-                            "\033[16t\033[14t" : "\033[16t\033[14t\033[?2;1;0S\033[c";
-        if (fputs(query, stdout) == EOF || fflush(stdout) == EOF)
+        const char *query = graphics_probe && selected != TIGT_GRAPHICS_ITERM2 ?
+                            "\033[16t\033[14t\033[?2;1;0S\033[c" : "\033[16t\033[14t";
+        if (fputs(query, stdout) == EOF ||
+            (mouse && renderer_config.mouse_mode == TIGT_MOUSE_AUTO &&
+             fputs("\033[?1016$p", stdout) == EOF) || fflush(stdout) == EOF)
             return TIGT_ERROR_SYSTEM;
         struct timespec start, now;
         if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) return TIGT_ERROR_SYSTEM;
@@ -993,8 +1100,30 @@ resolve_graphics_mode(void)
     }
     pthread_mutex_lock(&renderer_mutex);
     renderer_graphics_mode = selected;
+    uint32_t mouse_mode = renderer_config.mouse_mode;
+    if (mouse_mode == TIGT_MOUSE_AUTO)
+        mouse_mode = terminal_mouse_pixels ? TIGT_MOUSE_PIXELS : TIGT_MOUSE_CELLS;
+    terminal_mouse_mode = mouse_mode;
     pthread_mutex_unlock(&renderer_mutex);
+    if (mouse) {
+        tigt_input_set_mouse_mode(renderer_input, mouse_mode);
+        const char *encoding = mouse_mode == TIGT_MOUSE_PIXELS ? "\033[?1006;1016h" :
+                               mouse_mode == TIGT_MOUSE_X10 ? "" : "\033[?1006h";
+        const char *tracking = mouse_mode == TIGT_MOUSE_X10 ? "\033[?9h" :
+                               "\033[?1000h\033[?1002h\033[?1003h";
+        if (fputs(encoding, stdout) == EOF || fputs(tracking, stdout) == EOF || fflush(stdout) == EOF)
+            return TIGT_ERROR_SYSTEM;
+    }
     return TIGT_OK;
+}
+
+uint32_t
+tigt_get_mouse_mode(void)
+{
+    pthread_mutex_lock(&renderer_mutex);
+    const uint32_t mode = terminal_mouse_mode;
+    pthread_mutex_unlock(&renderer_mutex);
+    return mode;
 }
 
 uint32_t
@@ -1089,8 +1218,9 @@ tigt_resume(void)
     terminal_cursor_position_valid = false;
     if (has_colors() && start_color() == OK)
         terminal_default_colors_available = use_default_colors() == OK;
-    if (renderer_config.on_input != NULL) {
-        renderer_input = tigt_input_create(renderer_config.on_input, renderer_config.user);
+    if (renderer_config.on_input != NULL || renderer_config.on_mouse != NULL) {
+        renderer_input = tigt_input_create_with_mouse(renderer_config.on_input, renderer_config.user,
+            renderer_config.on_mouse != NULL ? terminal_mouse : NULL, NULL, renderer_config.mouse_mode);
         if (renderer_input == NULL) {
             result = TIGT_ERROR_SYSTEM;
             goto failure;
@@ -1098,9 +1228,18 @@ tigt_resume(void)
         tigt_input_set_terminal_report_callback(renderer_input, terminal_report, NULL);
         if (raw() == ERR || noecho() == ERR)
             goto failure;
-        terminal_keyboard_enabled = true;
-        if (fputs("\033[>u\033[=11;1u", stdout) == EOF || fflush(stdout) == EOF)
-            goto failure;
+        if (renderer_config.on_input != NULL) {
+            terminal_keyboard_enabled = true;
+            if (fputs("\033[>u\033[=11;1u", stdout) == EOF)
+                goto failure;
+        }
+        if (renderer_config.on_mouse != NULL) {
+            terminal_mouse_enabled = true;
+            if (fputs("\033[?9;1000;1002;1003;1005;1006;1015;1016s", stdout) == EOF ||
+                fputs(mouse_modes_reset, stdout) == EOF)
+                goto failure;
+        }
+        if (fflush(stdout) == EOF) goto failure;
     }
     curs_set(0);
     if (refresh() == ERR)
@@ -1115,7 +1254,7 @@ tigt_resume(void)
         }
         input_thread_created = true;
     }
-    result = resolve_graphics_mode();
+    result = resolve_terminal_modes();
     if (result != TIGT_OK) goto failure;
     atomic_store_explicit(&renderer_running, true, memory_order_relaxed);
     thread_error = pthread_create(&renderer_thread, NULL, renderer_main, NULL);
@@ -1147,7 +1286,8 @@ int
 tigt_init(const tigt_config *config)
 {
     if (config == NULL || config->abi_version != TIGT_ABI_VERSION ||
-        config->graphics_mode > TIGT_GRAPHICS_ITERM2)
+        config->graphics_mode > TIGT_GRAPHICS_ITERM2 || config->mouse_mode > TIGT_MOUSE_X10 ||
+        ((config->on_mouse == NULL) != (config->mouse_mode == TIGT_MOUSE_OFF)))
         return TIGT_ERROR_ARGUMENT;
     if (renderer_initialized)
         return TIGT_ERROR_BUSY;

@@ -222,7 +222,7 @@ impl<F> CallbackHandle<F> {
 
 impl<F> Drop for CallbackHandle<F> {
     fn drop(&mut self) {
-        // Both owners stop C callbacks before dropping this allocation.
+        // Owners stop C callbacks before dropping this allocation.
         unsafe { drop(Box::from_raw(self.raw.as_ptr())) };
     }
 }
@@ -231,15 +231,20 @@ pub(crate) unsafe extern "C" fn dispatch<F: FnMut(InputEvent)>(
     event: *const ffi::InputEvent,
     user: *mut c_void,
 ) {
-    // Both owners retain this stable Box until C stops calling it. C invokes
-    // each callback serially. Only this callback accesses handler; the owner
-    // reads failure concurrently through the atomic, never a mutable reference
-    // to the entire Callback. Live-session handlers additionally require Send.
+    let event = unsafe { event.as_ref() }.and_then(InputEvent::from_raw);
+    unsafe { dispatch_event::<F, InputEvent>(event, user) };
+}
+
+/// Dispatches a checked event using the shared callback ownership convention.
+///
+/// The owner retains its stable allocation until C stops callbacks. C invokes
+/// callbacks serially; only dispatch accesses the handler. The owner reads
+/// failure concurrently through the atomic. Live-session handlers require Send.
+pub(crate) unsafe fn dispatch_event<F: FnMut(E), E>(event: Option<E>, user: *mut c_void) {
     let state = unsafe { &*user.cast::<Callback<F>>() };
     if state.failure.load(Ordering::Acquire) != 0 {
         return;
     }
-    let event = unsafe { event.as_ref() }.and_then(InputEvent::from_raw);
     let Some(event) = event else {
         state.failure.store(2, Ordering::Release);
         return;
@@ -250,7 +255,7 @@ pub(crate) unsafe extern "C" fn dispatch<F: FnMut(InputEvent)>(
     if let Err(payload) = result {
         state.failure.store(1, Ordering::Release);
         // A panic payload can itself panic when dropped. Do not run its
-        // destructor at the C boundary. At most one payload leaks per decoder.
+        // destructor at the C boundary. At most one payload leaks per handler.
         std::mem::forget(payload);
     }
 }
@@ -265,6 +270,8 @@ pub(crate) unsafe extern "C" fn dispatch<F: FnMut(InputEvent)>(
 /// A panicking handler is disabled and subsequent operations return
 /// [`Error::CallbackPanicked`]; unwinding never crosses C (with panic=abort,
 /// Rust still aborts). This object is neither Send nor Sync.
+/// Handlers must not reenter or destroy their decoder or invoke C lifecycle
+/// operations.
 ///
 /// ```
 /// use tigt::{InputDecoder, InputKey};

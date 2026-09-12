@@ -12,7 +12,8 @@
 extern "C" {
 #endif
 
-/* Optional adapter: the application owns mapper and links pc-xt-keyboard.
+/* Optional adapter, available with TIGT_WITH_KEYBOARD. The application owns
+ * mapper; the tigt::tigt CMake target supplies the mapper and native libraries.
  * Both version-1 semantic event ABIs use the same numeric discriminants.
  * Copy fields, not object representations: no aliasing/layout assumption.
  * Capacity is in physical key-event slots, not bytes. The mapper validates it.

@@ -1,4 +1,5 @@
 /target/
+/keyboard/target/
 /build*/
 /dist/
 .DS_Store

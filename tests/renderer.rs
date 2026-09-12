@@ -1049,8 +1049,12 @@ fn bitmap_images_idle_until_rgb_or_presentation_changes() {
                 if !text_released && stage == Some(2) {
                     let since = text_since.get_or_insert_with(Instant::now);
                     if since.elapsed() >= Duration::from_millis(120) {
-                        if frames != 5 || !bytes[cursor..].windows(4).any(|p| p == b"\x1b[2J") {
-                            return Err("image not cleared on return to text".into());
+                        let text_output = &bytes[cursor..];
+                        let last_clear = text_output.windows(4).rposition(|p| p == b"\x1b[2J");
+                        let text = text_output.iter().position(|byte| *byte == b'X');
+                        if frames != 5 || !matches!((last_clear, text), (Some(clear), Some(text)) if clear < text)
+                        {
+                            return Err("image cleanup must precede replacement text".into());
                         }
                         master.write_all(b"n\n").map_err(|e| e.to_string())?;
                         text_released = true;
@@ -1063,6 +1067,32 @@ fn bitmap_images_idle_until_rgb_or_presentation_changes() {
             frames, 9,
             "{backend}: missed RGB/geometry/layout/resize/resume/kind invalidation"
         );
+        // Curses may write directly to the fd while image controls use stdio.
+        // Both suspend and shutdown must clear the image before restoring the
+        // shell, never flush a delayed clear into the normal screen afterward.
+        let (mut alternate, mut image_visible, mut exits) = (false, false, 0);
+        for offset in 0..capture.len() {
+            let output = &capture[offset..];
+            if output.starts_with(b"\x1b[?1049h") {
+                alternate = true;
+            } else if output.starts_with(b"\x1b[?1049l") {
+                assert!(
+                    !image_visible,
+                    "{backend}: image not cleared before terminal restoration"
+                );
+                alternate = false;
+                exits += 1;
+            } else if output.starts_with(b"\x1b[2J") {
+                assert!(
+                    alternate,
+                    "{backend}: image cleanup cleared the restored shell"
+                );
+                image_visible = false;
+            } else if output.starts_with(b"\x1bP") || output.starts_with(b"\x1b]1337;File=") {
+                image_visible = true;
+            }
+        }
+        assert_eq!(exits, 2, "{backend}: exercise both suspend and shutdown");
         for query in [
             b"\x1b[16t".as_slice(),
             b"\x1b[14t",
@@ -1444,4 +1474,262 @@ fn register_adapter_presents_text_and_cga_graphics_through_public_c_api() {
         stage, 3,
         "text and both CGA graphics modes must reach the terminal"
     );
+}
+
+#[test]
+fn mouse_decoder_preserves_fragmentation_order_and_real_leave_events() {
+    let fixture = Fixture::build("mouse_fixture", false, false);
+    let output = Command::new(&fixture.binary).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn live_mouse_maps_completed_frames_and_restores_shared_terminal_modes() {
+    let fixture = Fixture::build("mouse_session_fixture", true, false);
+    // Distinct contracts: probe fallback, pixel precision, unknown metrics,
+    // raster/cell conversion, press-only terminals, and libcaca's full viewport.
+    let mut cases = vec![
+        ("cell-fallback", 1, 1, false, true, false),
+        ("pixel-combined", 1, 1, true, true, true),
+        ("unknown-metrics", 1, 3, true, false, false),
+        ("sixel-pixels", 2, 1, true, true, false),
+        ("iterm2-cells", 4, 2, false, true, false),
+        ("x10-clicks", 1, 4, false, false, false),
+    ];
+    if cfg!(feature = "libcaca") {
+        cases.push(("ascii-pixels", 3, 1, true, true, false));
+    }
+    for (name, graphics, mode, pixels, metrics, combined) in cases {
+        let progress = fixture.path(&format!("{name}.progress"));
+        let (mut answered, mut sent) = (0, 0);
+        let capture = fixture.capture_observing(
+            name,
+            &[
+                &graphics.to_string(),
+                &mode.to_string(),
+                progress.to_str().unwrap(),
+                if combined { "combined" } else { "mouse-only" },
+            ],
+            |bytes, master| {
+                let queries = bytes
+                    .windows(5)
+                    .filter(|window| *window == b"\x1b[16t")
+                    .count();
+                while answered < queries {
+                    if metrics {
+                        master
+                            .write_all(b"\x1b[6;16;8t")
+                            .map_err(|e| e.to_string())?;
+                    }
+                    if mode == 1 {
+                        master
+                            .write_all(if pixels {
+                                b"\x1b[?1016;2$y"
+                            } else {
+                                b"\x1b[?1016;0$y"
+                            })
+                            .map_err(|e| e.to_string())?;
+                    }
+                    answered += 1;
+                }
+                if let Ok(state) = fs::read_to_string(&progress) {
+                    let values: Vec<u32> = state
+                        .split_whitespace()
+                        .filter_map(|s| s.parse().ok())
+                        .collect();
+                    if values.len() == 2 && values[0] == sent {
+                        assert_eq!(
+                            values[1],
+                            if mode == 4 {
+                                4
+                            } else if pixels {
+                                3
+                            } else {
+                                2
+                            }
+                        );
+                        // The shared reader must discard this key in mouse-only sessions.
+                        master.write_all(b"k").map_err(|e| e.to_string())?;
+                        if mode == 4 {
+                            master
+                                .write_all(b"\x1b[M\x20\x22\x22\x1b[M\x61\x22\x22")
+                                .map_err(|e| e.to_string())?;
+                        } else {
+                            let (x, y) = if pixels { (9, 25) } else { (2, 2) };
+                            let mut packet =
+                                format!("\x1b[<35;{x};{y}M\x1b[<0;{x};{y}M\x1b[<0;{x};{y}m");
+                            packet.push_str(if pixels {
+                                "\x1b[<35;1277;1065M\x1b[<35;1289;1081M\x1b[<291;-1;-1M"
+                            } else {
+                                "\x1b[<35;160;67M\x1b[<35;161;68M"
+                            });
+                            packet.push_str(&format!("\x1b[<65;{x};{y}M"));
+                            master
+                                .write_all(packet.as_bytes())
+                                .map_err(|e| e.to_string())?;
+                        }
+                        sent += 1;
+                    }
+                }
+                Ok(())
+            },
+        );
+        assert_eq!(sent, 2, "{name}: both presentations must be exercised");
+        let output = String::from_utf8_lossy(&capture);
+        let records: Vec<Vec<f64>> = output
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("@mouse ").map(|line| {
+                    line.split_whitespace()
+                        .map(|v| v.parse().unwrap())
+                        .collect()
+                })
+            })
+            .collect();
+        for stage in 0..2 {
+            let events: Vec<_> = records
+                .iter()
+                .filter(|e| e[0] == f64::from(stage))
+                .collect();
+            assert_eq!(
+                events.len(),
+                if mode == 4 {
+                    6
+                } else if pixels {
+                    10
+                } else {
+                    9
+                },
+                "{name}"
+            );
+            for (index, event) in events.iter().enumerate() {
+                let kind = event[2] as u32;
+                let flags = event[3] as u32;
+                if kind == 4 {
+                    assert!(pixels);
+                    assert_eq!(flags & 7, 0, "leave coordinates must be invalid");
+                    continue;
+                }
+                assert_ne!(flags & 1, 0);
+                if (1..=3).contains(&kind) {
+                    assert!(index > 0);
+                    let previous = events[index - 1];
+                    assert_eq!(
+                        previous[2], 0.0,
+                        "motion must immediately precede transition"
+                    );
+                    assert_eq!(&previous[6..10], &event[6..10]);
+                }
+                if pixels && !metrics {
+                    assert_eq!(
+                        flags & 6,
+                        0,
+                        "unknown pixel/cell geometry must not be guessed"
+                    );
+                    continue;
+                }
+                assert_ne!(flags & 2, 0, "{name}: completed frame coordinates missing");
+                let (mut x, mut y) = (event[6] + 0.5, event[7] + 0.5);
+                if pixels && (stage == 1 || graphics == 1 || graphics == 3) {
+                    x /= 8.0;
+                    y /= 16.0;
+                } else if !pixels && stage == 0 && matches!(graphics, 2 | 4) {
+                    x *= 8.0;
+                    y *= 16.0;
+                }
+                if stage == 0 {
+                    match graphics {
+                        1 => {
+                            x *= 2.0;
+                            y *= 3.0;
+                        }
+                        2 | 4 => {
+                            x *= 320.0 / 640.0;
+                            y *= 200.0 / 480.0;
+                        }
+                        3 => {
+                            y *= 200.0 / 67.0;
+                        } // capped by the renderer's 21440-cell budget
+                        _ => unreachable!(),
+                    }
+                }
+                assert!(
+                    (event[8] - x).abs() < 1e-9,
+                    "{name}: {event:?}, expected x={x}"
+                );
+                assert!(
+                    (event[9] - y).abs() < 1e-9,
+                    "{name}: {event:?}, expected y={y}"
+                );
+                let (width, height) = if stage == 0 {
+                    (320.0, 200.0)
+                } else {
+                    (40.0, 25.0)
+                };
+                assert_eq!(
+                    flags & 4 != 0,
+                    x < width && y < height,
+                    "{name}: clipped hit test"
+                );
+                if mode == 4 && kind == 2 {
+                    assert_ne!(flags & 8, 0, "X10 release must be marked synthetic");
+                }
+            }
+            assert_eq!(
+                events.last().unwrap()[11],
+                1.0,
+                "wheel direction must survive"
+            );
+        }
+        assert_eq!(
+            capture.windows(4).any(|w| w == b"\x1b[>u"),
+            combined,
+            "mouse-only sessions must not enable keyboard reporting"
+        );
+        // Model a caller's inherited tracking/encoding modes, including the
+        // modes TIGT temporarily disables to select an unambiguous encoding.
+        let tracked = [9, 1000, 1002, 1003, 1005, 1006, 1015, 1016];
+        let mut active = BTreeSet::from([1000, 1005]);
+        let mut saved = active.clone();
+        for part in output.split("\x1b[?").skip(1) {
+            let end = part
+                .find(|c: char| !c.is_ascii_digit() && c != ';')
+                .unwrap_or(part.len());
+            let params = part[..end].split(';').filter_map(|s| s.parse::<u32>().ok());
+            for parameter in params.filter(|p| tracked.contains(p)) {
+                match part.as_bytes().get(end) {
+                    Some(b'h') => {
+                        active.insert(parameter);
+                    }
+                    Some(b'l') => {
+                        active.remove(&parameter);
+                    }
+                    Some(b's') => {
+                        if active.contains(&parameter) {
+                            saved.insert(parameter);
+                        } else {
+                            saved.remove(&parameter);
+                        }
+                    }
+                    Some(b'r') => {
+                        if saved.contains(&parameter) {
+                            active.insert(parameter);
+                        } else {
+                            active.remove(&parameter);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(
+            active,
+            BTreeSet::from([1000, 1005]),
+            "{name}: inherited mouse modes lost"
+        );
+    }
 }

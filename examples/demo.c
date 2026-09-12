@@ -41,7 +41,9 @@ int main(int argc, char **argv)
             return !strcmp(argv[i], "--help") ? 0 : 2;
         }
     }
-    const tigt_config config = { TIGT_ABI_VERSION, once ? NULL : on_input, NULL, graphics };
+    const tigt_config config = {
+        .abi_version = TIGT_ABI_VERSION, .on_input = once ? NULL : on_input, .graphics_mode = graphics
+    };
     int result = tigt_init(&config);
     if (result != TIGT_OK) {
         fprintf(stderr, "tigt_init failed: %d (run inside a terminal)\n", result);

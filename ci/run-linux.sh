@@ -3,7 +3,7 @@ set -eu
 # Inputs are read-only bind mounts. All writes/build products stay in container.
 mkdir -p /work/tigt /work/tigt-gfxreader
 for project in tigt tigt-gfxreader; do
-    tar -C "/source/$project" --exclude='./target' --exclude='./build' \
+    tar -C "/source/$project" --exclude='./target' --exclude='./keyboard/target' --exclude='./build' \
         --exclude='./.git' -cf - . | tar -C "/work/$project" -xf -
 done
 # Cargo's pinned private dependency comes from the local committed repository,
@@ -20,6 +20,8 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build --parallel 2
 cargo test --all-features
 cargo test --no-default-features
+cargo test --manifest-path keyboard/Cargo.toml --locked --offline
+cargo fmt --manifest-path keyboard/Cargo.toml --check
 cargo fmt --all --check
 cmake --install build --prefix /work/installed
 cmake -S ci/consumer -B /work/consumer -DCMAKE_PREFIX_PATH=/work/installed
@@ -31,4 +33,11 @@ cmake --install build-caca --prefix /work/installed-caca
 cmake -S ci/consumer -B /work/consumer-caca -DCMAKE_PREFIX_PATH=/work/installed-caca
 cmake --build /work/consumer-caca --parallel 2
 /work/consumer-caca/consumer
-printf '\nPASS Linux analyzer, C/Rust snapshots, renderer PTYs and installed C consumer\n'
+cmake -S . -B build-keyboard -DCMAKE_BUILD_TYPE=Debug -DTIGT_WITH_KEYBOARD=ON
+cmake --build build-keyboard --parallel 2
+cmake --install build-keyboard --prefix /work/installed-keyboard
+cmake -S ci/consumer -B /work/consumer-keyboard -DCMAKE_PREFIX_PATH=/work/installed-keyboard
+cmake --build /work/consumer-keyboard --parallel 2
+/work/consumer-keyboard/consumer
+/work/consumer-keyboard/keyboard-api
+printf '\nPASS Linux analyzer, C/Rust snapshots, renderer/input PTYs and installed C consumers\n'

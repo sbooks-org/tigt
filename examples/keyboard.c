@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: MIT-0
  * Copyright (C) 2026 Simplebooks Foundation
  * Copyright (C) 2026 Josh Rodd
- * Optional example: compile with the keyboard package's include directory and
- * link libtigt plus libpc_xt_keyboard and their platform dependencies.
+ * Optional example: enable TIGT_WITH_KEYBOARD in CMake and link tigt::tigt,
+ * which supplies the in-tree mapper and its platform dependencies.
  * No display session is opened. Pipe terminal input bytes into stdin.
  */
 #include <tigt_keyboard.h>

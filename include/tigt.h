@@ -6,10 +6,11 @@
 #define TIGT_H
 #include <stddef.h>
 #include <stdint.h>
+#include "tigt_mouse.h"
 #ifdef __cplusplus
 extern "C" {
 #endif
-#define TIGT_ABI_VERSION 3u
+#define TIGT_ABI_VERSION 4u
 #define TIGT_OK 0
 #define TIGT_ERROR_ARGUMENT -1
 #define TIGT_ERROR_TERMINAL -2
@@ -87,6 +88,14 @@ typedef void (*tigt_input_callback)(const tigt_input_event *event, void *user);
 typedef struct tigt_input tigt_input;
 /* Returns NULL on allocation failure or a NULL callback (errno = EINVAL). */
 tigt_input *tigt_input_create(tigt_input_callback callback, void *user);
+/* Combined decoder on the same byte stream; either callback may be NULL.
+ * OFF requires on_mouse NULL; non-OFF requires on_mouse. At least one callback
+ * is required. Invalid modes or callback combinations return NULL (EINVAL).
+ * AUTO decodes cell SGR here; standalone decoders never probe a terminal.
+ * Both callbacks follow the serialization and lifetime rules above. */
+tigt_input *tigt_input_create_with_mouse(tigt_input_callback on_input, void *input_user,
+                                         tigt_mouse_callback on_mouse, void *mouse_user,
+                                         uint32_t mouse_mode);
 void tigt_input_feed(tigt_input *input, const uint8_t *bytes, size_t length);
 /* Resolve a pending bare Escape; callers choose their input timeout. */
 void tigt_input_flush(tigt_input *input);
@@ -104,16 +113,21 @@ typedef enum {
 
 typedef struct tigt_config {
     uint32_t abi_version;
-    tigt_input_callback on_input; /* NULL makes this an output-only session. */
+    tigt_input_callback on_input; /* NULL disables semantic keyboard callbacks. */
     void *user;
     uint32_t graphics_mode; /* tigt_graphics_mode; AUTO selects available output. */
+    tigt_mouse_callback on_mouse;
+    void *mouse_user;
+    uint32_t mouse_mode; /* tigt_mouse_mode; OFF requires on_mouse NULL. */
 } tigt_config;
 /* One process-wide curses session. Lifecycle calls must be serialized on the
  * owning thread. Init/resume return errors rather than exiting the application.
  * Callback storage must remain valid until shutdown returns. SIGINT/SIGTSTP
  * disposition belongs to the application; suspend restores shell state.
  * Stdin and stdout must be TTYs, including for output-only sessions.
- * Suspend/shutdown join in-flight callbacks before returning. */
+ * Suspend/shutdown join in-flight callbacks before returning. Keyboard and
+ * mouse callbacks are serialized on the same input worker; neither may call
+ * lifecycle functions. Both callbacks NULL with mouse OFF is output-only. */
 int tigt_init(const tigt_config *config);
 int tigt_resume(void);
 void tigt_suspend(void);
@@ -126,6 +140,10 @@ void tigt_shutdown(void);
 uint32_t tigt_get_graphics_mode(void);
 /* AUTO when no session exists. There is no runtime mode setter. */
 uint32_t tigt_get_requested_graphics_mode(void);
+/* Resolved live mouse protocol: OFF, CELLS, PIXELS, or X10, never AUTO.
+ * AUTO probes pixel reporting and falls back to cell SGR. Explicit PIXELS
+ * trusts the caller's terminal selection. OFF when reporting is inactive. */
+uint32_t tigt_get_mouse_mode(void);
 /* Sixel and iTerm2 presentation only: native frames/snapshots and Blocks/ASCII
  * are unchanged. Request columns 1..320 and a nonzero display aspect ratio
  * (aspect_width:aspect_height, each 1..65535). Defaults are 80 columns and 4:3.

@@ -15,7 +15,7 @@ xcode-select --install
 brew install cmake libpng pkg-config
 ```
 
-The macOS SDK supplies curses. Linux needs wide-character curses. For block graphics, use a UTF-8 locale and a terminal with Unicode sextants and 256-colour support. Terminals supporting sixel or the iTerm2 image protocol can display raster graphics; non-UTF-8 terminals can use optional libcaca ASCII conversion. A current stable Rust toolchain is required for Rust consumers and the complete test suite.
+The macOS SDK supplies curses. Linux needs wide-character curses. For block graphics, use a UTF-8 locale and a terminal with Unicode sextants and 256-colour support. Terminals supporting sixel or the iTerm2 image protocol can display raster graphics; non-UTF-8 terminals can use optional libcaca ASCII conversion. A current stable Rust toolchain is required for Rust consumers, the complete test suite, and C builds that enable the optional PC keyboard mapper. Default C builds do not need Rust.
 
 Libcaca is **off by default** and is not needed by normal builds. To enable ASCII graphics or run `cargo test --all-features`, install `libcaca-dev` on Debian/Ubuntu or `brew install libcaca` on macOS. Enabling the feature requires pkg-config metadata named `caca`; configuration fails if it is missing.
 
@@ -26,7 +26,7 @@ git clone git@github.com:sbooks-org/tigt.git
 cd tigt
 ```
 
-The repository and its analyzer development dependency are private. Your GitHub SSH identity must have access to both for the complete tests. The optional keyboard mapper is a separate Git dependency.
+The repository and its analyzer development dependency are private. Your GitHub SSH identity must have access to both for the complete tests. The optional keyboard mapper is included in `keyboard/`; it has no Git or crates.io dependencies.
 
 ## C
 
@@ -54,6 +54,14 @@ Set `CMAKE_PREFIX_PATH` to the installation prefix when configuring that consume
 
 Enable the optional ASCII backend with `-DTIGT_WITH_LIBCACA=ON`; the installed target then also discovers and propagates libcaca through pkg-config. The default OFF build has no libcaca dependency.
 
+Enable PC/XT and PC/AT mapping with `-DTIGT_WITH_KEYBOARD=ON`. CMake builds the in-tree Rust mapper and installs its archive and C headers; `tigt::tigt` propagates the link dependencies, so an installed consumer only needs that target. The option is OFF by default: no Cargo/rustc discovery, mapper compilation or mapper linkage occurs. The enabled CMake path currently supports native, single-architecture macOS and GNU/Linux builds; cross/universal builds fail explicitly instead of mixing incompatible archives.
+
+```sh
+cmake -S . -B build-keyboard -DTIGT_WITH_KEYBOARD=ON
+cmake --build build-keyboard --parallel
+printf a | ./build-keyboard/tigt-keyboard
+```
+
 A minimal text session:
 
 ```c
@@ -62,7 +70,7 @@ A minimal text session:
 
 int main(void)
 {
-    const tigt_config config = { TIGT_ABI_VERSION, NULL, NULL, TIGT_GRAPHICS_AUTO };
+    const tigt_config config = { .abi_version = TIGT_ABI_VERSION, .graphics_mode = TIGT_GRAPHICS_AUTO };
     const tigt_text_cell cells[] = {
         { 'H', 0xffffff, 0, 0 },
         { 'i', 0xffffff, 0, 0 }
@@ -119,11 +127,15 @@ cargo run --example keyboard --features keyboard
 cargo run --example snapshot -- /tmp/tigt-snapshot.json
 ```
 
-The keyboard example demonstrates physical PC key press/release events, decoded independently of a display session. The snapshot example demonstrates instrumentation; see its printed process information and [the instrumentation guide](instrumentation.md).
+The keyboard example demonstrates physical PC key press/release events, decoded independently of a display session. Rust's `keyboard` feature compiles the same in-tree mapper used by CMake. It is optional; semantic input decoding and mouse support do not require it. The snapshot example demonstrates instrumentation; see its printed process information and [the instrumentation guide](instrumentation.md).
 
-Both C and Rust demos accept `--graphics auto|blocks|sixel|ascii|iterm2`; the C demo also accepts `--once`. For API selection, set `tigt_config.graphics_mode` or call `Session::new_with_graphics(GraphicsMode::Iterm2)` / `Session::with_input_and_graphics(mode, handler)`. Read the requested and resolved selections through `tigt_get_requested_graphics_mode()` / `tigt_get_graphics_mode()` or the corresponding session methods. Explicit choices never silently fall back. Auto probes for sixel only with an input callback and the same input/output terminal; output-only sessions use UTF-8 blocks or libcaca ASCII directly. iTerm2 is explicit only. See [bitmap frames](reference.md#bitmap-frames) for detection, theme eligibility and image colour policies.
+Both C and Rust demos accept `--graphics auto|blocks|sixel|ascii|iterm2`; the C demo also accepts `--once`. For API selection, set `tigt_config.graphics_mode` or call `Session::new_with_graphics(GraphicsMode::Iterm2)` / `Session::with_input_and_graphics(mode, handler)`. Read the requested and resolved selections through `tigt_get_requested_graphics_mode()` / `tigt_get_graphics_mode()` or the corresponding session methods. Explicit choices never silently fall back. Auto probes for sixel only with a keyboard or mouse callback and the same input/output terminal; output-only sessions use UTF-8 blocks or libcaca ASCII directly. iTerm2 is explicit only. See [bitmap frames](reference.md#bitmap-frames) for detection, theme eligibility and image colour policies.
 
 Sixel and iTerm2 default to an 80-column-wide, 4:3 display rectangle, fitted to the terminal. Set a different target after initialization with `tigt_set_image_layout(60, 16, 9)` in C or `session.set_image_layout(60, 16, 9)?` in Rust. Sixel resamples on the host; iTerm2 sends 320×200 RGB PNGs for terminal-side enlargement, averaging 640-wide pixel pairs and duplicating 160-wide pixels. This changes presentation, not the native framebuffer or snapshots. Identical bitmap submissions do not redraw. Without usable pixel-width metrics, the target falls back to 640 pixels; see the reference for output-only ownership and resize behavior.
+
+For mouse-only input, use `Session::with_mouse(MouseMode::Auto, handler)`; for both handlers, use `Session::with_input_and_mouse(MouseMode::Auto, key_handler, mouse_handler)`. The `with_mouse_and_graphics` and `with_input_and_mouse_and_graphics` variants take `GraphicsMode` first. Callbacks run serially on TIGT's one input worker; send events to the owning thread rather than reading stdin or opening a second terminal library.
+
+In C, zero-initialize `tigt_config`, set `abi_version = TIGT_ABI_VERSION` (4), `on_mouse`, `mouse_user`, and `mouse_mode = TIGT_MOUSE_AUTO`. `on_input` is independently optional. Auto negotiates pixel reporting, with cell-coordinate fallback. Check event validity before using displayed-frame coordinates; see [mouse input](reference.md#mouse-input) for precision, click-only fallback and protocol limitations.
 
 ## Glass-TTY output without curses
 

@@ -161,6 +161,8 @@ The `--all-features` build requires the libcaca development package (`libcaca-de
 
 The comprehensive suite runs real C and Rust consumers in PTYs and compares their native dumps, decoded PNG pixels and structured attributes. Tests also exercise actual terminal replay, signal configuration/restoration, file/FIFO behavior, copied/padded frames, mode transitions, and error paths. The analyzer has an independent unit/CLI suite, so neither project relies on a circular runtime dependency.
 
+Mouse PTY scenarios exercise shared keyboard/mouse input, pixel negotiation and fallback, fractional displayed-frame coordinates, missing metrics, clipped bounds, Kitty leave reports, X10 synthetic releases and mode restoration. The in-tree PC mapper retains independent Rust and C state-transition regressions; run its Rust suite with `cargo test --manifest-path keyboard/Cargo.toml --locked --offline`.
+
 Use explicit child PIDs and finite timeouts in CI. Do not use blanket process-name signals. Recognized text and attribute reports are evidence to evaluate alongside the image, not a replacement for checking parser errors or child exit status.
 
 ## Local Docker CI
@@ -175,6 +177,6 @@ docker run --rm \
   tigt-ci
 ```
 
-The Linux container copies sources into its own writable workspace, builds and tests both projects, compares C/Rust snapshots, and checks an external installed CMake consumer. It mounts no SSH agent or token. Cargo's pinned analyzer revision is fetched from the local analyzer Git repository; make sure that checkout contains the pinned commit. Crates.io and the public keyboard dependency still require network access.
+The Linux container copies sources into its own writable workspace, builds and tests both projects, compares C/Rust snapshots, and checks external installed CMake consumers with optional ASCII and PC keyboard configurations. It also runs the in-tree mapper's Rust/C regressions. It mounts no SSH agent or token. Cargo's pinned analyzer revision is fetched from the local analyzer Git repository; make sure that checkout contains the pinned commit. Crates.io dependencies still require network access; the integrated keyboard mapper is dependency-free and builds offline.
 
 Host source trees are read-only and host build products are not reused. Container files disappear on `--rm`. The manually triggered GitHub workflow runs this same image; hosted runs additionally require an `ANALYZER_READ_TOKEN` secret with contents-read access to the private analyzer repository. Hosted CI is optional, not a prerequisite for running this local suite.

@@ -1,0 +1,14 @@
+[package]
+name = "pc-xt-keyboard"
+version = "0.1.0"
+edition = "2024"
+autobins = false
+description = "Transport-neutral IBM PC/XT and PC/AT Set 1 keyboard mapper"
+license = "MIT-0"
+repository = "ssh://git@github.com/sbooks-org/tigt.git"
+
+[lib]
+crate-type = ["rlib", "staticlib"]
+
+[features]
+default = []

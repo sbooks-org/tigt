@@ -1,6 +1,6 @@
 # tigt reference
 
-The installed `include/tigt.h`, `include/tigt_video.h`, `include/tigt_presenter.h` and Rust API documentation are the authoritative declarations. This guide describes the contracts and their interactions.
+The installed `include/tigt.h`, `include/tigt_mouse.h`, `include/tigt_video.h`, `include/tigt_presenter.h` and Rust API documentation are the authoritative declarations. This guide describes the contracts and their interactions.
 
 ## Lifecycle and ownership
 
@@ -12,11 +12,12 @@ The installed `include/tigt.h`, `include/tigt_video.h`, `include/tigt_presenter.
 | `tigt_shutdown()` | `Drop` | Stop/join workers, restore terminal state, release session resources. |
 | `tigt_get_requested_graphics_mode()` | `session.requested_graphics_mode()` | Read the session's configured bitmap policy. |
 | `tigt_get_graphics_mode()` | `session.graphics_mode()` | Read the resolved bitmap backend. |
+| `tigt_get_mouse_mode()` | `session.mouse_mode()` | Read the resolved mouse protocol; Off while suspended. |
 | `tigt_set_image_layout(columns, aspect_width, aspect_height)` | `session.set_image_layout(columns, aspect_width, aspect_height)` | Set sixel/iTerm2 target width in terminal cells and display aspect ratio. |
 
-`config.abi_version` must equal `TIGT_ABI_VERSION` (3). The ABI-3 config appends `uint32_t graphics_mode`; rebuild C consumers against the matching header/library. A NULL input callback selects output-only mode. Both standard input and standard output must be terminals even in output-only mode. Lifecycle calls are serialized on the owning thread. Frame producers must not race lifecycle operations. Do not mix raw C lifecycle calls with a live Rust `Session`.
+`config.abi_version` must equal `TIGT_ABI_VERSION` (4). The ABI-4 config appends `on_mouse`, `mouse_user` and `mouse_mode`; rebuild C consumers against the matching header/library and zero-initialize optional fields. Both callbacks NULL with mouse mode Off selects output-only mode. Keyboard and mouse callbacks are independently optional: mouse-only sessions do not enable Kitty keyboard reporting. Both standard input and standard output must be terminals even in output-only mode. Lifecycle calls are serialized on the owning thread. Frame producers must not race lifecycle operations. Do not mix raw C lifecycle calls with a live Rust `Session`.
 
-Input callbacks run on a worker thread in a live session. They must return promptly, must not call lifecycle operations or recursively operate/destroy their decoder, and must not unwind across C. Rust contains unwinding callback panics and reports them on `input_status()` and fallible session operations; `panic=abort` still aborts.
+Keyboard, mouse and graphics-capability reports share one decoder and one input worker. Both application callbacks run serially, never concurrently with each other. They must return promptly, must not call lifecycle operations or recursively operate/destroy their decoder, and must not unwind across C. Rust contains unwinding callback panics and reports failures from either handler on `input_status()` and fallible session operations; `panic=abort` still aborts. Shutdown/suspend join in-flight callbacks before returning. Do not run another stdin reader or terminal-mode owner alongside the session.
 
 The application owns SIGINT/SIGTSTP policy. Normal initialization does not reserve a screenshot signal. Snapshot configuration explicitly opts into SIGUSR1 or SIGUSR2. Snapshot configuration and its signal ownership survive suspension; shutdown or explicit disabling restores the prior disposition.
 
@@ -38,9 +39,9 @@ Select the bitmap output policy with `config.graphics_mode` in C, or `Session::n
 | `TIGT_GRAPHICS_ASCII` (3) | `GraphicsMode::Ascii` | Printable ASCII cells converted by optional libcaca. |
 | `TIGT_GRAPHICS_ITERM2` (4) | `GraphicsMode::Iterm2` | Aspect-normalized 320×200 RGB8 PNG through the iTerm2 inline image protocol, enlarged by the terminal. Explicit only. |
 
-Auto performs a bounded 150 ms capability probe only when an input callback exists and stdin/stdout refer to the same terminal. This uses the existing input decoder and worker, preserving application input; output-only sessions and split terminal descriptors use locale fallback immediately. A primary-device-attributes response advertising feature 4, or a successful XTSM sixel geometry response, selects sixel. A timeout or unrecognized reply uses locale fallback. Selection is resolved at initialization and again on resume; the requested policy stays unchanged and there is no runtime setter. The C requested-mode getter returns Auto without a session; the resolved-mode getter returns Auto before resolution and after shutdown.
+Auto performs a bounded 150 ms capability probe only when a keyboard or mouse callback exists and stdin/stdout refer to the same terminal. This uses the existing input decoder and worker, preserving application input; output-only sessions and split terminal descriptors use locale fallback immediately. A primary-device-attributes response advertising feature 4, or a successful XTSM sixel geometry response, selects sixel. A timeout or unrecognized reply uses locale fallback. Selection is resolved at initialization and again on resume; inspect it with `tigt_get_graphics_mode()` / `session.graphics_mode()`.
 
-Explicit modes never silently fall back. Blocks without UTF-8 and ASCII without a libcaca-enabled build return `TIGT_ERROR_TERMINAL` / `Error::Terminal`; Auto also fails in a non-UTF-8 locale when libcaca is absent. Explicit sixel/iTerm2 assert terminal support; neither backend is selected based on replies. Sixel uses Auto's bounded geometry-query path when tigt owns input on the same terminal. iTerm2 queries only cell/text-area geometry (`16t`/`14t`), never sixel capabilities or limits. Output-only sessions never query or read stdin. Explicit blocks/ASCII do not probe. Auto selection is unchanged and never selects iTerm2.
+Explicit modes never silently fall back. Blocks without UTF-8 and ASCII without a libcaca-enabled build return `TIGT_ERROR_TERMINAL` / `Error::Terminal`; Auto also fails in a non-UTF-8 locale when libcaca is absent. Explicit sixel/iTerm2 assert terminal support; neither backend is selected based on replies. Sixel uses Auto's bounded geometry-query path when tigt owns input on the same terminal. iTerm2 queries cell/text-area geometry (`16t`/`14t`), never sixel capabilities or limits. Output-only sessions never query or read stdin. Blocks/ASCII do not probe graphics capabilities, but enabled mouse input may query metrics and mouse protocol support. Auto selection is unchanged and never selects iTerm2.
 
 Bitmap RGB, including custom indexed palettes, is retained without first quantizing to CGA/IBM16. Sixel emits exact colours for images with at most 256 unique RGB values, within the protocol's integer-percentage channel precision; larger colour sets are quantized to 256 colours. iTerm2 sends RGB8 without palette quantization or theme substitutions, after the horizontal normalization described below. Blocks and ASCII approximate colours using terminal capabilities. Native PNG snapshots preserve original RGB and dimensions independently of the selected graphics mode.
 
@@ -63,6 +64,8 @@ session.set_image_layout(60, 16, 9)?;
 Columns must be 1–320; both aspect components must be 1–65535. An initialized active or suspended session is required. Invalid requests return Argument without changing the layout. A successful change schedules the latest sixel/iTerm2 frame for redraw without another frame submission. Layout survives suspend/resume and resets to 80 columns at 4:3 for a new session. Native framebuffer dimensions, RGB snapshots, and blocks/ASCII rendering are unchanged.
 
 Same-size image updates overwrite the current placement without clearing the screen. Resizing, leaving graphics, suspension and shutdown remove stale images; returning to text repaints its cells. iTerm2 never changes sixel DEC private modes. ASCII conversion fills the bounded terminal cell area. Sixel, iTerm2 and ASCII sample the first backing pixel of each logical pixel when `pixel_width = 2`.
+
+Image cleanup is flushed before curses repaints replacement text or leaves the alternate screen during suspend/shutdown. Clearing an image therefore does not erase the replacement text or the restored shell screen.
 
 Blocks and ASCII may substitute terminal-default background/foreground only when the entire source frame uses **at most three distinct RGB values**, each black (`0x000000`), white (`0xffffff`), or a neutral grey with equal channels in **129..254**. Classification happens before resampling or cell reduction and includes horizontally skipped source pixels. Every qualifying grey maps to regular foreground, white to intense foreground, and black to background; there is no additional restriction requiring a unique grey value. Thus OS/2 grey `0xcccccc` is eligible, while dark grey `0x808080`, any chromatic colour, or four distinct qualifying colours disable all theme substitutions. Standard IBM16 indexed input satisfies this policy only when its used indices belong to `{0,7,15}`. Sixel always emits explicit source RGB, never terminal foreground or bold colours, because those have no portable sixel mapping.
 
@@ -323,15 +326,83 @@ Feed arbitrary stream fragments; UTF-8 and escape sequences can span calls. Flus
 
 Events distinguish press, repeat and release; key identity includes Unicode characters, function keys, navigation, editing, lock and modifier keys. Modifier bits cover Shift, Control, Alt and Super. The decoder understands supported traditional terminal sequences and Kitty keyboard events, including fragmented SS3 (`ESC O`) arrows, Home/End, keypad Begin, and F1–F4. SS3 R is F3; CSI R remains a cursor-position report, not a key. Legacy terminal taps cannot reconstruct physical key-release timing that the transport never reported. Invalid or unsupported input is not a promise of arbitrary terminal-protocol compatibility.
 
-C decoder creation rejects a NULL callback. Feed/flush/destroy must be externally serialized. A decoder callback executes synchronously during explicit feed/flush; a live-session callback executes on the input worker.
+`tigt_input_create` rejects a NULL keyboard callback. `tigt_input_create_with_mouse(key_callback,key_user,mouse_callback,mouse_user,mode)` accepts either callback or both, but requires at least one. Mouse Off requires a NULL mouse callback; other mouse modes require a mouse callback. Feed/flush/destroy must be externally serialized. A decoder callback executes synchronously during explicit feed/flush; a live-session callback executes on the shared input worker.
+
+## Mouse input
+
+Mouse input is part of the shared terminal decoder, not the optional PC keyboard mapper. Configure `on_mouse`, its independent `mouse_user`, and `mouse_mode` in C. Rust offers `Session::with_mouse(mode,handler)` and `Session::with_input_and_mouse(mode,key_handler,mouse_handler)`; their graphics-selection variants take `GraphicsMode` first. Standalone C combined decoders and Rust `MouseDecoder::new(mode,handler)` parse bytes without opening or changing a terminal.
+
+| C mode | Rust mode | Behavior |
+|---|---|---|
+| `TIGT_MOUSE_OFF` | `MouseMode::Off` | No mouse callback or terminal reporting. |
+| `TIGT_MOUSE_AUTO` | `MouseMode::Auto` | Probe DEC private mode 1016; use pixel SGR when recognized and settable, otherwise cell SGR. Standalone decoding uses cells without probing. |
+| `TIGT_MOUSE_CELLS` | `MouseMode::Cells` | Cell-coordinate SGR, with legacy byte reports accepted as cells. |
+| `TIGT_MOUSE_PIXELS` | `MouseMode::Pixels` | Caller asserts pixel-SGR support; legacy byte reports still retain cell units. |
+| `TIGT_MOUSE_X10` | `MouseMode::X10` | Explicit press-only legacy tracking. Emit a synthetic release after each click. |
+
+Live mouse sessions query cell/text-area metrics through the same bounded negotiation window used by graphics, even for Blocks or ASCII. Auto's `CSI ? 1016 $ p` reply is consumed as a terminal report, never a key. Queries require the input/output descriptors to refer to the same terminal. Auto falls back to cells if replies are absent; explicit Pixels trusts the caller. Initialization/resume save mouse modes, disable conflicting encodings, then request SGR and normal/drag/all-motion tracking in increasing order. A terminal that only understands normal tracking can still report clicks. Suspend/shutdown disable TIGT's reporting and restore saved modes where the terminal implements DEC save/restore; terminals without that extension are left with TIGT's modes disabled.
+
+`MouseEvent` / `tigt_mouse_event` reports:
+
+- Move, Down, Up, Scroll and Leave; left, middle and right button identities and held-button masks; Shift/Control/Alt modifiers.
+- Raw zero-based terminal `x/y` with explicit cell/pixel units and position validity. Pixel mode reports integer terminal pixels, not physical sub-pixel precision.
+- `frame_x/frame_y` in the **completed displayed frame**, not a newly submitted frame: logical bitmap pixels (`width / pixel_width` by height), or text cells. Mapping preserves fractions and uses the centre of the reported cell/pixel. Blocks retain their exact 2×3 logical-pixel packing, including the last partial row; raster and ASCII projections use their displayed scale.
+- Frame validity and inside-frame flags. Coordinates are not clamped. No completed frame, an in-progress redraw, or missing metrics needed to cross cell/pixel units leaves frame coordinates invalid. Clipped/outside-frame positions remain distinguishable from an actual window-leave report.
+- Horizontal/vertical wheel steps, positive right/down. These protocols do not report continuous high-resolution wheel deltas.
+
+Every position-bearing Down, Up or Scroll is immediately preceded by Move, even at an unchanged position. Click-only transports therefore always establish position before the click. X10 lacks releases, so its synthesized Up is explicitly marked; legacy normal tracking has an ambiguous release code, which releases all known held buttons rather than guessing the last button in a chord. Missing independent motion or release timing cannot be reconstructed.
+
+[Kitty's pixel-mode extension](https://sw.kovidgoyal.net/kitty/misc-protocol/#reporting-when-the-mouse-leaves-the-window) reports genuine window departure using bit 256. Leave ignores the report's coordinates and does not synthesize button releases. Standard [xterm mouse reporting](https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h2-Mouse-Tracking) has no equivalent window-departure event. Keyboard focus loss and idle time are **not** pointer departure. Terminals without a leave report cannot provide it.
+
+The implemented protocols do not expose touch contact identities or a multipoint-touch stream. A terminal may translate a touch tap into a mouse click; TIGT preserves that click, but does not label it as touch or invent simultaneous contacts. There is no advertised native-touch capability.
+
 
 ## PC keyboard integration
 
-C consumers may include `tigt_keyboard.h` alongside the separate mapper's `pc_xt_keyboard.h`. `tigt_keyboard_handle` converts a semantic input event into `pc_xt_keyboard_v1_key_event` records: a physical PC key identity and a separate down/up flag. Supply `PC_XT_KEYBOARD_V1_EVENT_MAX_KEYS` slots; capacity and return count are in events, not bytes. Link the mapper separately; the core tigt library does not require it.
+The transport-neutral mapper from [terminal-to-pc-keyboard](https://github.com/sbooks-org/terminal-to-pc-keyboard) is integrated in `keyboard/`, preserving its Rust implementation and C ABI. Enable it with CMake `TIGT_WITH_KEYBOARD=ON` or Cargo feature `keyboard`; both are off by default. Disabled builds neither compile nor link the mapper. Core semantic keyboard decoding, mouse decoding and terminal-capability demultiplexing remain independent of it.
+
+CMake-enabled native macOS/GNU Linux builds require Rust; default C builds do not discover or invoke Cargo/rustc. The installed `tigt::tigt` target propagates the mapper archive and native dependencies. C consumers include `tigt_keyboard.h`, create a mapper with `pc_xt_keyboard_v1_create`, and pass each semantic keyboard event to `tigt_keyboard_handle`. It returns `pc_xt_keyboard_v1_key_event` records: a physical PC key identity and a separate down/up flag. Supply `PC_XT_KEYBOARD_V1_EVENT_MAX_KEYS` slots; capacity and return count are in events, not bytes. No separate project checkout or mapper linkage setup is needed with the imported CMake target.
 
 Rust enables `keyboard` to expose event conversions and the mapper re-export. `PcEvent::Make(key)` / `Break(key)` expose `key.physical` before wire encoding. Ordinary identities use PC make-position numbering; enhanced Print Screen and Pause are distinct identities, not E0/E1 byte streams. Feed an emulator's existing host-key interface and let its emulated keyboard choose guest scan-code encoding. The mapper's separate byte API remains available to consumers that actually need wire bytes.
 
 Input decoding, keyboard mapping and monitor decoding have independent state. A live terminal session coordinates terminal ownership and input callbacks, but display technology never selects keyboard profile. Applications own the mapper and release policy; tigt does not instantiate a PC keyboard. Do not submit one input to both mapper output APIs: both consume the same held-key state.
+
+### Migrating a consumer of both projects
+
+The original project's consumer documentation lived in its root `README.md`, not a `docs/` directory. Its library implementation, versioned C header, Rust/C regressions and license are now included here. Consumers of the two libraries can use the updated TIGT checkout alone:
+
+- **C/CMake:** remove the separate mapper checkout/build/imported target, configure TIGT with `TIGT_WITH_KEYBOARD=ON`, and link only the imported `tigt::tigt` target. The enabled installation supplies both `tigt_keyboard.h` and `pc_xt_keyboard.h`. Existing `pc_xt_keyboard_v1_*` calls remain valid; the mapper ABI is still version 1 even though TIGT's session configuration ABI is now 4. Manual non-CMake linking still needs the installed mapper archive and its native system libraries.
+- **Rust:** remove the separate `pc-xt-keyboard` dependency, enable TIGT's `keyboard` feature, and import mapper types through `tigt::keyboard::mapper::{PcKeyboard, KeyboardModel, PcEvent, ...}`. Convert TIGT semantic events with `event.into()` before passing them to `PcKeyboard::handle`. Use the re-export consistently rather than mixing types from a separately sourced copy of the crate.
+- **Terminal ownership:** use one TIGT session for display and input. Feed its semantic key callback into the application-owned mapper; do not retain a second raw stdin reader or terminal-mode owner.
+
+This replaces the library dependency, not every artifact of the old repository. The crossterm-based interactive tester was not imported, and the integrated crate produces Rust and static-library artifacts rather than the old dynamic-library artifact. The optional CMake mapper build supports native, single-architecture macOS and GNU/Linux; cross/universal builds are not provided by that build path.
+
+### Mapper state and C buffer contracts
+
+Send each actual press and release to the same mapper instance. It reference-counts guest keys held by multiple host sources, emitting a release only when the final source releases that key. Repeats are ignored. Releasing Command/Super also releases dependent command-layer mappings. Rust additionally exposes `release_source`, `release_command_mappings` and `release_all`; callers own any synthetic timeout or release policy.
+
+Direct C input uses `pc_xt_keyboard_v1_input_event`: semantic key identity, Unicode scalar for characters, function/modifier value where applicable, Shift/Control/Alt/Super bits, and Press/Repeat/Release kind. TIGT's adapter performs this conversion for its own semantic events.
+
+`pc_xt_keyboard_v1_handle_events` requires at least `PC_XT_KEYBOARD_V1_EVENT_MAX_KEYS` (64) output slots and returns a count of physical events. This conservatively bounds the current mappings, including bulk Command releases. `pc_xt_keyboard_v1_handle` instead writes Set 1 bytes and requires at least `PC_XT_KEYBOARD_V1_EVENT_MAX_BYTES` (32) bytes. Both consume the same state: choose one output API per input event.
+
+Invalid input, null pointers and insufficient capacity return `PC_XT_KEYBOARD_V1_ERROR` without changing mapper state or output, allowing a retry. Input and output storage must be properly aligned, readable/writable as appropriate, and non-overlapping with each other and mapper state. The mapper retains neither pointer and writes only the returned output slots. Serialize access to each instance and destroy it with `pc_xt_keyboard_v1_destroy`; no returned output allocation needs freeing. The C boundary uses fixed-width integers and opaque state, not Rust enum layout, strings or allocations.
+
+### Keyboard models and physical identities
+
+`KeyboardModel::XtSet1` / `PC_XT_KEYBOARD_V1_XT_SET1` selects the 83-key PC/XT model. `KeyboardModel::AtSet1` / `PC_XT_KEYBOARD_V1_AT_SET1` selects enhanced AT mappings.
+
+| Key | XT physical identity | AT physical identity |
+|---|---|---|
+| Ordinary keys | Make-position numbers `0x01..0x7f` | Make-position numbers `0x01..0x7f` |
+| Print Screen | `0x37` | `0x137`, distinct from keypad multiply |
+| Pause | Ctrl `0x1d` plus Num Lock `0x45` | `0x145` |
+| Navigation outside the Command layer | Unextended keypad positions | Enhanced positions listed below |
+
+AT navigation identities are Home `0x147`, Up `0x148`, Page Up `0x149`, Left `0x14b`, Right `0x14d`, End `0x14f`, Down `0x150`, Page Down `0x151`, Insert `0x152` and Delete `0x153`. Their Set 1 wire sequences are `E0 position` on press and `E0 (position | 80)` on release. XT navigation, Command-layer keypad mappings and explicit keypad function-key mappings retain unextended identities.
+
+AT Print Screen's wire sequences are `E0 2A E0 37` / `E0 B7 E0 AA`. AT Pause emits `E1 1D 45 E1 9D C5` with no wire break sequence, but the physical API still emits a matching release. The Command-layer mapping can emit AT SysRq (`0x54`) for the corresponding Super/Control/Shift/Alt input. Rust `PcKey::make` and `PcKey::break_sequence` expose complete wire sequences; `PcKey::physical` is a guest key identity, not a byte to inject into a keyboard controller.
+
+Legacy terminal input cannot recover releases or bare modifier transitions that the terminal never reports. Integrating the mapper does not remove that transport limitation; applications must choose any fallback release policy explicitly.
 
 ## Snapshots
 

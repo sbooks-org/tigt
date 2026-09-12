@@ -23,11 +23,33 @@ pub(crate) struct InputEvent {
 pub(crate) type InputCallback = unsafe extern "C" fn(*const InputEvent, *mut c_void);
 
 #[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct MouseEvent {
+    pub kind: u32,
+    pub button: u32,
+    pub buttons: u32,
+    pub modifiers: u32,
+    pub coordinates: u32,
+    pub flags: u32,
+    pub x: i32,
+    pub y: i32,
+    pub scroll_x: i32,
+    pub scroll_y: i32,
+    pub frame_x: f64,
+    pub frame_y: f64,
+}
+
+pub(crate) type MouseCallback = unsafe extern "C" fn(*const MouseEvent, *mut c_void);
+
+#[repr(C)]
 pub(crate) struct Config {
     pub abi_version: u32,
     pub on_input: Option<InputCallback>,
     pub user: *mut c_void,
     pub graphics_mode: u32,
+    pub on_mouse: Option<MouseCallback>,
+    pub mouse_user: *mut c_void,
+    pub mouse_mode: u32,
 }
 
 #[repr(C)]
@@ -46,6 +68,7 @@ unsafe extern "C" {
     pub(crate) fn tigt_shutdown();
     pub(crate) fn tigt_get_graphics_mode() -> u32;
     pub(crate) fn tigt_get_requested_graphics_mode() -> u32;
+    pub(crate) fn tigt_get_mouse_mode() -> u32;
     pub(crate) fn tigt_set_image_layout(
         columns: u16,
         aspect_width: u16,
@@ -88,6 +111,13 @@ unsafe extern "C" {
     pub(crate) fn tigt_input_create(
         callback: Option<InputCallback>,
         user: *mut c_void,
+    ) -> *mut c_void;
+    pub(crate) fn tigt_input_create_with_mouse(
+        on_input: Option<InputCallback>,
+        input_user: *mut c_void,
+        on_mouse: Option<MouseCallback>,
+        mouse_user: *mut c_void,
+        mouse_mode: u32,
     ) -> *mut c_void;
     pub(crate) fn tigt_input_feed(input: *mut c_void, bytes: *const u8, length: usize);
     pub(crate) fn tigt_input_flush(input: *mut c_void);

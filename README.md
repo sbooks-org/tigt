@@ -6,6 +6,7 @@ The C library is the implementation. The Rust crate wraps that same library with
 
 - [Getting started](docs/getting-started.md): prerequisites, CMake/Cargo builds and working consumers.
 - [Reference](docs/reference.md): rendering, input, lifecycle, keyboard integration and error contracts.
+- [Mouse support](docs/mouse-support.md): terminal event coverage, coordinate precision, negotiation and protocol limits.
 - [Instrumentation](docs/instrumentation.md): signals, PNG/text dumps, files/FIFOs, analysis and C/Rust parity testing.
 
 ## Build and test
@@ -36,7 +37,8 @@ Both repositories are currently private. Development tests require read access t
 - Text frames: resolved single-column Unicode cells and RGB colours.
 - Optional register/VRAM adapter: headless MDA/CGA standard text and basic CGA graphics decoding; PCjr exposes CGA compatibility only. C `tigt_video.h` and Rust `tigt::video` need no terminal session for tests.
 - Overscan metadata is retained but not drawn.
-- Optional `keyboard` feature integrates the separate [terminal-to-pc-keyboard](https://github.com/sbooks-org/terminal-to-pc-keyboard) mapper.
+- Optional in-tree PC/XT and PC/AT keyboard mapper: Cargo `keyboard` or CMake `TIGT_WITH_KEYBOARD=ON`, both off by default. CMake needs Rust only when the mapper is enabled; no separate mapper checkout or Git fetch is required.
+- Keyboard callbacks, mouse reports and graphics replies share one terminal input reader. Mouse events preserve terminal cell/pixel coordinates and map to the displayed frame, including fractional positions. Buttons, wheel, click-only terminals and Kitty pixel-mode leave reports are supported; these protocols do not identify multitouch contacts.
 - Snapshot instrumentation is opt-in. No dump signal is installed by default.
 
 MIT-0. Copyright (C) 2026 Simplebooks Foundation. Copyright (C) 2026 Josh Rodd.

@@ -10,17 +10,19 @@
 //! curses or the tigt C lifecycle independently while it is alive. Frames are
 //! copied by C before submission returns, so their slices need not be retained.
 //! Input decoding is independent of rendering and of any keyboard mapper.
-//! Enable the optional `keyboard` feature for conversions to `pc-xt-keyboard`.
+//! Enable the optional `keyboard` feature for the in-tree PC/XT and PC/AT mapper.
 
 mod ffi;
 mod input;
 #[cfg(feature = "keyboard")]
 pub mod keyboard;
+mod mouse;
 pub mod presenter;
 mod snapshot;
 pub mod video;
 
 pub use input::{InputDecoder, InputEvent, InputKey, InputKind, ModifierKey, Modifiers};
+pub use mouse::{MouseButton, MouseCoordinates, MouseDecoder, MouseEvent, MouseKind, MouseMode};
 pub use snapshot::{SnapshotConfig, SnapshotFormat, SnapshotSignal, SnapshotStatus};
 
 use input::{CallbackHandle, dispatch};
@@ -32,7 +34,7 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 pub const TEXT_MAX_COLUMNS: u16 = 320;
 pub const TEXT_MAX_ROWS: u16 = 128;
 pub const TEXT_MAX_CELLS: usize = 21440;
@@ -135,7 +137,7 @@ pub enum Error {
     Busy,
     /// An allocation, thread, or other system operation failed.
     System,
-    /// The input handler panicked and has been permanently disabled.
+    /// An input or mouse handler panicked and has been permanently disabled.
     CallbackPanicked,
     /// The C decoder returned an event outside this binding's ABI.
     InvalidInputEvent,
@@ -192,12 +194,15 @@ impl Drop for SessionClaim {
 }
 
 type InputHandler = Box<dyn FnMut(InputEvent) + Send + 'static>;
+type MouseHandler = Box<dyn FnMut(MouseEvent) + Send + 'static>;
 
 /// Exclusive, owning-thread terminal session.
 ///
-/// `new` is output-only; `with_input` calls a Send handler on C's input thread.
-/// Input handlers cannot capture this non-Send session. They should send events
-/// to the owning thread instead of invoking lifecycle operations. Ctrl+C and
+/// `new` is output-only; `with_input`, `with_mouse`, and `with_input_and_mouse`
+/// call Send handlers on C's shared input worker. Keyboard and mouse callbacks
+/// are serialized, never concurrent. Handlers cannot capture this non-Send
+/// session and must not invoke lifecycle operations or reenter input decoding.
+/// Send events to the owning thread instead. Ctrl+C and
 /// Ctrl+Z arrive as semantic control characters: application policy decides
 /// whether to quit or suspend. Signal dispositions remain application-owned.
 ///
@@ -207,6 +212,7 @@ type InputHandler = Box<dyn FnMut(InputEvent) + Send + 'static>;
 /// C session.
 pub struct Session {
     callback: Option<CallbackHandle<InputHandler>>,
+    mouse_callback: Option<CallbackHandle<MouseHandler>>,
     _claim: SessionClaim,
     _owner_thread: PhantomData<Rc<()>>,
 }
@@ -219,7 +225,7 @@ impl Session {
 
     /// Opens an output-only session with an explicit bitmap output policy.
     pub fn new_with_graphics(mode: GraphicsMode) -> Result<Self, Error> {
-        Self::start(SessionClaim::acquire()?, None, mode)
+        Self::start(SessionClaim::acquire()?, None, None, mode, MouseMode::Off)
     }
 
     /// Opens a session with a serialized input-thread callback.
@@ -242,17 +248,112 @@ impl Session {
         F: FnMut(InputEvent) + Send + 'static,
     {
         let claim = SessionClaim::acquire()?;
-        Self::start(claim, Some(CallbackHandle::new(Box::new(handler))), mode)
+        Self::start(
+            claim,
+            Some(CallbackHandle::new(Box::new(handler))),
+            None,
+            mode,
+            MouseMode::Off,
+        )
+    }
+
+    /// Opens a mouse-only session; keyboard events are not delivered.
+    ///
+    /// Off returns [`Error::Argument`]; use [`Self::new`] for output-only.
+    /// Callback serialization and panic handling match [`Self::with_input`].
+    pub fn with_mouse<F>(mode: MouseMode, handler: F) -> Result<Self, Error>
+    where
+        F: FnMut(MouseEvent) + Send + 'static,
+    {
+        Self::with_mouse_and_graphics(GraphicsMode::Auto, mode, handler)
+    }
+
+    /// Opens a mouse-only session with a bitmap output policy.
+    pub fn with_mouse_and_graphics<F>(
+        graphics: GraphicsMode,
+        mode: MouseMode,
+        handler: F,
+    ) -> Result<Self, Error>
+    where
+        F: FnMut(MouseEvent) + Send + 'static,
+    {
+        if mode == MouseMode::Off {
+            return Err(Error::Argument);
+        }
+        Self::start(
+            SessionClaim::acquire()?,
+            None,
+            Some(CallbackHandle::new(Box::new(handler))),
+            graphics,
+            mode,
+        )
+    }
+
+    /// Opens a session with keyboard and mouse handlers on one shared worker.
+    ///
+    /// Callbacks are serialized and must not reenter decoding or call lifecycle
+    /// operations. Each owns independent panic-contained state; [`Self::input_status`]
+    /// reports failure from either. Off returns [`Error::Argument`]; use
+    /// [`Self::with_input`] for keyboard-only.
+    pub fn with_input_and_mouse<I, M>(
+        mode: MouseMode,
+        input_handler: I,
+        mouse_handler: M,
+    ) -> Result<Self, Error>
+    where
+        I: FnMut(InputEvent) + Send + 'static,
+        M: FnMut(MouseEvent) + Send + 'static,
+    {
+        Self::with_input_and_mouse_and_graphics(
+            GraphicsMode::Auto,
+            mode,
+            input_handler,
+            mouse_handler,
+        )
+    }
+
+    /// Opens a combined-input session with a bitmap output policy.
+    ///
+    /// Callback and mode rules match [`Self::with_input_and_mouse`].
+    pub fn with_input_and_mouse_and_graphics<I, M>(
+        graphics: GraphicsMode,
+        mode: MouseMode,
+        input_handler: I,
+        mouse_handler: M,
+    ) -> Result<Self, Error>
+    where
+        I: FnMut(InputEvent) + Send + 'static,
+        M: FnMut(MouseEvent) + Send + 'static,
+    {
+        if mode == MouseMode::Off {
+            return Err(Error::Argument);
+        }
+        Self::start(
+            SessionClaim::acquire()?,
+            Some(CallbackHandle::new(Box::new(input_handler))),
+            Some(CallbackHandle::new(Box::new(mouse_handler))),
+            graphics,
+            mode,
+        )
     }
 
     fn start(
         claim: SessionClaim,
         callback: Option<CallbackHandle<InputHandler>>,
+        mouse_callback: Option<CallbackHandle<MouseHandler>>,
         mode: GraphicsMode,
+        mouse_mode: MouseMode,
     ) -> Result<Self, Error> {
         let (on_input, user) = match &callback {
             Some(state) => (
                 Some(dispatch::<InputHandler> as ffi::InputCallback),
+                state.user(),
+            ),
+            None => (None, ptr::null_mut()),
+        };
+        let (on_mouse, mouse_user) = match &mouse_callback {
+            Some(state) => (
+                Some(mouse::dispatch::<MouseHandler> as ffi::MouseCallback),
                 state.user(),
             ),
             None => (None, ptr::null_mut()),
@@ -262,6 +363,9 @@ impl Session {
             on_input,
             user,
             graphics_mode: mode as u32,
+            on_mouse,
+            mouse_user,
+            mouse_mode: mouse_mode as u32,
         };
         // Config is copied by C; callback storage stays at its raw allocation.
         // Init failure stops callbacks before returning; claim then releases
@@ -269,6 +373,7 @@ impl Session {
         check_status(unsafe { ffi::tigt_init(&config) })?;
         Ok(Self {
             callback,
+            mouse_callback,
             _claim: claim,
             _owner_thread: PhantomData,
         })
@@ -282,6 +387,14 @@ impl Session {
     /// Returns the resolved bitmap output mode. Resume resolves the mode again.
     pub fn graphics_mode(&self) -> GraphicsMode {
         GraphicsMode::from_raw(unsafe { ffi::tigt_get_graphics_mode() })
+    }
+
+    /// Returns the resolved live mouse protocol, never Auto.
+    ///
+    /// Reporting is Off while inactive; resume resolves Auto again.
+    pub fn mouse_mode(&self) -> MouseMode {
+        MouseMode::from_raw(unsafe { ffi::tigt_get_mouse_mode() })
+            .expect("C returned an invalid mouse mode")
     }
 
     /// Sets sixel/iTerm2 target width in terminal columns and display aspect ratio.
@@ -306,10 +419,13 @@ impl Session {
         check_status(unsafe { ffi::tigt_set_image_layout(columns, aspect_width, aspect_height) })
     }
 
-    /// Reports asynchronous input-handler failure without touching curses.
+    /// Reports asynchronous keyboard- or mouse-handler failure without touching curses.
     /// A successful result is a snapshot, not a promise about future callbacks.
     pub fn input_status(&self) -> Result<(), Error> {
         self.callback
+            .as_ref()
+            .map_or(Ok(()), |callback| callback.status())?;
+        self.mouse_callback
             .as_ref()
             .map_or(Ok(()), |callback| callback.status())
     }

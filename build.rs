@@ -110,6 +110,7 @@ fn main() {
         "include/tigt_presenter.h",
         "src/palette.h",
         "include/tigt.h",
+        "include/tigt_mouse.h",
         "include/tigt_video.h",
         "build.rs",
     ] {

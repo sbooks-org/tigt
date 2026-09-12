@@ -14,6 +14,7 @@ build = "build.rs"
 
 [workspace]
 members = ["."]
+exclude = ["keyboard"]
 resolver = "3"
 
 [lib]
@@ -29,7 +30,7 @@ test-fixtures = []
 
 [dependencies]
 libc = "0.2"
-pc-xt-keyboard = { git = "ssh://git@github.com/sbooks-org/terminal-to-pc-keyboard.git", rev = "d88bd182f24eb7567fba04585bc7e58419c649a1", optional = true, default-features = false }
+pc-xt-keyboard = { path = "keyboard", optional = true, default-features = false }
 
 [build-dependencies]
 cc = "1"
