@@ -79,6 +79,7 @@ struct tigt_presenter {
     bool utf8;
     bool initialized;
     bool fullscreen;
+    bool fullscreen_resume, foreground_fullscreen;
     bool recovery_boundary, recovery_text, recovery_confirming;
     unsigned recovery_ticks;
     bool pending;
@@ -956,6 +957,8 @@ observe_terminal(tigt_presenter *p)
     bool background = !tigt_terminal_fd_foreground(p->config.output_fd);
     unsigned epoch = tigt_terminal_generation();
     if (background != p->background || epoch != p->terminal_generation) {
+        bool resume_fullscreen = !background && (p->fullscreen || p->foreground_fullscreen);
+        if (background && !p->background) p->foreground_fullscreen = p->fullscreen;
         p->background = background;
         p->terminal_generation = epoch;
         p->host_cursor_known = false;
@@ -966,8 +969,12 @@ observe_terminal(tigt_presenter *p)
             tigt_terminal_record_error(p->error);
             return p->error;
         }
-        if (p->fullscreen) {
-            p->fullscreen = false;
+        if (p->fullscreen || resume_fullscreen) {
+            p->fullscreen = resume_fullscreen;
+            p->fullscreen_resume = resume_fullscreen;
+            if (resume_fullscreen) p->foreground_fullscreen = false;
+            p->recovery_boundary = p->recovery_text = p->recovery_confirming = false;
+            p->recovery_ticks = 0;
             p->pending = false;
             p->pending_ticks = 0;
             p->echo_count = 0;
@@ -1213,7 +1220,7 @@ finish_output(tigt_presenter *p, bool nonblocking)
         unsigned height = p->next_region_height;
         unsigned width = frame->columns < p->next_host_columns ?
                          frame->columns : p->next_host_columns;
-        bool entering = !p->fullscreen;
+        bool entering = !p->fullscreen || p->fullscreen_resume;
         commit(p, frame);
         p->host_columns = p->next_host_columns;
         p->host_rows = p->next_host_rows;
@@ -1222,6 +1229,7 @@ finish_output(tigt_presenter *p, bool nonblocking)
         p->host_row = p->region_top + (frame->cursor_row < height ? frame->cursor_row : height - 1);
         p->host_column = 1 + (frame->cursor_column < width ? frame->cursor_column : width - 1);
         p->host_cursor_known = true;
+        p->fullscreen_resume = false;
         p->host_wrap = p->echo_failed = false;
         p->echo_count = 0;
         if (p->next_glass_plan)
@@ -1326,6 +1334,10 @@ draw_fullscreen(tigt_presenter *p, const tigt_presenter_frame *frame, bool enter
 {
     if (!tigt_terminal_fd_foreground(p->config.output_fd))
         return TIGT_ERROR_UNREPRESENTABLE;
+    if (p->fullscreen_resume) {
+        entering = true;
+        recovered = false;
+    }
     unsigned host_columns, host_rows;
     int result = terminal_size(p, &host_columns, &host_rows);
     if (result != TIGT_OK)
@@ -1494,6 +1506,8 @@ tigt_presenter_observe_cursor(tigt_presenter *p, unsigned column, unsigned row)
         return TIGT_ERROR_ARGUMENT;
     if (p->output_pending)
         return TIGT_ERROR_BUSY;
+    int terminal_result = observe_terminal(p);
+    if (terminal_result < TIGT_OK) return terminal_result;
     unsigned columns, rows;
     int result = terminal_size(p, &columns, &rows);
     if (result != TIGT_OK)
@@ -1874,6 +1888,7 @@ tigt_presenter_reset(tigt_presenter *p)
         p->registered_fullscreen = false;
     }
     p->initialized = p->fullscreen = p->pending = p->output_pending = false;
+    p->fullscreen_resume = p->foreground_fullscreen = false;
     p->recovery_boundary = p->recovery_text = p->recovery_confirming = false;
     p->pending_ticks = p->recovery_ticks = 0;
     p->video_disabled_ticks = 0;

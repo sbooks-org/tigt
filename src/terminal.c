@@ -22,7 +22,7 @@ _Static_assert(ATOMIC_INT_LOCK_FREE == 2, "terminal signals require lock-free in
 _Static_assert(ATOMIC_POINTER_LOCK_FREE == 2, "terminal signals require lock-free pointer atomics");
 enum { OWN_INPUT = 1, OWN_OUTPUT = 2, OWN_KEYBOARD = 4, OWN_MOUSE = 8, OWN_SCREEN = 16 };
 static atomic_int captured, owned, blocked, failure, events, generation, desired_raw;
-static atomic_int desired_keyboard, desired_mouse, probe_mode;
+static atomic_int desired_keyboard, desired_mouse, probe_mode, input_disabled, input_generation;
 static atomic_int deferred_restore, faulted;
 static int input_fd = -1, output_fd = -1, cleanup_fd = -1;
 static atomic_int pending_protocols, pending_fullscreen;
@@ -68,14 +68,17 @@ int tigt_terminal_is_foreground(void)
 {
     if (!atomic_load(&captured))
         return 0;
-    return (!input_tty || tcgetpgrp(input_fd) == getpgrp()) &&
+    return (!input_tty || atomic_load(&input_disabled) || tcgetpgrp(input_fd) == getpgrp()) &&
            (!output_tty || tcgetpgrp(output_fd) == getpgrp());
 }
 
-static void release_write(const char *text, size_t length)
+static int release_write(const char *text, size_t length)
 {
-    if (cleanup_fd < 0 || write(cleanup_fd, text, length) != (ssize_t) length)
+    if (cleanup_fd < 0 || write(cleanup_fd, text, length) != (ssize_t) length) {
         tigt_terminal_record_error(TIGT_ERROR_SYSTEM);
+        return TIGT_ERROR_SYSTEM;
+    }
+    return TIGT_OK;
 }
 
 void tigt_terminal_pending_fullscreen(int delta)
@@ -91,7 +94,7 @@ void tigt_terminal_release(void)
     /* The borrowed stdout may have failed, closed, or been replaced. Cleanup
      * belongs to the original captured TTY, never to its replacement fd. */
     bool output_foreground = cleanup_fd >= 0 && tcgetpgrp(cleanup_fd) == getpgrp();
-    bool foreground = (!input_tty || tcgetpgrp(input_fd) == getpgrp()) &&
+    bool foreground = (!input_tty || atomic_load(&input_disabled) || tcgetpgrp(input_fd) == getpgrp()) &&
                       (!output_tty || output_foreground);
     if (atomic_load(&captured) && !foreground &&
         atomic_load(&pending_fullscreen) > 0)
@@ -163,6 +166,7 @@ int tigt_terminal_capture(int in, int out)
     atomic_store(&failure, TIGT_OK);
     atomic_store(&events, 0);
     atomic_store(&desired_raw, 0);
+    atomic_store(&input_disabled, 0);
     atomic_store(&desired_keyboard, 0);
     atomic_store(&desired_mouse, TIGT_MOUSE_OFF);
     atomic_store(&probe_mode, 0);
@@ -208,13 +212,13 @@ static int apply_input(void)
 {
     if (!input_tty) return TIGT_OK;
     struct termios mode = baseline_input;
-    if (atomic_load(&desired_raw)) {
+    if (!atomic_load(&input_disabled) && atomic_load(&desired_raw)) {
         mode.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
         mode.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
         mode.c_cflag = (mode.c_cflag & ~(CSIZE | PARENB)) | CS8;
         mode.c_cc[VMIN] = 0;
         mode.c_cc[VTIME] = 0;
-    } else {
+    } else if (!atomic_load(&input_disabled)) {
         mode.c_lflag |= ICANON | ECHO;
     }
     if (atomic_load(&probe_mode)) {
@@ -230,10 +234,11 @@ static int apply_protocols(void)
 {
     if (!output_tty) return TIGT_OK;
     int state = atomic_load(&owned), result = TIGT_OK;
-    if (atomic_load(&desired_keyboard) && !(state & OWN_KEYBOARD)) {
+    bool keyboard = !atomic_load(&input_disabled) && atomic_load(&desired_keyboard);
+    if (keyboard && !(state & OWN_KEYBOARD)) {
         atomic_fetch_or(&owned, OWN_KEYBOARD);
         result = normal_write(keyboard_on);
-    } else if (!atomic_load(&desired_keyboard) && (state & OWN_KEYBOARD)) {
+    } else if (!keyboard && (state & OWN_KEYBOARD)) {
         result = normal_write(keyboard_off);
         if (result == TIGT_OK) atomic_fetch_and(&owned, ~OWN_KEYBOARD);
     }
@@ -246,15 +251,68 @@ int tigt_terminal_set_input_mode(int raw, int keyboard)
         return TIGT_ERROR_ARGUMENT;
     if (!atomic_load(&captured)) return TIGT_ERROR_ARGUMENT;
     pthread_mutex_lock(&io_mutex);
+    bool reenable = atomic_exchange(&input_disabled, 0) != 0;
     atomic_store(&desired_raw, raw);
     atomic_store(&desired_keyboard, keyboard);
     int result = TIGT_OK;
     if (tigt_terminal_is_foreground() && !atomic_load(&blocked)) {
         result = apply_input();
         if (result == TIGT_OK) result = apply_protocols();
+        if (result == TIGT_OK && reenable && atomic_load(&desired_mouse) != TIGT_MOUSE_OFF)
+            result = tigt_terminal_mouse((uint32_t) atomic_load(&desired_mouse));
         if (result != TIGT_OK) tigt_terminal_release();
     }
     pthread_mutex_unlock(&io_mutex);
+    if (result != TIGT_OK) tigt_terminal_record_error(result);
+    if (reenable && result == TIGT_OK) {
+        atomic_fetch_or(&events, TIGT_TERMINAL_INPUT_RESET);
+        if (owner_transition != NULL) {
+            owner_transition(TIGT_TERMINAL_INPUT_RESET);
+            result = tigt_terminal_status();
+        }
+    }
+    return result;
+}
+
+int tigt_terminal_input_disabled(void) { return atomic_load(&input_disabled); }
+
+int tigt_terminal_disable_input(void)
+{
+    if (!atomic_load(&captured)) return TIGT_ERROR_ARGUMENT;
+    pthread_mutex_lock(&io_mutex);
+    bool changed = atomic_exchange(&input_disabled, 1) == 0;
+    if (changed) atomic_fetch_add(&input_generation, 1);
+    atomic_store(&probe_mode, 0);
+    int state = atomic_fetch_and(&owned, ~(OWN_INPUT | OWN_KEYBOARD | OWN_MOUSE));
+    sigset_t set, previous;
+    sigemptyset(&set);
+    sigaddset(&set, SIGTTOU);
+    pthread_sigmask(SIG_BLOCK, &set, &previous);
+    int result = TIGT_OK;
+    if ((state & OWN_INPUT) && tcsetattr(input_fd, TCSANOW, &baseline_input) < 0) {
+        atomic_fetch_or(&owned, OWN_INPUT);
+        result = TIGT_ERROR_SYSTEM;
+    }
+    bool foreground = cleanup_fd >= 0 && tcgetpgrp(cleanup_fd) == getpgrp();
+    if (foreground) {
+        if ((state & OWN_KEYBOARD) && release_write(keyboard_off, sizeof(keyboard_off) - 1) != TIGT_OK) {
+            atomic_fetch_or(&owned, OWN_KEYBOARD);
+            result = TIGT_ERROR_SYSTEM;
+        }
+        if ((state & OWN_MOUSE) && release_write(mouse_off, sizeof(mouse_off) - 1) != TIGT_OK) {
+            atomic_fetch_or(&owned, OWN_MOUSE);
+            result = TIGT_ERROR_SYSTEM;
+        }
+    } else
+        atomic_fetch_or(&pending_protocols, state & (OWN_KEYBOARD | OWN_MOUSE));
+    pthread_sigmask(SIG_SETMASK, &previous, NULL);
+    pthread_mutex_unlock(&io_mutex);
+    if (changed) {
+        atomic_fetch_or(&events, TIGT_TERMINAL_INPUT_RESET);
+        /* Joining an input worker while holding the I/O gate would deadlock
+         * a reader waiting to finish its bounded read. Output stays active. */
+        if (owner_transition != NULL) owner_transition(TIGT_TERMINAL_INPUT_RESET);
+    }
     if (result != TIGT_OK) tigt_terminal_record_error(result);
     return result;
 }
@@ -263,6 +321,7 @@ int tigt_terminal_set_probe_mode(int enabled)
 {
     if ((enabled != 0 && enabled != 1) || !atomic_load(&captured))
         return TIGT_ERROR_ARGUMENT;
+    if (enabled && atomic_load(&input_disabled)) return TIGT_ERROR_BUSY;
     pthread_mutex_lock(&io_mutex);
     int result = TIGT_ERROR_BACKGROUND;
     if (tigt_terminal_is_foreground() && !atomic_load(&blocked)) {
@@ -289,6 +348,7 @@ void tigt_terminal_screen(int enabled)
 int tigt_terminal_mouse(uint32_t mode)
 {
     atomic_store(&desired_mouse, (int) mode);
+    if (atomic_load(&input_disabled)) return TIGT_OK;
     if (!tigt_terminal_is_foreground()) return TIGT_ERROR_BACKGROUND;
     if (mode == TIGT_MOUSE_OFF) return TIGT_OK;
     if (!(atomic_load(&owned) & OWN_MOUSE)) {
@@ -320,7 +380,8 @@ int tigt_terminal_restore(void)
     atomic_store(&probe_mode, 0);
     int result = apply_input();
     if (result == TIGT_OK) result = apply_protocols();
-    if (result == TIGT_OK && atomic_load(&desired_mouse) != TIGT_MOUSE_OFF)
+    if (result == TIGT_OK && !atomic_load(&input_disabled) &&
+        atomic_load(&desired_mouse) != TIGT_MOUSE_OFF)
         result = tigt_terminal_mouse((uint32_t) atomic_load(&desired_mouse));
     if (result != TIGT_OK) {
         tigt_terminal_record_error(result);
@@ -386,6 +447,7 @@ int tigt_terminal_poll(void)
 /* The filter is confined to one decoder consumer. Generation changes discard
  * bookkeeping lazily; handlers never touch non-atomic key data. */
 static unsigned filter_generation;
+static unsigned filter_input_generation;
 static bool literal_next, quoted, prefix_down;
 static tigt_input_key quoted_key;
 static unsigned suppressed;
@@ -397,11 +459,14 @@ int tigt_terminal_filter_input(const tigt_input_event *event)
 {
     if (event == NULL || event->kind > TIGT_RELEASE) return TIGT_ERROR_ARGUMENT;
     unsigned epoch = tigt_terminal_generation();
-    if (filter_generation != epoch) {
+    unsigned input_epoch = (unsigned) atomic_load(&input_generation);
+    if (filter_generation != epoch || filter_input_generation != input_epoch) {
         literal_next = quoted = prefix_down = false;
         suppressed = 0;
         filter_generation = epoch;
+        filter_input_generation = input_epoch;
     }
+    if (atomic_load(&input_disabled)) return 0;
     if (event->flags & TIGT_INPUT_PASTE) return 1;
     if (!atomic_load(&desired_raw)) return 1;
     if (!tigt_terminal_is_foreground() || atomic_load(&blocked)) return 0;

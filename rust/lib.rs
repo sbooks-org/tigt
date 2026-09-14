@@ -515,6 +515,17 @@ impl Session {
         }
     }
 
+    /// Stops terminal input/probes without suspending ongoing output.
+    ///
+    /// Restores the captured input baseline, including saved noecho, and disables
+    /// keyboard/mouse reporting while retaining display ownership. Input stays
+    /// disabled across terminal restoration; no output-generation change is
+    /// caused by this operation. Call on the normal owner, never a callback or
+    /// signal handler. This remains available after a callback panic.
+    pub fn disable_input(&mut self) -> Result<(), Error> {
+        check_status(unsafe { ffi::tigt_terminal_disable_input() })
+    }
+
     /// Restores shell state and stops worker callbacks, retaining ownership.
     /// This remains available even after a callback panic.
     pub fn suspend(&mut self) {

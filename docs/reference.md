@@ -73,6 +73,7 @@ An output-only presenter still does not read input or decide when to change inpu
 |---|---|---|
 | `tigt_terminal_capture(input_fd, output_fd)` | `Terminal::capture(input.as_fd(), output.as_fd())` | Capture borrowed descriptors and baseline without changing terminal state; Busy if already owned. Pipes are permitted. |
 | `tigt_terminal_set_input_mode(raw, keyboard_reporting)` | `terminal.set_input_mode(InputMode::Cooked)` / `InputMode::Raw { keyboard_reporting }` | Set desired cooked editing/echo or raw policy and optional keyboard reporting. |
+| `tigt_terminal_disable_input()` | `terminal.disable_input()` / `session.disable_input()` | Restore the exact saved input baseline and disable input/probes and keyboard/mouse reporting while retaining output ownership. |
 | `tigt_terminal_set_probe_mode(enabled)` | `terminal.set_probe_mode(enabled)` | Temporarily disable canonical buffering/echo for a foreground query; preserve cooked kernel signals/literal-next and unread input. |
 | `tigt_terminal_filter_input(&event)` | `terminal.filter_input(event)` | Apply host policy once to an externally decoded event: 1/true forwards, 0/false consumes, negative/Err reports failure. |
 | `tigt_terminal_restore/poll/status/generation/is_foreground` | Corresponding owner methods | Share the same process-terminal transitions and persistent error contract as native sessions. |
@@ -80,6 +81,12 @@ An output-only presenter still does not read input or decide when to change inpu
 | `tigt_terminal_forget()` | `Drop` | Release and forget capture; C signal registration remains independently owned. |
 
 The Rust external owner borrows descriptors for its lifetime and is neither Send nor Sync. Do not create it beside a native `Session`, which already captures automatically. Serialize presenter output, input-mode changes, and decoder use; preserve unread cooked text when switching policy. Disable probe mode before switching policy, and bypass host filtering for buffered cooked/query bytes already processed by the line discipline.
+
+Raw and probe modes use `VMIN=0`, `VTIME=0`. A zero-length noncanonical TTY read means no bytes are available, not necessarily EOF; distinguish it from `POLLHUP` and stop draining when no progress is made. Zero-length reads from canonical terminals or non-TTY streams retain their normal EOF meaning. Do not release input or output ownership merely because an otherwise live raw terminal has no pending bytes.
+
+When stdin reaches EOF, call `tigt_terminal_disable_input()` / `disable_input()` in normal owner context; an external owner first stops its own input reader. This restores captured input termios, including an originally noecho baseline, and disables input/probes and keyboard/mouse reporting without releasing the presenter's output lease or changing its output generation. Valid glass output may continue. Input stays disabled across restoration until an explicit `tigt_terminal_set_input_mode` / external `Terminal::set_input_mode` call. Disabling input is not equivalent to full terminal release, session suspension, or forgetting capture; those would also end or invalidate output ownership.
+
+Native `Session::disable_input()` synchronously quiesces its input worker; an external `Terminal` cannot stop a reader owned by the embedding application. Disabling input enqueues `TIGT_TERMINAL_INPUT_RESET` without changing the output generation or invalidating full-screen presentation. Handle that event by releasing held guest input even when the generation is unchanged; do not treat an input-only reset as a request to clear or rebase the display.
 
 ### Host controls and literal-next
 

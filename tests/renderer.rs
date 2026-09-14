@@ -726,6 +726,10 @@ fn terminal_lifecycle_preserves_job_control_signal_and_background_contracts() {
         raw_sent && cooked_sent,
         "both real PTY input paths must complete"
     );
+    assert!(
+        capture.windows(b"alive".len()).any(|w| w == b"alive"),
+        "ending input must preserve real glass output"
+    );
     let pipe_begin = capture
         .windows(b"PIPE-CLEANUP-BEGIN".len())
         .position(|w| w == b"PIPE-CLEANUP-BEGIN")

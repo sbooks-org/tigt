@@ -40,14 +40,23 @@ int tigt_terminal_restore(void);
 int tigt_terminal_poll(void);
 int tigt_terminal_status(void);
 unsigned tigt_terminal_generation(void);
-/* Nonzero only if every captured TTY is owned by this process group. Pipes
- * require no foreground ownership; no captured owner returns zero. */
+/* Nonzero only if the output TTY and any enabled input TTY belong to this
+ * process group. Pipes need no foreground ownership; no owner returns zero. */
 int tigt_terminal_is_foreground(void);
 /* Raw mode disables kernel ISIG/IEXTEN; filter_input owns host keys. Cooked
  * mode enables canonical/echo and preserves baseline ISIG/IEXTEN/VLNEXT so
  * quoted bytes already processed by the kernel are never signalled twice.
- * No input flushing. The requested policy survives release/backgrounding. */
+ * No input flushing. The requested policy survives release/backgrounding.
+ * Raw/probe modes use VMIN=VTIME=0: an empty read is not itself EOF.
+ * External readers must distinguish no input from a poll-reported hangup. */
 int tigt_terminal_set_input_mode(int raw, int keyboard_reporting);
+/* Normal owning-thread context. Disable input/probes, restore exact captured
+ * input termios (including noecho), and restore keyboard/mouse reporting.
+ * Native input workers are joined; external readers remain caller-owned.
+ * Display/output ownership and generation are unchanged; INPUT_RESET is
+ * reported so consumers release held guest input without rebasing output.
+ * Disabled input survives restore/resume until explicit set_input_mode. */
+int tigt_terminal_disable_input(void);
 /* Temporary noecho/noncanonical cursor-query input, preserving the desired
  * mode's signal/quoting policy. Foreground only; no input flushing. Disable
  * before switching policy, and bypass filter for buffered cooked/query bytes. */

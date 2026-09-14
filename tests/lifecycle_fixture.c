@@ -526,6 +526,40 @@ static void background_glass(void)
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
+static void disabled_input_preserves_output(void)
+{
+    if (begin_job()) {
+        start_capture();
+        CHECK(tigt_terminal_disable_input() == TIGT_OK);
+        CHECK(tigt_terminal_disable_input() == TIGT_OK);
+        check_baseline();
+        tigt_terminal_release();
+        CHECK(tigt_terminal_restore() == TIGT_OK);
+        check_baseline(); /* Continuation must not revive an ended input stream. */
+        tigt_presenter *presenter = NULL;
+        const tigt_presenter_config config = { .abi_version = TIGT_PRESENTER_ABI_VERSION,
+            .output_fd = STDOUT_FILENO, .mode = TIGT_PRESENT_GLASS,
+            .encoding = TIGT_ENCODING_UTF8 };
+        CHECK(tigt_presenter_create(&config, &presenter) == TIGT_OK);
+        const tigt_text_cell cells[] = {
+            { 'a', 0xaaaaaa, 0, 0 }, { 'l', 0xaaaaaa, 0, 0 },
+            { 'i', 0xaaaaaa, 0, 0 }, { 'v', 0xaaaaaa, 0, 0 },
+            { 'e', 0xaaaaaa, 0, 0 }, { ' ', 0xaaaaaa, 0, 0 }
+        };
+        const tigt_presenter_frame frame = { .cells = cells, .columns = 6, .rows = 1,
+            .stride = 6, .cursor_column = 5, .cursor_row = 0, .refresh_hz = 60 };
+        CHECK(tigt_presenter_present(presenter, &frame) == TIGT_OK);
+        check_baseline();
+        tigt_presenter_destroy(presenter);
+        CHECK(tigt_terminal_set_input_mode(1, 1) == TIGT_OK);
+        check_raw();
+        finish_capture();
+        _exit(0);
+    }
+    int status = finish_job();
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
 static unsigned forwarded[3][3];
 static unsigned paste_controls;
 static int input_done;
@@ -683,6 +717,7 @@ int main(void)
     background_bitmap(0);
     background_bitmap(1);
     background_glass();
+    disabled_input_preserves_output();
     quoted_controls();
     alarm(0);
     puts("PASS terminal lifecycle, signal chaining, job control, background output and quoting");

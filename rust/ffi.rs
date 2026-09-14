@@ -77,6 +77,7 @@ unsafe extern "C" {
     pub(crate) fn tigt_terminal_generation() -> u32;
     pub(crate) fn tigt_terminal_is_foreground() -> c_int;
     pub(crate) fn tigt_terminal_set_input_mode(raw: c_int, keyboard_reporting: c_int) -> c_int;
+    pub(crate) fn tigt_terminal_disable_input() -> c_int;
     pub(crate) fn tigt_terminal_set_probe_mode(enabled: c_int) -> c_int;
     pub(crate) fn tigt_terminal_filter_input(event: *const InputEvent) -> c_int;
     pub(crate) fn tigt_terminal_install_signal_handlers() -> c_int;

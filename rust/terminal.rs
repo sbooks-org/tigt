@@ -120,6 +120,18 @@ impl<'fd> Terminal<'fd> {
         check_status(unsafe { ffi::tigt_terminal_set_input_mode(raw, keyboard) })
     }
 
+    /// Disables input while retaining the presenter's output lease.
+    ///
+    /// After stopping its input reader (for example on stdin EOF), an external
+    /// owner can restore the exact captured input termios, including saved
+    /// noecho, and disable keyboard/mouse reporting without suspending valid
+    /// glass output. Input and probes remain disabled across restoration until
+    /// an explicit [`Self::set_input_mode`] call. This does not change the output
+    /// generation or relinquish capture. Call only in normal owner context.
+    pub fn disable_input(&mut self) -> Result<(), Error> {
+        check_status(unsafe { ffi::tigt_terminal_disable_input() })
+    }
+
     /// Temporarily disables canonical buffering/echo for a foreground query.
     /// Kernel signal and literal-next handling remain intact in cooked mode.
     /// Disabling restores the desired mode without flushing unread input.

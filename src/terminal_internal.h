@@ -12,6 +12,7 @@ void tigt_terminal_record_error(int error);
 int tigt_terminal_is_released(void);
 void tigt_terminal_set_owner(void (*transition)(unsigned events));
 int tigt_terminal_is_faulted(void);
+int tigt_terminal_input_disabled(void);
 void tigt_terminal_pending_fullscreen(int delta);
 /* Called before curses/protocol mutation so partial setup is releasable. */
 void tigt_terminal_screen(int enabled);
