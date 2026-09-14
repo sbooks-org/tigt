@@ -1203,14 +1203,15 @@ terminal_report(const char *parameters, uint8_t final, void *user)
 }
 
 static int
-resolve_terminal_modes(void)
+resolve_terminal_modes(bool resolve_graphics)
 {
-    uint32_t selected = renderer_config.graphics_mode;
+    uint32_t selected = resolve_graphics ? renderer_config.graphics_mode : renderer_graphics_mode;
     const char *codeset = nl_langinfo(CODESET);
     const bool utf8 = strcmp(codeset, "UTF-8") == 0 || strcmp(codeset, "UTF8") == 0;
     struct stat input, output;
-    const bool graphics_probe = selected == TIGT_GRAPHICS_AUTO || selected == TIGT_GRAPHICS_SIXEL ||
-                                selected == TIGT_GRAPHICS_ITERM2;
+    const bool graphics_probe = resolve_graphics &&
+        (selected == TIGT_GRAPHICS_AUTO || selected == TIGT_GRAPHICS_SIXEL ||
+         selected == TIGT_GRAPHICS_ITERM2);
     const bool mouse = renderer_config.on_mouse != NULL && !tigt_terminal_input_disabled();
     const bool probe = tigt_terminal_is_foreground() && !tigt_terminal_is_released() &&
                        (graphics_probe || mouse) && renderer_input != NULL &&
@@ -1250,7 +1251,7 @@ resolve_terminal_modes(void)
         if (renderer_ascii == NULL) return TIGT_ERROR_SYSTEM;
     }
     pthread_mutex_lock(&renderer_mutex);
-    renderer_graphics_mode = selected;
+    if (resolve_graphics) renderer_graphics_mode = selected;
     uint32_t mouse_mode = renderer_config.mouse_mode;
     if (mouse_mode == TIGT_MOUSE_AUTO)
         mouse_mode = terminal_mouse_pixels ? TIGT_MOUSE_PIXELS : TIGT_MOUSE_CELLS;
@@ -1411,7 +1412,7 @@ tigt_resume(void)
     }
     result = start_input_worker();
     if (result != TIGT_OK) goto failure;
-    result = resolve_terminal_modes();
+    result = resolve_terminal_modes(true);
     if (result != TIGT_OK) goto failure;
 start_workers:
     atomic_store_explicit(&renderer_running, true, memory_order_relaxed);
@@ -1447,7 +1448,7 @@ terminal_transition(unsigned changes)
         } else if (renderer_active && !input_thread_created &&
                    tigt_terminal_is_foreground() && !tigt_terminal_is_released()) {
             int result = start_input_worker();
-            if (result == TIGT_OK) result = resolve_terminal_modes();
+            if (result == TIGT_OK) result = resolve_terminal_modes(false);
             if (result != TIGT_OK) tigt_terminal_record_error(result);
         }
     }
