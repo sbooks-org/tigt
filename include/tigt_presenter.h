@@ -138,7 +138,9 @@ int tigt_presenter_local_echo(tigt_presenter *presenter, const uint32_t *text, s
  * Background operation is nonadaptive glass; fullscreen is never emitted.
  * A pending fullscreen transaction invalidated by release/background fails
  * with BACKGROUND and also records terminal status. Foreground restoration
- * invalidates host cursor observations; obtain a fresh CPR before fallback.
+ * retains the prior fullscreen policy but invalidates its physical region.
+ * Obtain a fresh CPR before the resumed repaint; it creates a new region and
+ * restarts adaptive recovery only after that repaint commits.
  * Returned status: OK (glass), PENDING (confirmation, scroll, or disable hold),
  * NEEDS_CURSOR (observation), FULLSCREEN, WOULD_BLOCK, or error. PENDING retains
  * the current presentation/input mode, including when already fullscreen.
