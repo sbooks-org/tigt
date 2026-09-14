@@ -74,6 +74,7 @@ int tigt_terminal_is_foreground(void)
 
 static int release_write(const char *text, size_t length)
 {
+    if (!output_tty) return TIGT_OK;
     if (cleanup_fd < 0 || write(cleanup_fd, text, length) != (ssize_t) length) {
         tigt_terminal_record_error(TIGT_ERROR_SYSTEM);
         return TIGT_ERROR_SYSTEM;
@@ -196,6 +197,7 @@ void tigt_terminal_forget(void)
 
 static int normal_write(const char *text)
 {
+    if (!output_tty) return TIGT_OK;
     size_t length = strlen(text);
     while (length != 0) {
         if (!tigt_terminal_is_foreground())
@@ -337,7 +339,7 @@ int tigt_terminal_set_probe_mode(int enabled)
 
 void tigt_terminal_screen(int enabled)
 {
-    if (enabled) atomic_fetch_or(&owned, OWN_SCREEN | OWN_OUTPUT | (input_tty ? OWN_INPUT : 0));
+    if (enabled) atomic_fetch_or(&owned, (output_tty ? OWN_SCREEN | OWN_OUTPUT : 0) | (input_tty ? OWN_INPUT : 0));
     else {
         int result = normal_write("\033[0 q");
         if (result == TIGT_OK) atomic_fetch_and(&owned, ~OWN_SCREEN);
