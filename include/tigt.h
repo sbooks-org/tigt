@@ -16,6 +16,9 @@ extern "C" {
 #define TIGT_ERROR_TERMINAL -2
 #define TIGT_ERROR_BUSY -3
 #define TIGT_ERROR_SYSTEM -4
+#define TIGT_ERROR_UNREPRESENTABLE -5
+#define TIGT_ERROR_BACKGROUND -6
+#define TIGT_ERROR_UNSUPPORTED -7
 typedef enum {
     TIGT_PRESS = 0,
     TIGT_REPEAT = 1,
@@ -76,14 +79,18 @@ typedef struct {
     tigt_input_key key;
     uint8_t modifiers;
     uint8_t kind;
+    uint8_t flags;
 } tigt_input_event;
+
+enum { TIGT_INPUT_PASTE = 1u << 0 };
 
 
 /* Input callbacks run on the input thread for a live session, and synchronously
  * for tigt_input_feed/flush. They must return promptly and must not call lifecycle
  * functions, reenter/destroy their decoder, or unwind across this C boundary.
  * Feed/flush/destroy on a decoder must be externally serialized.
- * No key is reserved: applications decide what Ctrl+C and Ctrl+Z mean. */
+ * Standalone decoders reserve no keys. Live sessions apply the terminal host
+ * signal/literal-next policy before delivering keyboard callbacks. */
 typedef void (*tigt_input_callback)(const tigt_input_event *event, void *user);
 typedef struct tigt_input tigt_input;
 /* Returns NULL on allocation failure or a NULL callback (errno = EINVAL). */
@@ -122,9 +129,13 @@ typedef struct tigt_config {
 } tigt_config;
 /* One process-wide curses session. Lifecycle calls must be serialized on the
  * owning thread. Init/resume return errors rather than exiting the application.
- * Callback storage must remain valid until shutdown returns. SIGINT/SIGTSTP
- * disposition belongs to the application; suspend restores shell state.
- * Stdin and stdout must be TTYs, including for output-only sessions.
+ * Callback storage must remain valid until shutdown returns. Signal handler
+ * installation is opt-in through tigt_terminal_install_signal_handlers.
+ * Stdin and stdout must be TTYs; background sessions allow only glass text.
+ * Background text needs a visible cursor to supply its logical position;
+ * hidden-cursor native frames return UNREPRESENTABLE rather than guessing.
+ * Background bitmaps return BACKGROUND. Poll tigt_terminal_poll regularly to
+ * service transitions and observe asynchronous presentation failures.
  * Suspend/shutdown join in-flight callbacks before returning. Keyboard and
  * mouse callbacks are serialized on the same input worker; neither may call
  * lifecycle functions. Both callbacks NULL with mouse OFF is output-only. */

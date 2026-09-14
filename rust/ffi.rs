@@ -18,6 +18,7 @@ pub(crate) struct InputEvent {
     pub key: InputKey,
     pub modifiers: u8,
     pub kind: u8,
+    pub flags: u8,
 }
 
 pub(crate) type InputCallback = unsafe extern "C" fn(*const InputEvent, *mut c_void);
@@ -66,6 +67,24 @@ unsafe extern "C" {
     pub(crate) fn tigt_resume() -> c_int;
     pub(crate) fn tigt_suspend();
     pub(crate) fn tigt_shutdown();
+    pub(crate) fn tigt_terminal_capture(input_fd: c_int, output_fd: c_int) -> c_int;
+    pub(crate) fn tigt_terminal_forget();
+    pub(crate) fn tigt_terminal_release();
+    pub(crate) fn tigt_terminal_request_restore();
+    pub(crate) fn tigt_terminal_restore() -> c_int;
+    pub(crate) fn tigt_terminal_poll() -> c_int;
+    pub(crate) fn tigt_terminal_status() -> c_int;
+    pub(crate) fn tigt_terminal_generation() -> u32;
+    pub(crate) fn tigt_terminal_is_foreground() -> c_int;
+    pub(crate) fn tigt_terminal_set_input_mode(raw: c_int, keyboard_reporting: c_int) -> c_int;
+    pub(crate) fn tigt_terminal_set_probe_mode(enabled: c_int) -> c_int;
+    pub(crate) fn tigt_terminal_filter_input(event: *const InputEvent) -> c_int;
+    pub(crate) fn tigt_terminal_install_signal_handlers() -> c_int;
+    pub(crate) fn tigt_terminal_install_signal_handlers_with_actions(
+        actions: *const crate::terminal::SignalAction,
+        count: usize,
+    ) -> c_int;
+    pub(crate) fn tigt_terminal_uninstall_signal_handlers();
     pub(crate) fn tigt_get_graphics_mode() -> u32;
     pub(crate) fn tigt_get_requested_graphics_mode() -> u32;
     pub(crate) fn tigt_get_mouse_mode() -> u32;

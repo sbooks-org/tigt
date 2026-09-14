@@ -25,6 +25,8 @@ struct tigt_input {
     size_t sequence_length;
     bool discard_sequence;
     bool csi_intermediate;
+    bool paste;
+    uint8_t paste_end_length;
     uint32_t utf8_codepoint;
     uint32_t utf8_minimum;
     uint8_t utf8_remaining;
@@ -37,7 +39,8 @@ input_event(tigt_input *input, uint32_t key_kind, uint32_t key_value,
     const tigt_input_event event = {
         .key = { .kind = key_kind, .value = key_value, .character = character },
         .modifiers = modifiers,
-        .kind = kind
+        .kind = kind,
+        .flags = input->paste ? TIGT_INPUT_PASTE : 0
     };
 
     if (input->callback != NULL)
@@ -147,8 +150,12 @@ handle_kitty_key(tigt_input *input, const char *parameters)
         case 57448: key_kind = TIGT_KEY_MODIFIER; key_value = TIGT_RIGHT_CONTROL; break;
         case 57449: key_kind = TIGT_KEY_MODIFIER; key_value = TIGT_RIGHT_ALT; break;
         case 57450: key_kind = TIGT_KEY_MODIFIER; key_value = TIGT_RIGHT_SUPER; break;
+        case 0xf746: key_kind = TIGT_KEY_INSERT; break;
         default:
-            break;
+            if (codepoint >= 57364 && codepoint <= 57398) {
+                key_kind = TIGT_KEY_FUNCTION;
+                key_value = codepoint - 57363;
+            }
     }
     input_event(input, key_kind, key_value, codepoint, kitty_modifiers(modifiers),
                 (uint8_t) (event_kind - 1));
@@ -181,6 +188,7 @@ handle_csi_key(tigt_input *input, const char *parameters, uint8_t final)
         case '~':
             switch (key_value) {
                 case 2: key_kind = TIGT_KEY_INSERT; break;
+                case 200: input->paste = true; return;
                 case 3: key_kind = TIGT_KEY_DELETE; break;
                 case 5: key_kind = TIGT_KEY_PAGE_UP; break;
                 case 6: key_kind = TIGT_KEY_PAGE_DOWN; break;
@@ -193,6 +201,18 @@ handle_csi_key(tigt_input *input, const char *parameters, uint8_t final)
                 case 17: case 18: case 19: case 20: case 21:
                     key_kind = TIGT_KEY_FUNCTION;
                     key_value -= 11;
+                    break;
+                case 23: case 24:
+                    key_kind = TIGT_KEY_FUNCTION;
+                    key_value -= 12;
+                    break;
+                case 25: case 26:
+                    key_kind = TIGT_KEY_FUNCTION;
+                    key_value -= 12;
+                    break;
+                case 28:
+                    key_kind = TIGT_KEY_FUNCTION;
+                    key_value = 15;
                     break;
                 default:
                     return;
@@ -236,14 +256,19 @@ handle_plain_key(tigt_input *input, uint8_t byte)
                 const bool valid = codepoint >= input->utf8_minimum && codepoint <= 0x10ffff &&
                                    (codepoint < 0xd800 || codepoint > 0xdfff);
 
-                input_tap(input, TIGT_KEY_CHAR, valid ? codepoint : 0xfffd, 0);
+                if (valid && codepoint == 0xf746 && !input->paste)
+                    input_tap(input, TIGT_KEY_INSERT, 0, 0);
+                else
+                    input_tap(input, TIGT_KEY_CHAR, valid ? codepoint : 0xfffd, 0);
             }
             return;
         }
         input->utf8_remaining = 0;
         input_tap(input, TIGT_KEY_CHAR, 0xfffd, 0);
     }
-    if (byte == '\b' || byte == 127)
+    if (input->paste && byte < 0x80)
+        input_tap(input, TIGT_KEY_CHAR, byte, 0);
+    else if (byte == '\b' || byte == 127)
         input_tap(input, TIGT_KEY_BACKSPACE, 0, 0);
     else if (byte == '\r' || byte == '\n')
         input_tap(input, TIGT_KEY_ENTER, 0, 0);
@@ -258,6 +283,32 @@ handle_plain_key(tigt_input *input, uint8_t byte)
         input->utf8_codepoint = byte & (byte < 0xe0 ? 0x1f : byte < 0xf0 ? 0x0f : 0x07);
     } else
         input_tap(input, TIGT_KEY_CHAR, 0xfffd, 0);
+}
+
+static void
+handle_paste_byte(tigt_input *input, uint8_t byte)
+{
+    static const uint8_t end[] = "\033[201~";
+
+    if (byte == end[input->paste_end_length]) {
+        if (++input->paste_end_length == sizeof(end) - 1) {
+            if (input->utf8_remaining != 0) {
+                input->utf8_remaining = 0;
+                input_tap(input, TIGT_KEY_CHAR, 0xfffd, 0);
+            }
+            input->paste_end_length = 0;
+            input->paste = false;
+        }
+        return;
+    }
+    /* A partial end marker is payload unless all six bytes match. */
+    for (uint8_t index = 0; index < input->paste_end_length; index++)
+        handle_plain_key(input, end[index]);
+    input->paste_end_length = 0;
+    if (byte == end[0])
+        input->paste_end_length = 1;
+    else
+        handle_plain_key(input, byte);
 }
 
 static void
@@ -443,6 +494,11 @@ tigt_input_feed(tigt_input *input, const uint8_t *bytes, size_t length)
         return;
     for (size_t index = 0; index < length; index++) {
         const uint8_t byte = bytes[index];
+
+        if (input->paste) {
+            handle_paste_byte(input, byte);
+            continue;
+        }
 
         if (input->legacy_remaining != 0) {
             input->legacy_mouse[3 - input->legacy_remaining] = byte;

@@ -164,6 +164,73 @@ static void check_terminal_reports(void)
     tigt_input_destroy(input);
 }
 
+static void check_help_and_function_keys(void)
+{
+    const char stream[] = "\xef\x9d\x86\033OP\033[57364u"
+                          "\033[25~\033[26~\033[28~"
+                          "\033[57376;2:1u\033[57376;2:2u\033[57376;1:3u"
+                          "\033[57377u\033[57378;5u";
+    for (size_t split = 0; split < sizeof(stream); split++) {
+        struct events events = {0};
+        tigt_input *input = tigt_input_create(collect, &events);
+        assert(input != NULL);
+        tigt_input_feed(input, (const uint8_t *) stream, split);
+        tigt_input_feed(input, (const uint8_t *) stream + split, sizeof(stream) - 1 - split);
+        tigt_input_flush(input);
+        assert(events.count == 12);
+        check(&events, 0, TIGT_KEY_INSERT, 0, 0, TIGT_PRESS);
+        check(&events, 1, TIGT_KEY_INSERT, 0, 0, TIGT_RELEASE);
+        check(&events, 2, TIGT_KEY_FUNCTION, 0, 0, TIGT_PRESS);
+        check(&events, 3, TIGT_KEY_FUNCTION, 57364, 0, TIGT_PRESS);
+        assert(events.values[2].key.value == 1 && events.values[3].key.value == 1);
+        for (size_t index = 0; index < 3; index++) {
+            check(&events, 4 + index, TIGT_KEY_FUNCTION, 0, 0, TIGT_PRESS);
+            assert(events.values[4 + index].key.value == 13 + index);
+            check(&events, 7 + index, TIGT_KEY_FUNCTION, 57376,
+                  index == 2 ? 0 : TIGT_MOD_SHIFT, (uint8_t) index);
+            assert(events.values[7 + index].key.value == 13);
+        }
+        check(&events, 10, TIGT_KEY_FUNCTION, 57377, 0, TIGT_PRESS);
+        check(&events, 11, TIGT_KEY_FUNCTION, 57378, TIGT_MOD_CONTROL, TIGT_PRESS);
+        assert(events.values[10].key.value == 14 && events.values[11].key.value == 15);
+        for (size_t index = 0; index < events.count; index++)
+            assert(events.values[index].flags == 0);
+        tigt_input_destroy(input);
+    }
+}
+
+static void check_paste_payload(void)
+{
+    /* Controls, Help, and sequences that resemble keys/end markers stay text. */
+    const char stream[] = "\033[200~\xef\x9d\x86\003\026\r\177"
+                          "\033OP\033[20x\033\033[201~\xef\x9d\x86";
+    const uint32_t payload[] = { 0xf746, 3, 22, '\r', 127,
+                                 27, 'O', 'P', 27, '[', '2', '0', 'x', 27 };
+    for (size_t split = 0; split < sizeof(stream); split++) {
+        struct events events = {0};
+        tigt_input *input = tigt_input_create(collect, &events);
+        assert(input != NULL);
+        tigt_input_feed(input, (const uint8_t *) stream, split);
+        if (split >= 6)
+            tigt_input_flush(input);
+        tigt_input_feed(input, (const uint8_t *) stream + split, sizeof(stream) - 1 - split);
+        tigt_input_flush(input);
+        const size_t count = sizeof(payload) / sizeof(payload[0]);
+        assert(events.count == 2 * count + 2);
+        for (size_t index = 0; index < count; index++) {
+            check(&events, 2 * index, TIGT_KEY_CHAR, payload[index], 0, TIGT_PRESS);
+            check(&events, 2 * index + 1, TIGT_KEY_CHAR, payload[index], 0, TIGT_RELEASE);
+            assert(events.values[2 * index].flags == TIGT_INPUT_PASTE);
+            assert(events.values[2 * index + 1].flags == TIGT_INPUT_PASTE);
+        }
+        check(&events, 2 * count, TIGT_KEY_INSERT, 0, 0, TIGT_PRESS);
+        check(&events, 2 * count + 1, TIGT_KEY_INSERT, 0, 0, TIGT_RELEASE);
+        assert(events.values[2 * count].flags == 0);
+        assert(events.values[2 * count + 1].flags == 0);
+        tigt_input_destroy(input);
+    }
+}
+
 int main(void)
 {
     assert(signal(SIGINT, signal_seen) != SIG_ERR);
@@ -173,6 +240,8 @@ int main(void)
     check_escape_and_modifier();
     check_ss3();
     check_terminal_reports();
+    check_help_and_function_keys();
+    check_paste_payload();
     assert(signals_seen == 0);
     puts("PASS semantic controls, incremental CSI/Kitty events, Escape timeout, modifier release");
     return 0;

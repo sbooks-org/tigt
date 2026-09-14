@@ -37,7 +37,7 @@ cc = "1"
 pkg-config = "0.3"
 
 [dev-dependencies]
-tigt-gfxreader = { git = "ssh://git@github.com/sbooks-org/tigt-gfxreader.git", rev = "2cb76de904f9a7397a57253704a7265a00ff06ab" }
+tigt-gfxreader = { git = "ssh://git@github.com/sbooks-org/tigt-gfxreader.git", rev = "c46b132688039d94a6a633c109bf6624de5645e9" }
 cc = "1"
 flate2 = "1"
 libc = "0.2"

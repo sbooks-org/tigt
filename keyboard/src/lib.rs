@@ -188,6 +188,7 @@ pub enum KeyboardModel {
 struct HeldMapping {
     keys: Vec<PcKey>,
     release_with_command: bool,
+    suppress_shift: bool,
 }
 
 /// Stateful, transport-neutral PC keyboard mapper.
@@ -198,6 +199,7 @@ pub struct PcKeyboard {
     model: KeyboardModel,
     held: HashMap<String, HeldMapping>,
     counts: HashMap<&'static str, usize>,
+    shift_suppressions: usize,
 }
 
 impl PcKeyboard {
@@ -206,6 +208,7 @@ impl PcKeyboard {
             model,
             held: HashMap::new(),
             counts: HashMap::new(),
+            shift_suppressions: 0,
         }
     }
 
@@ -220,7 +223,9 @@ impl PcKeyboard {
                 let source = source_id(input.key);
                 let mapping = map_key(input, self.model);
                 let release_with_command = is_command_layer_mapping(input, &mapping);
-                self.press(source, mapping, release_with_command)
+                let suppress_shift = input.key == InputKey::Function(13)
+                    && input.modifiers.contains(Modifiers::SHIFT);
+                self.press(source, mapping, release_with_command, suppress_shift)
             }
             InputKind::Release => {
                 let mut events = self.release_source(&source_id(input.key));
@@ -248,7 +253,15 @@ impl PcKeyboard {
             *count -= 1;
             if *count == 0 {
                 self.counts.remove(key.id);
-                events.push(PcEvent::Break(key));
+                if self.shift_suppressions == 0 || !is_shift(key.id) {
+                    events.push(PcEvent::Break(key));
+                }
+            }
+        }
+        if held.suppress_shift {
+            self.shift_suppressions -= 1;
+            if self.shift_suppressions == 0 {
+                self.shift_transitions(&mut events, true);
             }
         }
         events
@@ -282,11 +295,18 @@ impl PcKeyboard {
         source: String,
         mapping: Vec<PcKey>,
         release_with_command: bool,
+        suppress_shift: bool,
     ) -> Vec<PcEvent> {
         let mut events = self.release_source(&source);
+        if suppress_shift {
+            if self.shift_suppressions == 0 {
+                self.shift_transitions(&mut events, false);
+            }
+            self.shift_suppressions += 1;
+        }
         for key in &mapping {
             let count = self.counts.entry(key.id).or_default();
-            if *count == 0 {
+            if *count == 0 && (self.shift_suppressions == 0 || !is_shift(key.id)) {
                 events.push(PcEvent::Make(*key));
             }
             *count += 1;
@@ -296,9 +316,23 @@ impl PcKeyboard {
             HeldMapping {
                 keys: mapping,
                 release_with_command,
+                suppress_shift,
             },
         );
         events
+    }
+
+    fn shift_transitions(&self, events: &mut Vec<PcEvent>, down: bool) {
+        for (id, code) in [("L_SHIFT", 0x2A), ("R_SHIFT", 0x36)] {
+            if self.counts.contains_key(id) {
+                let key = single(self.model, id, code);
+                events.push(if down {
+                    PcEvent::Make(key)
+                } else {
+                    PcEvent::Break(key)
+                });
+            }
+        }
     }
 }
 
@@ -306,6 +340,10 @@ impl Default for PcKeyboard {
     fn default() -> Self {
         Self::new(KeyboardModel::XtSet1)
     }
+}
+
+fn is_shift(id: &str) -> bool {
+    matches!(id, "L_SHIFT" | "R_SHIFT")
 }
 
 fn single(model: KeyboardModel, id: &'static str, make_code: u8) -> PcKey {
@@ -403,9 +441,16 @@ pub fn map_key(input: &InputEvent, model: KeyboardModel) -> Vec<PcKey> {
             },
             0x3A + number,
         ),
-        Function(13) => single("KP_INS", 0x52),
-        Function(14) => single("KP_5", 0x4C),
-        Function(15) => single("KP_DEL", 0x53),
+        Function(13) => single("KP_STAR", 0x37),
+        Function(14) => single("SCROLL", 0x46),
+        Function(15) => vec![
+            crate::single(model, "CTRL", 0x1D),
+            if input.modifiers.contains(Modifiers::CONTROL) {
+                crate::single(model, "SCROLL", 0x46)
+            } else {
+                crate::single(model, "NUMLOCK", 0x45)
+            },
+        ],
         Function(16) => single("CAPS", 0x3A),
         Function(17) => single("KP_MINUS", 0x4A),
         Function(18) => single("KP_PLUS", 0x4E),
@@ -509,7 +554,11 @@ fn prepend_simulated_modifiers(input: &InputEvent, mapping: &mut Vec<PcKey>, mod
     }
 
     let mut modifiers = Vec::with_capacity(3);
-    let shift = input.modifiers.contains(Modifiers::SHIFT) || key_requires_shift(input.key);
+    let shift = if input.key == InputKey::Function(13) {
+        !input.modifiers.contains(Modifiers::SHIFT)
+    } else {
+        input.modifiers.contains(Modifiers::SHIFT) || key_requires_shift(input.key)
+    };
     for (active, id, make_code) in [
         (shift, "L_SHIFT", 0x2A),
         (input.modifiers.contains(Modifiers::CONTROL), "CTRL", 0x1D),

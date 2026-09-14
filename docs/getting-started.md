@@ -66,6 +66,7 @@ A minimal text session:
 
 ```c
 #include <tigt.h>
+#include <tigt_terminal.h>
 #include <unistd.h>
 
 int main(void)
@@ -78,14 +79,27 @@ int main(void)
     int result = tigt_init(&config);
     if (result != TIGT_OK)
         return 1;
+    result = tigt_terminal_install_signal_handlers();
+    if (result != TIGT_OK) {
+        tigt_shutdown();
+        return 1;
+    }
     result = tigt_present_text(cells, 2, 1, 2);
     sleep(2);
+    int status = tigt_terminal_poll();
+    if (status < TIGT_OK)
+        result = status;
     tigt_shutdown();
+    tigt_terminal_uninstall_signal_handlers();
     return result != TIGT_OK;
 }
 ```
 
-The sleep only keeps this small example visible; applications run their own event loop. Always call shutdown on normal exit. Ctrl+C/Ctrl+Z policy belongs to the application, not the decoder.
+The sleep only keeps this small example visible; applications poll from their owning event loop. Always call shutdown on normal exit. Signal-handler installation is opt-in and chains the application's previous dispositions after terminal release. Managed live input defaults to host Ctrl+C/Ctrl+\\/Ctrl+Z signals; Ctrl+T requests SIGINFO where available. Ctrl+V quotes the next complete gesture for the guest, and doubled Ctrl+V sends one guest Ctrl+V. Standalone decoding and bracketed paste do not reserve those keys.
+
+TIGT restores the captured terminal settings, not guessed “sane” settings. Custom handlers may call the async-signal-safe, idempotent `tigt_terminal_release()`; a custom SIGCONT handler may call `tigt_terminal_request_restore()`. Actual restoration, worker changes and event consumption belong in normal-context `tigt_terminal_poll()`. Check its error result and compare `tigt_terminal_generation()` even on errors to invalidate held guest keys and cursor provenance. Foreground ownership is required for raw input, terminal protocols, probes and adaptive/fullscreen output. Background output is nonadaptive glass only; bitmaps fail with `TIGT_ERROR_BACKGROUND`, including a persistent error if an accepted frame becomes ineligible before presentation. See the [lifecycle reference](reference.md#lifecycle-and-ownership) for signal contexts, fatal-handler limits and standalone terminal ownership.
+
+On macOS, `sigaction()` omits `SA_RESETHAND` when reading an existing action. Applications using one-shot handlers must retain their original `struct sigaction` and pass it to `tigt_terminal_install_signal_handlers_with_actions()` for exact preservation. Other signals still use automatic discovery. Rust exposes the corresponding unsafe `install_signal_handlers_with_actions()` methods with a borrowed slice of `terminal::SignalAction`; the caller guarantees valid signal-safe handlers and their lifetimes.
 
 ## Rust
 
@@ -104,18 +118,20 @@ A session owns and restores terminal state:
 use tigt::{Session, TextCell};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let session = Session::new()?;
+    let mut session = Session::new()?;
+    session.install_signal_handlers()?;
     let cells = [
         TextCell::new('H', 0xffffff, 0),
         TextCell::new('i', 0xffffff, 0),
     ];
     session.present_text(&cells, 2, 1, 2)?;
     std::thread::sleep(std::time::Duration::from_secs(2));
+    session.poll()?;
     Ok(())
 }
 ```
 
-`Session` is neither Send nor Sync. Keep it on its owning thread. C copies submitted frames, so the input arrays need not outlive the call. `Drop` joins workers and restores the terminal. Aborting the process or forgetting the session bypasses normal restoration.
+`Session` is neither Send nor Sync. Keep it on its owning thread and call `poll()` from the event loop. C copies submitted frames, so the input arrays need not outlive the call. `Drop` joins workers and restores the terminal. Forgetting the session or aborting bypasses normal RAII cleanup; opt-in fatal handlers provide only minimal, best-effort release before preserving the previous/default fatal disposition. SIGKILL cannot be handled. Rust's `terminal` module also exposes borrowed standalone ownership and signal-safe `release()` / `request_restore()`; see the reference before calling lifecycle operations from callbacks or handlers.
 
 Existing runnable examples:
 

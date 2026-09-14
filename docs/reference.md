@@ -1,6 +1,6 @@
 # tigt reference
 
-The installed `include/tigt.h`, `include/tigt_mouse.h`, `include/tigt_video.h`, `include/tigt_presenter.h` and Rust API documentation are the authoritative declarations. This guide describes the contracts and their interactions.
+The installed `include/tigt.h`, `include/tigt_terminal.h`, `include/tigt_mouse.h`, `include/tigt_video.h`, `include/tigt_presenter.h` and Rust API documentation are the authoritative declarations. This guide describes the contracts and their interactions.
 
 ## Lifecycle and ownership
 
@@ -14,12 +14,80 @@ The installed `include/tigt.h`, `include/tigt_mouse.h`, `include/tigt_video.h`, 
 | `tigt_get_graphics_mode()` | `session.graphics_mode()` | Read the resolved bitmap backend. |
 | `tigt_get_mouse_mode()` | `session.mouse_mode()` | Read the resolved mouse protocol; Off while suspended. |
 | `tigt_set_image_layout(columns, aspect_width, aspect_height)` | `session.set_image_layout(columns, aspect_width, aspect_height)` | Set sixel/iTerm2 target width in terminal cells and display aspect ratio. |
+| `tigt_terminal_poll()` | `session.poll()` | Service deferred lifecycle work and report transitions or persistent errors. |
+| `tigt_terminal_status()` | `session.status()` | Observe terminal failure without submitting another frame; Rust also checks callback failure. |
+| `tigt_terminal_generation()` | `session.generation()` | Observe terminal release/restore even when an error prevents returning transition flags. |
+| `tigt_terminal_is_foreground()` | `session.is_foreground()` | Check process-group ownership of every captured TTY. |
 
 `config.abi_version` must equal `TIGT_ABI_VERSION` (4). The ABI-4 config appends `on_mouse`, `mouse_user` and `mouse_mode`; rebuild C consumers against the matching header/library and zero-initialize optional fields. Both callbacks NULL with mouse mode Off selects output-only mode. Keyboard and mouse callbacks are independently optional: mouse-only sessions do not enable Kitty keyboard reporting. Both standard input and standard output must be terminals even in output-only mode. Lifecycle calls are serialized on the owning thread. Frame producers must not race lifecycle operations. Do not mix raw C lifecycle calls with a live Rust `Session`.
 
 Keyboard, mouse and graphics-capability reports share one decoder and one input worker. Both application callbacks run serially, never concurrently with each other. They must return promptly, must not call lifecycle operations or recursively operate/destroy their decoder, and must not unwind across C. Rust contains unwinding callback panics and reports failures from either handler on `input_status()` and fallible session operations; `panic=abort` still aborts. Shutdown/suspend join in-flight callbacks before returning. Do not run another stdin reader or terminal-mode owner alongside the session.
 
-The application owns SIGINT/SIGTSTP policy. Normal initialization does not reserve a screenshot signal. Snapshot configuration explicitly opts into SIGUSR1 or SIGUSR2. Snapshot configuration and its signal ownership survive suspension; shutdown or explicit disabling restores the prior disposition.
+Signal cleanup is opt-in; host-key policy is not. Native raw input applies the host controls below before delivering guest callbacks, even when the application retains its own signal handlers. Normal initialization does not reserve a screenshot signal. Snapshot configuration explicitly opts into SIGUSR1 or SIGUSR2. Snapshot configuration and its signal ownership survive suspension; shutdown or explicit disabling restores the prior disposition.
+
+### Process-terminal release and restoration
+
+`tigt_terminal_release()` / `tigt::terminal::release()` is an **idempotent, async-signal-safe, best-effort release**, not shutdown. It uses previously captured terminal state and precomputed protocol cleanup, with no allocation, stdio, curses calls, mutex acquisition or worker joins. It restores the exact saved termios rather than a guessed “sane” mode: a shell that started with echo disabled remains noecho. Calling it twice does not establish a new baseline. Errors remain observable through status. There is no recovery promise for SIGKILL, power loss, or an unusable terminal.
+
+`tigt_terminal_request_restore()` / `terminal::request_restore()` is also async-signal-safe. An application-owned SIGCONT handler may call it to request normal-context work; it does not restore protocols in the handler.
+
+All capture, forget, mode changes, restore, poll, suspend, shutdown, and signal install/uninstall operations run in **normal context on the serialized owner**, never an input callback or raw signal handler. Normal session lifecycle stops/joins workers before releasing resources. Release alone does not free callback storage, destroy a presenter, or relinquish the process-wide capture. Full lifecycle calls in a handler or on the input/render worker can deadlock or self-join and are prohibited.
+
+`tigt_terminal_restore()` restores the retained foreground policy. In the background it remains released and returns `TIGT_ERROR_BACKGROUND` / `Error::Background`. `tigt_terminal_poll()` services foreground changes, requested continuation, resize and native worker transitions. A nonnegative return is a bitset: `TIGT_TERMINAL_RESTORED` (1), `RELEASED` (2), `RESIZED` (4), and `INPUT_RESET` (8); Rust returns `terminal::Events` with `contains` and `bits`. A negative return is a persistent error, not a transition bitset. Always compare `tigt_terminal_generation()` / `generation()` around polling even when polling returns an error: release held guest keys/buttons and invalidate observed host-cursor state after a generation change. Native input filters reset their own gesture state, but TIGT does not own an external PC keyboard mapper.
+
+Poll regularly even when the producer has no new frame. `tigt_terminal_status()` returns the persistent terminal failure; it does not consume or clear it. A fresh successful capture starts a new error epoch. Rust `Session::input_status()` remains the callback-only query; `Session::status()` additionally reports terminal failures, and `Session::poll()` services lifecycle work before reporting a callback error.
+
+### Optional chained signal installation
+
+Call `tigt_terminal_install_signal_handlers()` / `session.install_signal_handlers()` to opt in; installation is idempotent. Uninstall restores prior dispositions only where TIGT still owns the installed handler, rather than overwriting a later application registration. Signal ownership is independent of terminal capture. The Rust owner removes handlers it installed when dropped; raw C callers explicitly uninstall. Serialize all application signal-disposition changes with installation and removal.
+
+When an application knows the exact prior action it registered, use `tigt_terminal_install_signal_handlers_with_actions(actions, count)`. Each `tigt_terminal_signal_action` contains `signal_number` and the original `struct sigaction action`; listed managed signals use these explicit actions and all others use OS-discovered dispositions. This matters on Darwin, where `sigaction` readback can omit SA_RESETHAND: the no-argument installer cannot reconstruct an omitted flag. Passing the original action preserves one-shot behavior instead of silently turning it into a persistent handler.
+
+The explicit-action API copies its input before returning. Duplicate signal numbers, unmanaged signals and NULL with a nonzero count are rejected before any disposition changes. Nonempty overrides return Busy if handlers are already installed; a zero count retains the ordinary installer's idempotent behavior. Supply only genuine, valid prior actions, with callbacks matching the action flags, and retain their callback code/state for as long as those dispositions remain registered, including after uninstall.
+
+Rust exposes `terminal::SignalAction`, a `repr(C)` structure containing `libc::c_int signal_number` and `libc::sigaction action`. Both `Session` and `terminal::Terminal` provide **unsafe** `install_signal_handlers_with_actions(&[SignalAction])`: the borrowed slice is passed directly without a Rust allocation or staging copy. The caller must ensure valid platform actions and callback pointers, signal-safe behavior, callback lifetimes, no unwinding across C, and serialized disposition changes. Ordinary no-argument installation remains safe and opt-in.
+
+| Signals | Installed policy |
+|---|---|
+| SIGINT, SIGQUIT, SIGTERM, SIGPIPE, **SIGHUP** | Release terminal ownership, then preserve the previous custom, default or ignored disposition. SIGHUP is hangup/termination, never continuation. |
+| SIGTSTP, SIGTTIN, SIGTTOU | Release, then preserve normal stop/chained disposition. |
+| SIGCONT | Schedule foreground-aware normal-context restoration and chain; a background continuation does not reenable raw input, reporting, or full-screen output. |
+| SIGWINCH | Enqueue resize for normal processing and chain. |
+| SIGINFO, where available (including macOS) | Informational chaining without teardown. |
+| SIGPWR, where available | Cleanup followed by termination/chained disposition. |
+| SIGSEGV, SIGILL, SIGFPE, SIGBUS, where available | Minimal best-effort release, then preserve the crash handler or default signal termination/core semantics. TIGT does not recover execution from a crash. |
+
+Custom handlers retain SA_SIGINFO calling convention, signal information and configured masks; default signal deaths remain signal deaths rather than successful exits. Ordinary teardown signals are dispatched after in-flight terminal I/O finishes: their prior handlers run on the dispatcher with the **original siginfo and the dispatcher's current real delivery ucontext**, not the original interrupted thread's execution context. Do not use that context to recover or redirect the original thread. Returning from `raise` does not prove deferred handling has completed. Fatal signals, SIGCONT, SIGWINCH and SIGINFO chain synchronously with the original delivery context. Fatal handling stays on its minimal emergency path. No stdout stream is required for SIGPIPE cleanup.
+
+### Foreground and background jobs
+
+Foreground ownership is determined from `tcgetpgrp` and `getpgrp` for every captured TTY, not from `isatty` alone. Files/pipes need no foreground owner. TIGT does not toggle TOSTOP. A TTY without this process group's foreground ownership is never permission to probe, read input, enable keyboard/mouse protocols, request cursor position, enter full-screen/alternate-screen presentation, or draw bitmaps.
+
+Background text output is **nonadaptive glass only**. Valid glass text may continue; unrepresentable output reports its normal error instead of silently promoting to full-screen. The requested foreground configuration is retained for later restoration. All bitmap backends, including Blocks and ASCII, synchronously reject background submissions with `TIGT_ERROR_BACKGROUND` (-6) / `Error::Background`: they do not drop, queue, or convert the frame. A frame accepted while foregrounded can subsequently fail when the job becomes backgrounded; normal `poll` and persistent `status` expose that failure without another submission.
+
+### External presenter terminal ownership
+
+An output-only presenter still does not read input or decide when to change input policy. Its embedding application can share TIGT's terminal lifecycle instead of duplicating termios and signal control:
+
+| C | Rust `terminal::Terminal` | Purpose |
+|---|---|---|
+| `tigt_terminal_capture(input_fd, output_fd)` | `Terminal::capture(input.as_fd(), output.as_fd())` | Capture borrowed descriptors and baseline without changing terminal state; Busy if already owned. Pipes are permitted. |
+| `tigt_terminal_set_input_mode(raw, keyboard_reporting)` | `terminal.set_input_mode(InputMode::Cooked)` / `InputMode::Raw { keyboard_reporting }` | Set desired cooked editing/echo or raw policy and optional keyboard reporting. |
+| `tigt_terminal_set_probe_mode(enabled)` | `terminal.set_probe_mode(enabled)` | Temporarily disable canonical buffering/echo for a foreground query; preserve cooked kernel signals/literal-next and unread input. |
+| `tigt_terminal_filter_input(&event)` | `terminal.filter_input(event)` | Apply host policy once to an externally decoded event: 1/true forwards, 0/false consumes, negative/Err reports failure. |
+| `tigt_terminal_restore/poll/status/generation/is_foreground` | Corresponding owner methods | Share the same process-terminal transitions and persistent error contract as native sessions. |
+| `tigt_terminal_install/uninstall_signal_handlers` | Corresponding owner methods | Optional chained process signal ownership. |
+| `tigt_terminal_forget()` | `Drop` | Release and forget capture; C signal registration remains independently owned. |
+
+The Rust external owner borrows descriptors for its lifetime and is neither Send nor Sync. Do not create it beside a native `Session`, which already captures automatically. Serialize presenter output, input-mode changes, and decoder use; preserve unread cooked text when switching policy. Disable probe mode before switching policy, and bypass host filtering for buffered cooked/query bytes already processed by the line discipline.
+
+### Host controls and literal-next
+
+In raw live input, Ctrl+C generates SIGINT, Ctrl+backslash SIGQUIT, Ctrl+Z SIGTSTP, and Ctrl+T SIGINFO where the platform provides it. Unsupported informational signalling returns `TIGT_ERROR_UNSUPPORTED` (-7) / `Error::Unsupported`; TIGT does not invent a replacement informational signal. Repeats/releases of a consumed host gesture are not guest input and do not generate repeated host signals.
+
+**Ctrl+V quotes the next logical gesture**, not merely its first byte or press. Its press, repeats and release go to the guest without host signalling. Ctrl+V Ctrl+V emits exactly the second Ctrl+V gesture to the guest. Legacy byte transports preserve their synthetic press/release pair; they cannot recover unreported physical release timing.
+
+Cooked/glass input retains the host line discipline's ISIG/IEXTEN/VLNEXT policy. The kernel handles host controls and literal-next before bytes reach the decoder; TIGT forwards those decoded cooked bytes without signalling again or consuming an already-quoted Ctrl+V. Raw mode disables kernel signal/literal-next interpretation so the semantic filter is the only owner. Bracketed-paste payload is literal and bypasses host gestures; `TIGT_INPUT_PASTE` / `InputEvent::is_paste` marks it. Independent standalone decoders remain transport-neutral and reserve no controls.
 
 ## Bitmap frames
 
@@ -105,7 +173,7 @@ This is an additive, output-only API, independent of the curses `Session` and re
 
 The presenter configuration uses `TIGT_PRESENTER_ABI_VERSION`, not the curses ABI version. Mode is `TIGT_PRESENT_GLASS` / `Mode::Glass` or `TIGT_PRESENT_ADAPTIVE` / `Mode::Adaptive`. Encoding is `TIGT_ENCODING_LOCALE`, `TIGT_ENCODING_UTF8`, or `TIGT_ENCODING_ASCII` / `Encoding::{Locale,Utf8,Ascii}`. The C `reversible` field is 0 or 1; Rust uses `Reversibility::{OneWay,Reversible}`. This option controls adaptive fallback, not pure glass mode.
 
-C callers retain ownership of the descriptor and serialize presenter operations and writes through every alias of that destination. Rust retains a `BorrowedFd` for the presenter's lifetime and uses mutable borrows for operations; it neither duplicates the fd nor takes ownership. The presenter is neither Send nor Sync. Submission retains neither the input slice nor its descriptor; Rust passes the existing `repr(C)` `TextCell` storage directly, without a Rust staging buffer. C retains its validated candidate image until output commits. Blocking descriptor writes in the synchronous API can block the calling thread. There are no input reads, termios changes, signal handlers, or alternate-screen entry/exit.
+C callers retain ownership of the descriptor and serialize presenter operations and writes through every alias of that destination. Rust retains a `BorrowedFd` for the presenter's lifetime and uses mutable borrows for operations; it neither duplicates the fd nor takes ownership. The presenter is neither Send nor Sync. Submission retains neither the input slice nor its descriptor; Rust passes the existing `repr(C)` `TextCell` storage directly, without a Rust staging buffer. C retains its validated candidate image until output commits. Blocking descriptor writes in the synchronous API can block the calling thread. The presenter itself performs no input reads, termios changes, signal installation, or alternate-screen entry/exit. Use the separate process-terminal owner above when the consumer needs shared lifecycle/input policy; background destinations are always constrained to nonadaptive glass.
 
 On macOS, writes temporarily enable no-SIGPIPE on the borrowed open-file description and restore its previous setting; this is another reason to serialize descriptor aliases. Other supported POSIX platforms suppress write-generated SIGPIPE on the calling thread without installing a signal handler.
 
@@ -137,7 +205,7 @@ A released hardware-disabled blank is a clear regardless of the unchanged logica
 | `TIGT_PRESENTER_NEEDS_CURSOR` (5) | `Ok(Status::NeedsCursor)` | No output written; acquire and observe the current host cursor before adaptive fallback. Not yet full-screen. |
 | `TIGT_ERROR_UNREPRESENTABLE` | `Err(presenter::Error::Unrepresentable)` | Confirmed pure-glass ABORT; consumer chooses recovery. |
 
-Argument, terminal, busy and system failures propagate as the corresponding `presenter::Error` variants; unknown statuses preserve their numeric value. Unrepresentability and hard I/O failures are sticky until reset; ordinary backpressure is not. Reset emits nothing: the consumer must prepare the destination before starting a new empty glass baseline. It clears local-echo accounting and invalidates host cursor observation; it is not an implicit repair of previously emitted text.
+Argument, terminal, busy, system, background and unsupported failures propagate as the corresponding `presenter::Error` variants; unknown statuses preserve their numeric value. Unrepresentability and hard I/O failures are sticky until reset; ordinary backpressure is not. Reset emits nothing: the consumer must prepare the destination before starting a new empty glass baseline. It clears local-echo accounting and invalidates host cursor observation; it is not an implicit repair of previously emitted text. A pending full-screen transaction cannot continue after foreground ownership is lost; callers must service the lifecycle transition rather than resume special output in the background.
 
 ### Nonblocking output and cancellation
 
@@ -201,7 +269,7 @@ Accounting is bounded by `TIGT_PRESENTER_LOCAL_ECHO_MAX` / `presenter::LOCAL_ECH
 
 Matching guest screen evidence consumes only confirmed glyph and newline operations, suppressing their duplicate output. The finalized input trajectory also supplies guest automatic soft-wrap boundaries, so those wraps do not add spurious newlines. Guest output not covered by confirmed local echo still uses ordinary presentation. A mismatch fails representability rather than replaying the already-displayed line. This is deliberately different from `notify`: speculative predictions may be discarded and ordinary output used, whereas actual host output cannot be undone or emitted again.
 
-Consumers that switch to raw input for active adaptive fallback must preserve unread cooked text, distinguish terminal replies from guest keys, and restore cooked editing when reversible presentation returns to glass. These input policies are not implemented by the presenter library.
+Consumers that switch to raw input for active adaptive fallback must preserve unread cooked text, distinguish terminal replies from guest keys, and restore cooked editing when reversible presentation returns to glass. These decisions remain outside the presenter; the separate `tigt_terminal_set_input_mode` API owns the actual terminal-mode transition.
 
 ### Speculative output notifications
 
@@ -259,7 +327,7 @@ The presenter fixture also reproduces PC DOS 2.10 LINK's `Object Modules [.OBJ]:
 
 Vertical tabs and additional character sets, specifically ISO-8859-1, remain unimplemented TODOs.
 
-Input reading and editing remain outside this presenter: the consumer owns cooked/raw modes, backspace/arrow handling, and terminal-response demultiplexing. The presenter does validate guest echo against registered already-displayed local output as described above; it does not implement a terminal input loop. The existing independent input decoder does not change that boundary.
+Input reading and editing remain outside this presenter: the consumer owns the input loop, backspace/arrow handling, and terminal-response demultiplexing. The process-terminal owner supplies actual cooked/raw mode and host-signal policy. The presenter validates guest echo against registered already-displayed local output as described above; the independent input decoder does not change that boundary.
 
 ## Display technology
 
@@ -322,9 +390,11 @@ The input decoder is independent of a curses session and of the keyboard mapper:
 - C: `tigt_input_create(callback,user)`, `tigt_input_feed`, `tigt_input_flush`, `tigt_input_destroy`.
 - Rust: `InputDecoder`, `feed` and `flush`.
 
-Feed arbitrary stream fragments; UTF-8 and escape sequences can span calls. Flush resolves a pending bare Escape; the embedding application chooses when to do that. Live sessions perform their own input polling/escape timeout. No key is reserved: Ctrl+C and Ctrl+Z are semantic input events.
+Feed arbitrary stream fragments; UTF-8 and escape sequences can span calls. Flush resolves a pending bare Escape; the embedding application chooses when to do that. Live sessions perform their own input polling/escape timeout. **Standalone decoding** reserves no key: Ctrl+C and Ctrl+Z are semantic input events. Native live sessions apply the host-control/literal-next policy described above before dispatch; external owners opt into that event filter explicitly.
 
 Events distinguish press, repeat and release; key identity includes Unicode characters, function keys, navigation, editing, lock and modifier keys. Modifier bits cover Shift, Control, Alt and Super. The decoder understands supported traditional terminal sequences and Kitty keyboard events, including fragmented SS3 (`ESC O`) arrows, Home/End, keypad Begin, and F1–F4. SS3 R is F3; CSI R remains a cursor-position report, not a key. Legacy terminal taps cannot reconstruct physical key-release timing that the transport never reported. Invalid or unsupported input is not a promise of arbitrary terminal-protocol compatibility.
+
+Keyboard decoding recognizes macOS Help (U+F746), whether UTF-8 or a supported keyboard report, as Insert. This is not a general text rewrite: ordinary text rendering, mapper `Char(U+F746)`, and bracketed-paste payload retain their literal meaning. Bracketed paste emits literal character events, including control and escape characters, with `TIGT_INPUT_PASTE` / Rust `is_paste`; all other events have that flag clear. The flag occupies existing padding in the C event layout; configuration ABI remains 4.
 
 `tigt_input_create` rejects a NULL keyboard callback. `tigt_input_create_with_mouse(key_callback,key_user,mouse_callback,mouse_user,mode)` accepts either callback or both, but requires at least one. Mouse Off requires a NULL mouse callback; other mouse modes require a mouse callback. Feed/flush/destroy must be externally serialized. A decoder callback executes synchronously during explicit feed/flush; a live-session callback executes on the shared input worker.
 
@@ -366,6 +436,8 @@ CMake-enabled native macOS/GNU Linux builds require Rust; default C builds do no
 Rust enables `keyboard` to expose event conversions and the mapper re-export. `PcEvent::Make(key)` / `Break(key)` expose `key.physical` before wire encoding. Ordinary identities use PC make-position numbering; enhanced Print Screen and Pause are distinct identities, not E0/E1 byte streams. Feed an emulator's existing host-key interface and let its emulated keyboard choose guest scan-code encoding. The mapper's separate byte API remains available to consumers that actually need wire bytes.
 
 Input decoding, keyboard mapping and monitor decoding have independent state. A live terminal session coordinates terminal ownership and input callbacks, but display technology never selects keyboard profile. Applications own the mapper and release policy; tigt does not instantiate a PC keyboard. Do not submit one input to both mapper output APIs: both consume the same held-key state.
+
+The PC mapper supplies terminal keyboard aliases without changing literal transport function-key numbering: F13 is Shift+keypad asterisk (Print Screen chord), Shift+F13 is bare keypad asterisk, F14 is Scroll Lock, F15 is Ctrl+Num Lock (Pause chord), and Ctrl+F15 is Ctrl+Scroll Lock (Break chord). XT and AT profiles use these same physical chords; wire encoding remains profile-specific. F1 is unchanged, and native semantic PrintScreen/Pause retain their own identities. Standalone terminal events `Function(13..15)` remain those function numbers until passed to the PC mapper.
 
 ### Migrating a consumer of both projects
 
@@ -421,7 +493,7 @@ Formats: PNG, UTF8, ASCII, CP437, ANSI, CELLS, ATTRIBUTES. Signals: SIGUSR1 or S
 
 ## Errors and limits
 
-Core/session C errors are `TIGT_ERROR_ARGUMENT`, `TIGT_ERROR_TERMINAL`, `TIGT_ERROR_BUSY` and `TIGT_ERROR_SYSTEM`; success is `TIGT_OK`. Rust exposes corresponding `Error` values and callback-panic reporting. Argument errors include unsupported dimensions/formats/flags, invalid text cells and insufficient font data. Busy includes conflicting ownership and missing/inactive frame state. Terminal errors describe unavailable terminal initialization; system errors describe OS/allocation/I/O failures. The independent presenter adds the statuses and unrepresentability error [described above](#snapshots-cursor-and-confirmation), exposed through `presenter::{Status,Error}`.
+Core/session C errors are `TIGT_ERROR_ARGUMENT` (-1), `TIGT_ERROR_TERMINAL` (-2), `TIGT_ERROR_BUSY` (-3), `TIGT_ERROR_SYSTEM` (-4), `TIGT_ERROR_UNREPRESENTABLE` (-5), `TIGT_ERROR_BACKGROUND` (-6) and `TIGT_ERROR_UNSUPPORTED` (-7); success is `TIGT_OK`. Rust exposes corresponding `Error` values and callback-panic reporting. Argument errors include unsupported dimensions/formats/flags, invalid text cells and insufficient font data. Busy includes conflicting ownership and missing/inactive frame state. Terminal errors describe unavailable terminal initialization; system errors describe OS/allocation/I/O failures. Unrepresentable rejects text that required glass output cannot express, Background rejects graphics without foreground ownership, and Unsupported reports a missing host operation such as SIGINFO. Asynchronous terminal failures persist in terminal status until a fresh capture. The independent presenter uses these errors alongside the statuses [described above](#snapshots-cursor-and-confirmation), exposed through `presenter::{Status,Error}`.
 
 Signal delivery is asynchronous; successful configuration does not mean a capture succeeded. Inspect snapshot completion status, and validate/decode output before declaring an instrumentation step successful. Standard signals can coalesce; this is a request for a current frame, not a lossless frame-recording protocol.
 

@@ -11,6 +11,9 @@
 //! live curses session. The borrowed descriptor must outlive the presenter.
 //! Use [`Presenter::present_nonblocking`] and [`Presenter::resume`] with an
 //! `O_NONBLOCK` descriptor to service host control between bounded write attempts.
+//! Background TTY output is forced to nonadaptive glass: never request a cursor
+//! report or switch input modes/protocols until foreground ownership returns.
+//! Use [`crate::terminal::Terminal`] for shared input and signal lifecycle policy.
 
 use crate::TextCell;
 use std::{
@@ -167,6 +170,10 @@ pub enum Error {
     System,
     /// Confirmed glass-TTY failure (ABORT); sticky until an explicit reset.
     Unrepresentable,
+    /// A pending full-screen transaction lost foreground terminal ownership.
+    Background,
+    /// The host operation is unavailable on this platform.
+    Unsupported,
     /// An unrecognized C status, retained without discarding its numeric value.
     UnexpectedStatus(i32),
 }
@@ -179,6 +186,8 @@ impl Error {
             -3 => Self::Busy,
             -4 => Self::System,
             -5 => Self::Unrepresentable,
+            -6 => Self::Background,
+            -7 => Self::Unsupported,
             4 => Self::WouldBlock,
             other => Self::UnexpectedStatus(other),
         }
@@ -196,6 +205,10 @@ impl fmt::Display for Error {
             Self::Unrepresentable => {
                 f.write_str("guest text cannot be represented as glass-TTY output")
             }
+            Self::Background => {
+                f.write_str("tigt full-screen output requires the foreground terminal")
+            }
+            Self::Unsupported => f.write_str("the tigt presenter host operation is unsupported"),
             Self::UnexpectedStatus(status) => {
                 write!(f, "unexpected tigt presenter status {status}")
             }

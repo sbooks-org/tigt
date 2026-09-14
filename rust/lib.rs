@@ -19,6 +19,7 @@ pub mod keyboard;
 mod mouse;
 pub mod presenter;
 mod snapshot;
+pub mod terminal;
 pub mod video;
 
 pub use input::{InputDecoder, InputEvent, InputKey, InputKind, ModifierKey, Modifiers};
@@ -137,6 +138,12 @@ pub enum Error {
     Busy,
     /// An allocation, thread, or other system operation failed.
     System,
+    /// Guest text cannot be represented by the required glass-TTY output.
+    Unrepresentable,
+    /// Bitmap/full-screen output is forbidden while the process is backgrounded.
+    Background,
+    /// The requested host operation is not supported on this platform.
+    Unsupported,
     /// An input or mouse handler panicked and has been permanently disabled.
     CallbackPanicked,
     /// The C decoder returned an event outside this binding's ABI.
@@ -152,6 +159,13 @@ impl fmt::Display for Error {
             Self::Terminal => f.write_str("unable to initialize the terminal"),
             Self::Busy => f.write_str("the tigt session is unavailable or already owned"),
             Self::System => f.write_str("a tigt system operation failed"),
+            Self::Unrepresentable => {
+                f.write_str("guest text cannot be represented as glass-TTY output")
+            }
+            Self::Background => {
+                f.write_str("tigt graphics output requires the foreground terminal")
+            }
+            Self::Unsupported => f.write_str("the tigt host operation is unsupported"),
             Self::CallbackPanicked => f.write_str("the tigt input callback panicked"),
             Self::InvalidInputEvent => {
                 f.write_str("the tigt decoder emitted an invalid input event")
@@ -170,6 +184,9 @@ fn check_status(status: i32) -> Result<(), Error> {
         -2 => Err(Error::Terminal),
         -3 => Err(Error::Busy),
         -4 => Err(Error::System),
+        -5 => Err(Error::Unrepresentable),
+        -6 => Err(Error::Background),
+        -7 => Err(Error::Unsupported),
         other => Err(Error::UnexpectedStatus(other)),
     }
 }
@@ -202,9 +219,10 @@ type MouseHandler = Box<dyn FnMut(MouseEvent) + Send + 'static>;
 /// call Send handlers on C's shared input worker. Keyboard and mouse callbacks
 /// are serialized, never concurrent. Handlers cannot capture this non-Send
 /// session and must not invoke lifecycle operations or reenter input decoding.
-/// Send events to the owning thread instead. Ctrl+C and
-/// Ctrl+Z arrive as semantic control characters: application policy decides
-/// whether to quit or suspend. Signal dispositions remain application-owned.
+/// Send events to the owning thread instead. Raw Ctrl+C, Ctrl+backslash and
+/// Ctrl+Z signal the host; Ctrl+T uses SIGINFO where available. Ctrl+V quotes
+/// the next complete gesture for the guest. Signal cleanup/chaining is opt-in
+/// through [`Self::install_signal_handlers`]; standalone decoders reserve no keys.
 ///
 /// Drop joins C's workers before releasing callback storage or the singleton
 /// claim. As with all RAII resources, process abort/exit or `mem::forget` bypasses
@@ -214,6 +232,7 @@ pub struct Session {
     callback: Option<CallbackHandle<InputHandler>>,
     mouse_callback: Option<CallbackHandle<MouseHandler>>,
     _claim: SessionClaim,
+    signals_installed: bool,
     _owner_thread: PhantomData<Rc<()>>,
 }
 
@@ -376,6 +395,7 @@ impl Session {
             mouse_callback,
             _claim: claim,
             _owner_thread: PhantomData,
+            signals_installed: false,
         })
     }
 
@@ -430,6 +450,71 @@ impl Session {
             .map_or(Ok(()), |callback| callback.status())
     }
 
+    /// Reports both callback failures and persistent asynchronous terminal errors.
+    /// Unlike a frame submission, this observes an accepted-frame/background
+    /// failure even when the producer has no more frames to submit.
+    pub fn status(&self) -> Result<(), Error> {
+        self.input_status()?;
+        check_status(unsafe { ffi::tigt_terminal_status() })
+    }
+
+    /// Services deferred lifecycle work on the owning thread, outside callbacks
+    /// and signal handlers. Check [`Self::generation`] even when this returns an
+    /// error: a transition must still invalidate external cursor/guest state.
+    pub fn poll(&mut self) -> Result<terminal::Events, Error> {
+        let result = terminal::Events::from_status(unsafe { ffi::tigt_terminal_poll() });
+        self.input_status()?;
+        result
+    }
+
+    pub fn generation(&self) -> u32 {
+        unsafe { ffi::tigt_terminal_generation() }
+    }
+
+    pub fn is_foreground(&self) -> bool {
+        unsafe { ffi::tigt_terminal_is_foreground() != 0 }
+    }
+
+    /// Opts into async-safe cleanup and chaining of supported signal dispositions.
+    /// Serialize application signal registration with this call. Normal-context
+    /// polling remains required; the raw handler never joins session workers.
+    pub fn install_signal_handlers(&mut self) -> Result<(), Error> {
+        check_status(unsafe { ffi::tigt_terminal_install_signal_handlers() })?;
+        self.signals_installed = true;
+        Ok(())
+    }
+
+    /// Installs chained handlers with explicitly supplied prior dispositions.
+    ///
+    /// Use this when platform readback omits flags such as Darwin's
+    /// SA_RESETHAND. Unlisted signals retain discovered actions. Nonempty
+    /// overrides return [`Error::Busy`] if handlers are already installed.
+    ///
+    /// # Safety
+    ///
+    /// Actions must contain valid platform flags and matching handler pointers.
+    /// Handlers and their referenced state must remain valid while registered,
+    /// including after uninstall restores them; they must obey signal-context
+    /// restrictions and never unwind across C. Serialize disposition changes.
+    /// See [`terminal::Terminal::install_signal_handlers_with_actions`].
+    pub unsafe fn install_signal_handlers_with_actions(
+        &mut self,
+        actions: &[terminal::SignalAction],
+    ) -> Result<(), Error> {
+        check_status(unsafe {
+            ffi::tigt_terminal_install_signal_handlers_with_actions(actions.as_ptr(), actions.len())
+        })?;
+        self.signals_installed = true;
+        Ok(())
+    }
+
+    pub fn uninstall_signal_handlers(&mut self) {
+        if self.signals_installed {
+            unsafe { ffi::tigt_terminal_uninstall_signal_handlers() };
+            self.signals_installed = false;
+        }
+    }
+
     /// Restores shell state and stops worker callbacks, retaining ownership.
     /// This remains available even after a callback panic.
     pub fn suspend(&mut self) {
@@ -452,6 +537,9 @@ impl Session {
     /// Further display scaling belongs to the terminal; native snapshots are unaffected.
     /// Identical resolved RGB/geometry does not redraw; padding and high bytes
     /// are ignored. Layout, resize, resume and text/bitmap transitions still redraw.
+    /// Background submission returns [`Error::Background`], never dropping,
+    /// queueing or converting the bitmap to glass. A later background transition
+    /// is a persistent failure observable through [`Self::poll`] / [`Self::status`].
     pub fn present_bitmap(
         &self,
         pixels: &[u32],
@@ -571,6 +659,7 @@ impl Drop for Session {
         // Session is !Send/!Sync: lifecycle and submissions cannot race in safe
         // Rust. Shutdown joins both C workers before fields are destroyed.
         unsafe { ffi::tigt_shutdown() };
+        self.uninstall_signal_handlers();
     }
 }
 

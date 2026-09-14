@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -38,7 +39,7 @@ const XTERM: [usize; 16] = [
 ];
 const FONT_OFFSET: usize = 0xfa6e;
 const CONTROLS: &[u8] =
-    b"\x03\x1a\x1b[99;5:1u\x1b[99;5:2u\x1b[99;5:3u\x1b[122;5:1u\x1b[122;5:2u\x1b[122;5:3uq";
+    b"\x16\x03\x16\x1a\x16\x1b[99;5:1u\x1b[99;5:2u\x1b[99;5:3u\x16\x1b[122;5:1u\x1b[122;5:2u\x1b[122;5:3uq";
 
 struct Fixture {
     directory: Option<tempfile::TempDir>,
@@ -113,6 +114,7 @@ impl Fixture {
                 .arg(root.join("src/snapshot.c"))
                 .arg(root.join("src/video.c"))
                 .arg(root.join("src/presenter.c"));
+            command.arg(root.join("src/terminal.c"));
             let png = pkg_config::Config::new()
                 .cargo_metadata(false)
                 .probe("libpng")
@@ -292,7 +294,8 @@ impl Fixture {
         } else {
             "C.UTF-8"
         };
-        let child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(arguments)
             .env("TERM", "xterm-256color")
             .env("LANG", locale)
@@ -302,10 +305,24 @@ impl Fixture {
             .env_remove("TIGT_SNAPSHOT_FORMAT")
             .env_remove("TIGT_SNAPSHOT_SIGNAL")
             .stdout(slave.try_clone().unwrap())
-            .stderr(slave)
+            .stderr(slave);
+        // A TTY fd alone is not foreground ownership. Give the subprocess its
+        // own controlling terminal without touching the test runner's session.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = command
             .spawn()
             .expect("launching compiled C fixture in its own PTY");
         let mut child = ChildGuard(child);
+        // Command retains configured stdio handles. Linux cannot report PTY EOF
+        // until the parent's slave copies are closed as well as the child's.
+        drop(command);
         let mut bytes = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(30);
         let result = (|| -> Result<ExitStatus, String> {
@@ -674,6 +691,74 @@ fn public_session_copies_frames_dispatches_controls_and_restores_terminal() {
         output.status.success(),
         "non-TTY initialization: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn terminal_lifecycle_preserves_job_control_signal_and_background_contracts() {
+    let fixture = Fixture::build("lifecycle_fixture", true, false);
+    let (mut raw_sent, mut cooked_sent) = (false, false);
+    let capture = fixture.capture_observing("lifecycle", &[], |bytes, master| {
+        if !raw_sent
+            && bytes
+                .windows(b"QUOTE-RAW-READY".len())
+                .any(|w| w == b"QUOTE-RAW-READY")
+        {
+            master.write_all(
+                b"\x16\x1b[99;5:1u\x1b[99;5:2u\x1b[99;5:3u\x16\x16\x16\x1a\x1b[200~\x03\x1b[201~q",
+            ).map_err(|error| error.to_string())?;
+            raw_sent = true;
+        }
+        if !cooked_sent
+            && bytes
+                .windows(b"QUOTE-COOKED-READY".len())
+                .any(|w| w == b"QUOTE-COOKED-READY")
+        {
+            // The line discipline consumes each VLNEXT, retaining literal C/V.
+            master
+                .write_all(b"\x16\x03\x16\x16\n")
+                .map_err(|error| error.to_string())?;
+            cooked_sent = true;
+        }
+        Ok(())
+    });
+    assert!(
+        raw_sent && cooked_sent,
+        "both real PTY input paths must complete"
+    );
+    let pipe_begin = capture
+        .windows(b"PIPE-CLEANUP-BEGIN".len())
+        .position(|w| w == b"PIPE-CLEANUP-BEGIN")
+        .unwrap();
+    let pipe_end = capture[pipe_begin..]
+        .windows(b"PIPE-CLEANUP-END".len())
+        .position(|w| w == b"PIPE-CLEANUP-END")
+        .unwrap()
+        + pipe_begin;
+    let pipe_cleanup = &capture[pipe_begin..pipe_end];
+    for restore in [b"\x1b[<u".as_slice(), b"\x1b[?2004r"] {
+        assert_eq!(
+            pipe_cleanup
+                .windows(restore.len())
+                .filter(|w| *w == restore)
+                .count(),
+            2,
+            "custom and default SIGPIPE must each restore input protocols once through the surviving tty"
+        );
+    }
+    let begin = capture
+        .windows(b"GLASS-BG-BEGIN".len())
+        .position(|w| w == b"GLASS-BG-BEGIN")
+        .unwrap()
+        + b"GLASS-BG-BEGIN".len();
+    let end = capture[begin..]
+        .windows(b"GLASS-BG-END".len())
+        .position(|w| w == b"GLASS-BG-END")
+        .unwrap()
+        + begin;
+    assert!(
+        !capture[begin..end].contains(&0x1b),
+        "background glass emitted terminal protocols"
     );
 }
 

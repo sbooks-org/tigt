@@ -12,6 +12,7 @@
 #include <locale.h>
 #include <poll.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -95,6 +96,8 @@ create_pty(fixture *f, unsigned guest_columns, unsigned guest_rows,
     CHECK(name != NULL);
     f->slave = open(name, O_RDWR | O_NOCTTY);
     CHECK(f->slave >= 0);
+    CHECK(ioctl(f->slave, TIOCSCTTY, 0) == 0);
+    CHECK(tcsetpgrp(f->slave, getpgrp()) == 0);
     struct termios modes;
     CHECK(tcgetattr(f->slave, &modes) == 0);
     modes.c_oflag &= ~OPOST;
@@ -2237,6 +2240,10 @@ nonblocking_transactions(void)
 int
 main(void)
 {
+    /* Adaptive output requires actual foreground ownership, not just a PTY fd.
+     * Each fixture releases its controlling terminal when its master closes. */
+    CHECK(setsid() >= 0);
+    CHECK(signal(SIGHUP, SIG_IGN) != SIG_ERR);
     editing();
     clears_and_attributes();
     scrolling_after_partial_line();

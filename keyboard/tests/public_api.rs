@@ -213,3 +213,206 @@ fn enhanced_navigation_and_command_keypad_have_independent_holds() {
         [(0x152, false)]
     );
 }
+
+#[test]
+fn function_aliases_preserve_physical_and_wire_release_identity() {
+    for model in [KeyboardModel::XtSet1, KeyboardModel::AtSet1] {
+        for (number, modifiers, expected) in [
+            (13, Modifiers::NONE, vec![0x2A, 0x37]),
+            (13, Modifiers::SHIFT, vec![0x37]),
+            (14, Modifiers::NONE, vec![0x46]),
+            (15, Modifiers::NONE, vec![0x1D, 0x45]),
+            (15, Modifiers::CONTROL, vec![0x1D, 0x46]),
+        ] {
+            let mut keyboard = PcKeyboard::new(model);
+            let key = InputKey::Function(number);
+            let make = keyboard.handle(&InputEvent::new(key, modifiers, InputKind::Press));
+            assert_eq!(
+                physical(make.clone()),
+                expected
+                    .iter()
+                    .map(|&code| (u16::from(code), true))
+                    .collect::<Vec<_>>(),
+                "{model:?} {key:?} {modifiers:?}"
+            );
+            let make_bytes = make
+                .iter()
+                .flat_map(|event| match event {
+                    PcEvent::Make(key) => key.make.bytes(),
+                    PcEvent::Break(_) => panic!("unexpected break"),
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            assert_eq!(make_bytes, expected);
+            assert_eq!(
+                keyboard.handle(&InputEvent::new(key, Modifiers::NONE, InputKind::Repeat)),
+                []
+            );
+            // Release modifiers need not match the press: release the held chord,
+            // not whichever alias those current modifiers would select.
+            let release = keyboard.handle(&InputEvent::new(
+                key,
+                Modifiers::SHIFT | Modifiers::CONTROL,
+                InputKind::Release,
+            ));
+            assert_eq!(
+                physical(release.clone()),
+                expected
+                    .iter()
+                    .map(|&code| (u16::from(code), false))
+                    .collect::<Vec<_>>()
+            );
+            let break_bytes = release
+                .iter()
+                .flat_map(|event| match event {
+                    PcEvent::Break(key) => key.break_sequence.bytes(),
+                    PcEvent::Make(_) => panic!("unexpected make"),
+                })
+                .copied()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                break_bytes,
+                expected.iter().map(|code| code | 0x80).collect::<Vec<_>>()
+            );
+            assert_eq!(keyboard.release_all(), []);
+        }
+    }
+}
+
+#[test]
+fn shifted_f13_temporarily_suppresses_physical_shift_and_tracks_its_release() {
+    for model in [KeyboardModel::XtSet1, KeyboardModel::AtSet1] {
+        for (shift, code) in [
+            (ModifierKey::LeftShift, 0x2A),
+            (ModifierKey::RightShift, 0x36),
+        ] {
+            for release_shift_first in [false, true] {
+                let mut keyboard = PcKeyboard::new(model);
+                let shift = InputKey::Modifier(shift);
+                assert_eq!(
+                    physical(keyboard.handle(&InputEvent::new(
+                        shift,
+                        Modifiers::SHIFT,
+                        InputKind::Press
+                    ))),
+                    [(code, true)]
+                );
+                assert_eq!(
+                    physical(keyboard.handle(&InputEvent::new(
+                        InputKey::Function(13),
+                        Modifiers::SHIFT,
+                        InputKind::Press,
+                    ))),
+                    [(code, false), (0x37, true)]
+                );
+                if release_shift_first {
+                    assert_eq!(
+                        keyboard.handle(&InputEvent::new(
+                            shift,
+                            Modifiers::NONE,
+                            InputKind::Release
+                        )),
+                        []
+                    );
+                }
+                assert_eq!(
+                    physical(keyboard.handle(&InputEvent::new(
+                        InputKey::Function(13),
+                        Modifiers::NONE,
+                        InputKind::Release,
+                    ))),
+                    if release_shift_first {
+                        vec![(0x37, false)]
+                    } else {
+                        vec![(0x37, false), (code, true)]
+                    }
+                );
+                if !release_shift_first {
+                    assert_eq!(
+                        physical(keyboard.handle(&InputEvent::new(
+                            shift,
+                            Modifiers::NONE,
+                            InputKind::Release
+                        ))),
+                        [(code, false)]
+                    );
+                }
+                assert_eq!(keyboard.release_all(), []);
+            }
+        }
+    }
+}
+
+#[test]
+fn alias_modifier_references_survive_chord_changes_and_other_held_keys() {
+    for model in [KeyboardModel::XtSet1, KeyboardModel::AtSet1] {
+        let mut keyboard = PcKeyboard::new(model);
+        for (key, modifiers, kind, expected) in [
+            (
+                InputKey::Function(15),
+                Modifiers::NONE,
+                InputKind::Press,
+                vec![(0x1D, true), (0x45, true)],
+            ),
+            (
+                InputKey::Char('c'),
+                Modifiers::CONTROL,
+                InputKind::Press,
+                vec![(0x2E, true)],
+            ),
+            (
+                InputKey::Function(15),
+                Modifiers::CONTROL,
+                InputKind::Press,
+                vec![(0x45, false), (0x46, true)],
+            ),
+            (
+                InputKey::Function(14),
+                Modifiers::NONE,
+                InputKind::Press,
+                vec![],
+            ),
+            (
+                InputKey::Function(15),
+                Modifiers::NONE,
+                InputKind::Release,
+                vec![],
+            ),
+            (
+                InputKey::Function(14),
+                Modifiers::NONE,
+                InputKind::Release,
+                vec![(0x46, false)],
+            ),
+            (
+                InputKey::Char('c'),
+                Modifiers::NONE,
+                InputKind::Release,
+                vec![(0x1D, false), (0x2E, false)],
+            ),
+        ] {
+            assert_eq!(
+                physical(keyboard.handle(&InputEvent::new(key, modifiers, kind))),
+                expected,
+                "{model:?} {key:?} {kind:?}"
+            );
+        }
+        assert_eq!(keyboard.release_all(), []);
+        assert_eq!(
+            keyboard.handle(&InputEvent::new(
+                InputKey::Char('\u{f746}'),
+                Modifiers::NONE,
+                InputKind::Press
+            )),
+            []
+        );
+        assert_eq!(
+            physical(keyboard.handle(&InputEvent::new(
+                InputKey::Function(1),
+                Modifiers::NONE,
+                InputKind::Press
+            ))),
+            [(0x3B, true)]
+        );
+    }
+}

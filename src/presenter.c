@@ -9,6 +9,7 @@
 #define _DARWIN_C_SOURCE
 #endif
 #include "tigt_presenter.h"
+#include "terminal_internal.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -87,6 +88,8 @@ struct tigt_presenter {
     bool scroll_holding;
     unsigned scroll_ticks;
     int error;
+    unsigned terminal_generation;
+    bool background;
     uint16_t columns, rows;
     uint16_t guest_column, guest_row;
     unsigned output_column, output_row;
@@ -113,6 +116,7 @@ struct tigt_presenter {
     glass_cursor next_cursor;
     unsigned next_host_columns, next_host_rows;
     unsigned next_region_top, next_region_height;
+    bool registered_fullscreen;
 };
 
 
@@ -947,10 +951,43 @@ plan_glass(tigt_presenter *p, const tigt_presenter_frame *frame, glass_cursor *c
 }
 
 static int
+observe_terminal(tigt_presenter *p)
+{
+    bool background = !tigt_terminal_fd_foreground(p->config.output_fd);
+    unsigned epoch = tigt_terminal_generation();
+    if (background != p->background || epoch != p->terminal_generation) {
+        p->background = background;
+        p->terminal_generation = epoch;
+        p->host_cursor_known = false;
+        if (p->output_pending && p->next_fullscreen) {
+            /* A retained fullscreen byte transaction cannot turn into glass
+             * halfway through an escape sequence or be replayed on resume. */
+            p->error = TIGT_ERROR_BACKGROUND;
+            tigt_terminal_record_error(p->error);
+            return p->error;
+        }
+        if (p->fullscreen) {
+            p->fullscreen = false;
+            p->pending = false;
+            p->pending_ticks = 0;
+            p->echo_count = 0;
+            p->host_wrap = false;
+            discard_expectations(&p->queue);
+        }
+    }
+    return TIGT_OK;
+}
+
+static int
 write_output(tigt_presenter *p, bool nonblocking)
 {
     if (p->buffer_error != TIGT_OK)
         return p->buffer_error;
+    if (observe_terminal(p) < TIGT_OK) return p->error;
+    if (p->next_fullscreen && !tigt_terminal_fd_foreground(p->config.output_fd)) {
+        tigt_terminal_record_error(TIGT_ERROR_BACKGROUND);
+        return TIGT_ERROR_BACKGROUND;
+    }
     if (p->written == p->used)
         return TIGT_OK;
 #if defined(__APPLE__)
@@ -977,6 +1014,11 @@ write_output(tigt_presenter *p, bool nonblocking)
 #endif
     int result = TIGT_OK, saved = 0;
     while (p->written < p->used) {
+        if (p->next_fullscreen && !tigt_terminal_fd_foreground(p->config.output_fd)) {
+            result = TIGT_ERROR_BACKGROUND;
+            tigt_terminal_record_error(result);
+            break;
+        }
         ssize_t count = write(p->config.output_fd, p->bytes + p->written, p->used - p->written);
         if (count > 0) {
             p->written += (size_t) count;
@@ -1150,7 +1192,16 @@ incompatible:
 static int
 finish_output(tigt_presenter *p, bool nonblocking)
 {
+    if (!tigt_terminal_begin_io(p->next_fullscreen)) {
+        if (p->next_fullscreen) {
+            p->error = TIGT_ERROR_BACKGROUND;
+            tigt_terminal_record_error(p->error);
+            return p->error;
+        }
+        return TIGT_ERROR_BUSY;
+    }
     int result = write_output(p, nonblocking);
+    tigt_terminal_end_io();
     if (result == TIGT_PRESENTER_WOULD_BLOCK)
         return result;
     if (result != TIGT_OK) {
@@ -1193,6 +1244,10 @@ finish_output(tigt_presenter *p, bool nonblocking)
         commit_glass(p, &p->next_frame, &p->next_cursor);
         p->fullscreen = false;
     }
+    if (p->registered_fullscreen) {
+        tigt_terminal_pending_fullscreen(-1);
+        p->registered_fullscreen = false;
+    }
     p->pending = p->output_pending = false;
     p->pending_ticks = 0;
     return p->fullscreen ? TIGT_PRESENTER_FULLSCREEN : TIGT_OK;
@@ -1212,6 +1267,10 @@ begin_output(tigt_presenter *p, const tigt_presenter_frame *frame,
         p->next_cursor = *cursor;
     p->written = 0;
     p->output_pending = true;
+    if (fullscreen) {
+        tigt_terminal_pending_fullscreen(1);
+        p->registered_fullscreen = true;
+    }
     return finish_output(p, nonblocking);
 }
 
@@ -1265,6 +1324,8 @@ static int
 draw_fullscreen(tigt_presenter *p, const tigt_presenter_frame *frame, bool entering,
                 const glass_cursor *cursor, bool recovered, bool nonblocking)
 {
+    if (!tigt_terminal_fd_foreground(p->config.output_fd))
+        return TIGT_ERROR_UNREPRESENTABLE;
     unsigned host_columns, host_rows;
     int result = terminal_size(p, &host_columns, &host_rows);
     if (result != TIGT_OK)
@@ -1396,6 +1457,8 @@ tigt_presenter_create(const tigt_presenter_config *config, tigt_presenter **outp
     if (p == NULL)
         return TIGT_ERROR_SYSTEM;
     p->config = *config;
+    p->terminal_generation = tigt_terminal_generation();
+    p->background = !tigt_terminal_fd_foreground(config->output_fd);
     if (config->encoding == TIGT_ENCODING_LOCALE) {
         p->locale = newlocale(LC_CTYPE_MASK, "", (locale_t) 0);
         if (p->locale == (locale_t) 0) {
@@ -1648,6 +1711,8 @@ present(tigt_presenter *p, const tigt_presenter_frame *frame, bool nonblocking)
 {
     if (p == NULL)
         return TIGT_ERROR_ARGUMENT;
+    int terminal_result = observe_terminal(p);
+    if (terminal_result < TIGT_OK) return terminal_result;
     if (p->error != TIGT_OK)
         return p->error;
     if (p->output_pending)
@@ -1757,7 +1822,7 @@ present(tigt_presenter *p, const tigt_presenter_frame *frame, bool nonblocking)
             p->pending_ticks += 2100u / frame->refresh_hz;
         if (p->pending_ticks < 210)
             return TIGT_PRESENTER_PENDING;
-        if (p->config.mode == TIGT_PRESENT_ADAPTIVE)
+        if (p->config.mode == TIGT_PRESENT_ADAPTIVE && !p->background)
             result = draw_fullscreen(p, frame, true, NULL, false, nonblocking);
     }
     if (result < TIGT_OK)
@@ -1782,6 +1847,8 @@ tigt_presenter_resume(tigt_presenter *p)
 {
     if (p == NULL)
         return TIGT_ERROR_ARGUMENT;
+    int terminal_result = observe_terminal(p);
+    if (terminal_result < TIGT_OK) return terminal_result;
     if (p->error != TIGT_OK)
         return p->error;
     if (!p->output_pending)
@@ -1802,6 +1869,10 @@ tigt_presenter_reset(tigt_presenter *p)
 {
     if (p == NULL)
         return TIGT_ERROR_ARGUMENT;
+    if (p->registered_fullscreen) {
+        tigt_terminal_pending_fullscreen(-1);
+        p->registered_fullscreen = false;
+    }
     p->initialized = p->fullscreen = p->pending = p->output_pending = false;
     p->recovery_boundary = p->recovery_text = p->recovery_confirming = false;
     p->pending_ticks = p->recovery_ticks = 0;
@@ -1820,6 +1891,8 @@ tigt_presenter_reset(tigt_presenter *p)
     memset(&p->mapping, 0, sizeof(p->mapping));
     memset(p->recent_ids, 0, sizeof(p->recent_ids));
     p->logical_column = p->vsync_ticks = p->recent_next = 0;
+    p->terminal_generation = tigt_terminal_generation();
+    p->background = !tigt_terminal_fd_foreground(p->config.output_fd);
     return TIGT_OK;
 }
 
@@ -1828,6 +1901,7 @@ tigt_presenter_destroy(tigt_presenter *p)
 {
     if (p == NULL)
         return;
+    if (p->registered_fullscreen) tigt_terminal_pending_fullscreen(-1);
     if (p->locale != (locale_t) 0)
         freelocale(p->locale);
     free(p->image);

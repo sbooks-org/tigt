@@ -20,7 +20,7 @@ add_library(tigt::curses INTERFACE IMPORTED)
 set_target_properties(tigt::curses PROPERTIES
     INTERFACE_LINK_LIBRARIES "${CURSES_LIBRARIES}"
     INTERFACE_INCLUDE_DIRECTORIES "${CURSES_INCLUDE_DIRS}")
-add_library(tigt src/tigt.c src/input.c src/graphics.c src/snapshot.c src/video.c src/presenter.c)
+add_library(tigt src/tigt.c src/terminal.c src/input.c src/graphics.c src/snapshot.c src/video.c src/presenter.c)
 add_library(tigt::tigt ALIAS tigt)
 target_compile_features(tigt PUBLIC c_std_11)
 target_compile_definitions(tigt PRIVATE _XOPEN_SOURCE_EXTENDED=1)
@@ -117,7 +117,7 @@ install(TARGETS tigt EXPORT tigtTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(FILES include/tigt.h include/tigt_mouse.h include/tigt_video.h include/tigt_presenter.h
+install(FILES include/tigt.h include/tigt_terminal.h include/tigt_mouse.h include/tigt_video.h include/tigt_presenter.h
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 if(TIGT_WITH_KEYBOARD)
     install(FILES "${TIGT_KEYBOARD_LIBRARY}" DESTINATION ${CMAKE_INSTALL_LIBDIR})

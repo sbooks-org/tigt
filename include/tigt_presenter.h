@@ -6,7 +6,6 @@
 extern "C" {
 #endif
 #define TIGT_PRESENTER_ABI_VERSION 1u
-#define TIGT_ERROR_UNREPRESENTABLE -5
 #define TIGT_PRESENTER_PENDING 1
 #define TIGT_PRESENTER_FULLSCREEN 2
 #define TIGT_PRESENTER_WOULD_BLOCK 4
@@ -135,6 +134,11 @@ int tigt_presenter_local_echo(tigt_presenter *presenter, const uint32_t *text, s
  * The caller serializes all operations and owns the borrowed output fd. Never
  * share output with a live curses session. Adaptive mode requires a TTY fd.
  * No stdin reads, termios raw mode, alternate screen, or signal handlers.
+ * Foreground ownership is checked on the output TTY independently of capture.
+ * Background operation is nonadaptive glass; fullscreen is never emitted.
+ * A pending fullscreen transaction invalidated by release/background fails
+ * with BACKGROUND and also records terminal status. Foreground restoration
+ * invalidates host cursor observations; obtain a fresh CPR before fallback.
  * Returned status: OK (glass), PENDING (confirmation, scroll, or disable hold),
  * NEEDS_CURSOR (observation), FULLSCREEN, WOULD_BLOCK, or error. PENDING retains
  * the current presentation/input mode, including when already fullscreen.

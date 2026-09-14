@@ -113,6 +113,8 @@ pub struct InputEvent {
     pub key: InputKey,
     pub modifiers: Modifiers,
     pub kind: InputKind,
+    /// Literal bracketed-paste payload; never interpret it as a host control gesture.
+    pub is_paste: bool,
 }
 
 impl InputEvent {
@@ -121,10 +123,14 @@ impl InputEvent {
             key,
             modifiers,
             kind,
+            is_paste: false,
         }
     }
 
     fn from_raw(raw: &ffi::InputEvent) -> Option<Self> {
+        if raw.flags & !1 != 0 {
+            return None;
+        }
         let key = match raw.key.kind {
             0 => InputKey::Char(char::from_u32(raw.key.character)?),
             1 => InputKey::Backspace,
@@ -171,7 +177,63 @@ impl InputEvent {
             key,
             modifiers: Modifiers::from_bits(raw.modifiers)?,
             kind,
+            is_paste: raw.flags & 1 != 0,
         })
+    }
+
+    pub(crate) fn to_raw(self) -> ffi::InputEvent {
+        let (kind, value, character) = match self.key {
+            InputKey::Char(character) => (0, 0, character as u32),
+            InputKey::Backspace => (1, 0, 0),
+            InputKey::Delete => (2, 0, 0),
+            InputKey::Insert => (3, 0, 0),
+            InputKey::Enter => (4, 0, 0),
+            InputKey::Left => (5, 0, 0),
+            InputKey::Right => (6, 0, 0),
+            InputKey::Up => (7, 0, 0),
+            InputKey::Down => (8, 0, 0),
+            InputKey::Home => (9, 0, 0),
+            InputKey::End => (10, 0, 0),
+            InputKey::PageUp => (11, 0, 0),
+            InputKey::PageDown => (12, 0, 0),
+            InputKey::PrintScreen => (13, 0, 0),
+            InputKey::Pause => (14, 0, 0),
+            InputKey::ScrollLock => (15, 0, 0),
+            InputKey::NumLock => (16, 0, 0),
+            InputKey::KeypadBegin => (17, 0, 0),
+            InputKey::Escape => (18, 0, 0),
+            InputKey::Null => (19, 0, 0),
+            InputKey::Function(value) => (20, u32::from(value), 0),
+            InputKey::Modifier(key) => (
+                21,
+                match key {
+                    ModifierKey::LeftShift => 0,
+                    ModifierKey::RightShift => 1,
+                    ModifierKey::LeftControl => 2,
+                    ModifierKey::RightControl => 3,
+                    ModifierKey::LeftAlt => 4,
+                    ModifierKey::RightAlt => 5,
+                    ModifierKey::LeftSuper => 6,
+                    ModifierKey::RightSuper => 7,
+                    ModifierKey::Other => 8,
+                },
+                0,
+            ),
+        };
+        ffi::InputEvent {
+            key: ffi::InputKey {
+                kind,
+                value,
+                character,
+            },
+            modifiers: self.modifiers.bits(),
+            kind: match self.kind {
+                InputKind::Press => 0,
+                InputKind::Repeat => 1,
+                InputKind::Release => 2,
+            },
+            flags: u8::from(self.is_paste),
+        }
     }
 }
 
@@ -265,7 +327,8 @@ pub(crate) unsafe fn dispatch_event<F: FnMut(E), E>(event: Option<E>, user: *mut
 /// The handler runs synchronously during `feed` and `flush`, and may borrow
 /// local data. Input buffering belongs to C, so split UTF-8 and escape sequences
 /// can be fed in separate chunks. `flush` resolves a pending bare Escape after
-/// the application's chosen timeout. No control key is reserved by tigt.
+/// the application's chosen timeout. This standalone decoder reserves no control
+/// keys; live-session host policy is separate.
 ///
 /// A panicking handler is disabled and subsequent operations return
 /// [`Error::CallbackPanicked`]; unwinding never crosses C (with panic=abort,
@@ -331,6 +394,31 @@ impl<F: FnMut(InputEvent)> Drop for InputDecoder<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bracketed_paste_preserves_literal_controls_and_help_in_rust_events() {
+        let mut events = Vec::new();
+        {
+            let mut decoder = InputDecoder::new(|event| events.push(event)).unwrap();
+            decoder.feed(b"\x1b[200").unwrap();
+            decoder
+                .feed("~\u{f746}\x03\x1b[201~\u{f746}".as_bytes())
+                .unwrap();
+        }
+        let presses: Vec<_> = events
+            .into_iter()
+            .filter(|event| event.kind == InputKind::Press)
+            .map(|event| (event.key, event.is_paste))
+            .collect();
+        assert_eq!(
+            presses,
+            [
+                (InputKey::Char('\u{f746}'), true),
+                (InputKey::Char('\x03'), true),
+                (InputKey::Insert, false),
+            ]
+        );
+    }
 
     #[test]
     fn fragmented_utf8_and_control_taps_reach_borrowed_callback() {

@@ -39,6 +39,7 @@ Both repositories are currently private. Development tests require read access t
 - Overscan metadata is retained but not drawn.
 - Optional in-tree PC/XT and PC/AT keyboard mapper: Cargo `keyboard` or CMake `TIGT_WITH_KEYBOARD=ON`, both off by default. CMake needs Rust only when the mapper is enabled; no separate mapper checkout or Git fetch is required.
 - Keyboard callbacks, mouse reports and graphics replies share one terminal input reader. Mouse events preserve terminal cell/pixel coordinates and map to the displayed frame, including fractional positions. Buttons, wheel, click-only terminals and Kitty pixel-mode leave reports are supported; these protocols do not identify multitouch contacts.
+- Terminal lifecycle ownership with saved-state release, foreground-aware restoration and opt-in chained POSIX signal handlers. Managed live input supports host control signals and Ctrl+V guest quoting. Background output is nonadaptive glass only; bitmap rejection and asynchronous presentation failures are explicit errors. See the [lifecycle contract](docs/reference.md#lifecycle-and-ownership).
 - Snapshot instrumentation is opt-in. No dump signal is installed by default.
 
 MIT-0. Copyright (C) 2026 Simplebooks Foundation. Copyright (C) 2026 Josh Rodd.

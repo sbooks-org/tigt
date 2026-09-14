@@ -32,6 +32,7 @@ fn main() {
     build
         .files([
             "src/tigt.c",
+            "src/terminal.c",
             "src/input.c",
             "src/graphics.c",
             "src/snapshot.c",
@@ -99,6 +100,9 @@ fn main() {
     println!("cargo:include={}", include.display());
     for path in [
         "src/tigt.c",
+        "src/terminal.c",
+        "src/terminal_internal.h",
+        "include/tigt_terminal.h",
         "src/input.c",
         "src/input.h",
         "src/graphics.c",

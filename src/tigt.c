@@ -11,6 +11,8 @@
 #include "graphics.h"
 #include "input.h"
 #include "palette.h"
+#include "tigt_presenter.h"
+#include "terminal_internal.h"
 
 #include <curses.h>
 #include <errno.h>
@@ -60,11 +62,15 @@ static bool input_thread_created;
 static SCREEN *renderer_screen;
 static tigt_config renderer_config;
 static tigt_input *renderer_input;
-static struct termios saved_input_termios;
-static struct termios saved_output_termios;
-static bool terminal_modes_saved;
-static bool terminal_keyboard_enabled;
-static bool terminal_mouse_enabled;
+static bool terminal_captured;
+static bool session_requested;
+static tigt_presenter *background_presenter;
+static tigt_input_event held_keys[256];
+static unsigned held_key_count;
+static unsigned native_epoch;
+static uint32_t held_mouse_buttons;
+static void terminal_report(const char *parameters, uint8_t final, void *user);
+static void terminal_transition(unsigned changes);
 /* Negotiated protocol and published display geometry are protected by renderer_mutex. */
 static uint32_t terminal_mouse_mode;
 static bool terminal_mouse_pixels;
@@ -73,7 +79,6 @@ static struct {
     uint16_t width, height, columns, rows;
     double scale_x, scale_y, cell_width, cell_height;
 } pointer_projection;
-static const char mouse_modes_reset[] = "\033[?9;1000;1002;1003;1005;1006;1015;1016l";
 static uint64_t renderer_frame_serial;
 static uint64_t rendered_frame_serial;
 static bool terminal_default_colors_available;
@@ -816,10 +821,76 @@ publish_pointer_projection(const tigt_native_frame *frame)
 }
 
 static void
-terminal_mouse(const tigt_mouse_event *event, void *user)
+terminal_input(const tigt_input_event *event, void *user)
 {
     (void) user;
+    int result = tigt_terminal_filter_input(event);
+    if (result <= 0 || renderer_config.on_input == NULL) return;
+    unsigned index = 0;
+    while (index < held_key_count &&
+           (held_keys[index].key.kind != event->key.kind ||
+            held_keys[index].key.value != event->key.value ||
+            held_keys[index].key.character != event->key.character))
+        index++;
+    if (event->kind == TIGT_RELEASE) {
+        if (index < held_key_count) held_keys[index] = held_keys[--held_key_count];
+    } else if (index == held_key_count) {
+        if (held_key_count == 256) {
+            tigt_terminal_record_error(TIGT_ERROR_SYSTEM);
+            return;
+        }
+        held_keys[held_key_count++] = *event;
+    }
+    renderer_config.on_input(event, renderer_config.user);
+}
+
+static void
+release_guest_keys(void)
+{
+    while (held_key_count != 0) {
+        tigt_input_event event = held_keys[--held_key_count];
+        event.kind = TIGT_RELEASE;
+        renderer_config.on_input(&event, renderer_config.user);
+    }
+    if (renderer_config.on_mouse != NULL) {
+        for (unsigned button = TIGT_MOUSE_BUTTON_LEFT; button <= TIGT_MOUSE_BUTTON_RIGHT; button++) {
+            uint32_t bit = 1u << (button - 1);
+            if (!(held_mouse_buttons & bit)) continue;
+            held_mouse_buttons &= ~bit;
+            tigt_mouse_event event = {
+                .kind = TIGT_MOUSE_UP, .button = button, .buttons = held_mouse_buttons,
+                .flags = TIGT_MOUSE_SYNTHETIC
+            };
+            renderer_config.on_mouse(&event, renderer_config.mouse_user);
+        }
+    }
+}
+
+static int
+glass_frame(const tigt_text_cell *cells, uint16_t columns, uint16_t rows)
+{
+    unsigned cursor = 0;
+    bool found = false;
+    for (unsigned i = 0; i < (unsigned) columns * rows; i++)
+        if (cells[i].flags & TIGT_TEXT_CURSOR) { cursor = i; found = true; break; }
+    /* Native frames do not report a hidden logical cursor. Never invent one
+     * in order to make fullscreen output appear representable as scrollback. */
+    if (!found) return TIGT_ERROR_UNREPRESENTABLE;
+    tigt_presenter_frame frame = {
+        .cells = cells, .columns = columns, .rows = rows, .stride = columns,
+        .cursor_column = cursor % columns, .cursor_row = cursor / columns,
+        .refresh_hz = 50
+    };
+    return tigt_presenter_present(background_presenter, &frame);
+}
+
+static void
+terminal_mouse(const tigt_mouse_event *event, void *user)
+{
+    if (!tigt_terminal_is_foreground() || tigt_terminal_is_released()) return;
+    (void) user;
     tigt_mouse_event mapped = *event;
+    held_mouse_buttons = event->buttons;
     pthread_mutex_lock(&renderer_mutex);
     if ((event->flags & TIGT_MOUSE_POSITION_VALID) && pointer_projection.valid) {
         const bool pixels = event->coordinates == TIGT_MOUSE_COORD_PIXELS;
@@ -897,9 +968,33 @@ input_main(void *unused)
 {
     struct pollfd descriptor = { .fd = STDIN_FILENO, .events = POLLIN };
     uint8_t bytes[128];
+    unsigned epoch = tigt_terminal_generation();
 
     (void) unused;
     while (atomic_load_explicit(&input_running, memory_order_relaxed)) {
+        if (epoch != tigt_terminal_generation()) {
+            release_guest_keys();
+            pthread_mutex_lock(&renderer_mutex);
+            tigt_input_destroy(renderer_input);
+            renderer_input = tigt_input_create_with_mouse(
+                terminal_input, NULL,
+                renderer_config.on_mouse != NULL ? terminal_mouse : NULL, NULL,
+                renderer_config.mouse_mode);
+            if (renderer_input == NULL) {
+                tigt_terminal_record_error(TIGT_ERROR_SYSTEM);
+                pthread_mutex_unlock(&renderer_mutex);
+                break;
+            }
+            tigt_input_set_terminal_report_callback(renderer_input, terminal_report, NULL);
+            tigt_input_set_mouse_mode(renderer_input, terminal_mouse_mode);
+            pthread_mutex_unlock(&renderer_mutex);
+            epoch = tigt_terminal_generation();
+        }
+        if (!tigt_terminal_is_foreground() || tigt_terminal_is_released()) {
+            const struct timespec delay = { .tv_nsec = 25000000 };
+            nanosleep(&delay, NULL);
+            continue;
+        }
         const int ready = poll(&descriptor, 1, 25);
 
         if (!atomic_load_explicit(&input_running, memory_order_relaxed))
@@ -910,11 +1005,14 @@ input_main(void *unused)
             break;
         }
         if (ready == 0) {
-            tigt_input_flush(renderer_input);
+            if (tigt_terminal_is_foreground() && !tigt_terminal_is_released())
+                tigt_input_flush(renderer_input);
             continue;
         }
         if ((descriptor.revents & POLLIN) != 0) {
+            if (!tigt_terminal_begin_io(1)) continue;
             const ssize_t length = read(STDIN_FILENO, bytes, sizeof(bytes));
+            tigt_terminal_end_io();
 
             if (length > 0)
                 tigt_input_feed(renderer_input, bytes, (size_t) length);
@@ -924,28 +1022,48 @@ input_main(void *unused)
             break;
         }
     }
+    release_guest_keys();
     return NULL;
 }
 
 static void *
 renderer_main(void *unused)
 {
+    unsigned epoch = tigt_terminal_generation();
     const struct timespec interval = { .tv_sec = 0, .tv_nsec = 20000000 };
 
     (void) unused;
     while (atomic_load_explicit(&renderer_running, memory_order_relaxed)) {
-        render_frame();
+        if (tigt_terminal_begin_io(1)) {
+            if (epoch != tigt_terminal_generation()) {
+                epoch = tigt_terminal_generation();
+                rendered_cells_valid = false;
+                terminal_cursor_style_valid = false;
+                terminal_cursor_position_valid = false;
+                pthread_mutex_lock(&renderer_mutex);
+                pointer_projection.valid = false;
+                pthread_mutex_unlock(&renderer_mutex);
+            }
+            if (renderer_screen != NULL) render_frame();
+            tigt_terminal_end_io();
+        } else if (!tigt_terminal_is_faulted() && !tigt_terminal_is_foreground()) {
+            /* No terminal probes, reads, protocols or curses in background.
+             * A pending accepted bitmap fails observably, not by dropping it. */
+            pthread_mutex_lock(&renderer_mutex);
+            if (renderer_has_frame && renderer_bitmap_valid) {
+                if (renderer_frame_serial != rendered_frame_serial)
+                    tigt_terminal_record_error(TIGT_ERROR_BACKGROUND);
+            } else if (renderer_has_frame) {
+                int result = glass_frame(renderer_text_cells, renderer_text_columns, renderer_text_rows);
+                if (result < TIGT_OK) tigt_terminal_record_error(result);
+            }
+            pthread_mutex_unlock(&renderer_mutex);
+        }
         nanosleep(&interval, NULL);
     }
     return NULL;
 }
 
-static void
-restore_terminal_mode(int descriptor, const struct termios *mode)
-{
-    while (tcsetattr(descriptor, TCSANOW, mode) < 0 && errno == EINTR)
-        ;
-}
 
 static void
 stop_session(void)
@@ -973,33 +1091,23 @@ stop_session(void)
     pthread_mutex_unlock(&renderer_mutex);
     tigt_input_destroy(renderer_input);
     renderer_input = NULL;
-    if (terminal_keyboard_enabled) {
-        fputs("\033[<u", stdout);
-        terminal_keyboard_enabled = false;
-    }
-    if (terminal_mouse_enabled) {
-        fputs(mouse_modes_reset, stdout);
-        fputs("\033[?9;1000;1002;1003;1005;1006;1015;1016r", stdout);
-        terminal_mouse_enabled = false;
-    }
-    /* Input mode restoration must precede curses' direct terminal writes. */
-    fflush(stdout);
+    /* Workers are quiescent. Curses teardown must not write after an async
+     * release or when another foreground process owns the terminal. */
     if (renderer_screen != NULL) {
-        leave_image_graphics();
-        fputs("\033[0 q", stdout);
-        curs_set(1);
-        endwin();
+        if (tigt_terminal_begin_io(1)) {
+            leave_image_graphics();
+            if (endwin() == OK && fflush(stdout) != EOF)
+                tigt_terminal_screen(0);
+            else
+                tigt_terminal_record_error(TIGT_ERROR_SYSTEM);
+            tigt_terminal_end_io();
+        }
         delscreen(renderer_screen);
         renderer_screen = NULL;
     }
     tigt_ascii_destroy(renderer_ascii);
     renderer_ascii = NULL;
-    fflush(stdout);
-    if (terminal_modes_saved) {
-        restore_terminal_mode(STDOUT_FILENO, &saved_output_termios);
-        restore_terminal_mode(STDIN_FILENO, &saved_input_termios);
-        terminal_modes_saved = false;
-    }
+    if (terminal_captured) tigt_terminal_release();
 }
 
 static void
@@ -1064,19 +1172,22 @@ resolve_terminal_modes(void)
     const bool graphics_probe = selected == TIGT_GRAPHICS_AUTO || selected == TIGT_GRAPHICS_SIXEL ||
                                 selected == TIGT_GRAPHICS_ITERM2;
     const bool mouse = renderer_config.on_mouse != NULL;
-    const bool probe = (graphics_probe || mouse) && renderer_input != NULL &&
+    const bool probe = tigt_terminal_is_foreground() && !tigt_terminal_is_released() &&
+                       (graphics_probe || mouse) && renderer_input != NULL &&
                        fstat(STDIN_FILENO, &input) == 0 && fstat(STDOUT_FILENO, &output) == 0 &&
                        input.st_rdev == output.st_rdev && input.st_ino == output.st_ino;
     if (probe) {
         pthread_mutex_lock(&renderer_mutex);
         terminal_graphics.pending = true;
         pthread_mutex_unlock(&renderer_mutex);
+        if (!tigt_terminal_begin_io(1)) return TIGT_ERROR_BACKGROUND;
         const char *query = graphics_probe && selected != TIGT_GRAPHICS_ITERM2 ?
                             "\033[16t\033[14t\033[?2;1;0S\033[c" : "\033[16t\033[14t";
-        if (fputs(query, stdout) == EOF ||
+        int output_result = fputs(query, stdout) == EOF ||
             (mouse && renderer_config.mouse_mode == TIGT_MOUSE_AUTO &&
-             fputs("\033[?1016$p", stdout) == EOF) || fflush(stdout) == EOF)
-            return TIGT_ERROR_SYSTEM;
+             fputs("\033[?1016$p", stdout) == EOF) || fflush(stdout) == EOF;
+        tigt_terminal_end_io();
+        if (output_result) return TIGT_ERROR_SYSTEM;
         struct timespec start, now;
         if (clock_gettime(CLOCK_MONOTONIC, &start) != 0) return TIGT_ERROR_SYSTEM;
         const struct timespec interval = { .tv_nsec = 5000000 };
@@ -1106,13 +1217,13 @@ resolve_terminal_modes(void)
     terminal_mouse_mode = mouse_mode;
     pthread_mutex_unlock(&renderer_mutex);
     if (mouse) {
-        tigt_input_set_mouse_mode(renderer_input, mouse_mode);
-        const char *encoding = mouse_mode == TIGT_MOUSE_PIXELS ? "\033[?1006;1016h" :
-                               mouse_mode == TIGT_MOUSE_X10 ? "" : "\033[?1006h";
-        const char *tracking = mouse_mode == TIGT_MOUSE_X10 ? "\033[?9h" :
-                               "\033[?1000h\033[?1002h\033[?1003h";
-        if (fputs(encoding, stdout) == EOF || fputs(tracking, stdout) == EOF || fflush(stdout) == EOF)
-            return TIGT_ERROR_SYSTEM;
+        pthread_mutex_lock(&renderer_mutex);
+        if (renderer_input != NULL) tigt_input_set_mouse_mode(renderer_input, mouse_mode);
+        pthread_mutex_unlock(&renderer_mutex);
+        if (!tigt_terminal_begin_io(1)) return TIGT_ERROR_BACKGROUND;
+        int result = tigt_terminal_mouse(mouse_mode);
+        tigt_terminal_end_io();
+        if (result != TIGT_OK) return result;
     }
     return TIGT_OK;
 }
@@ -1170,23 +1281,43 @@ tigt_set_image_layout(uint16_t columns, uint16_t aspect_width, uint16_t aspect_h
 int
 tigt_resume(void)
 {
-    static const int application_signals[] = { SIGINT, SIGQUIT, SIGTSTP };
+    static const int application_signals[] = { SIGINT, SIGQUIT, SIGTSTP, SIGWINCH };
     struct sigaction saved_signals[sizeof(application_signals) / sizeof(application_signals[0])];
     int result = TIGT_ERROR_TERMINAL;
     int thread_error;
 
     if (!renderer_initialized)
         return TIGT_ERROR_ARGUMENT;
-    if (renderer_active)
+    if (renderer_active) {
+        if (tigt_terminal_is_foreground() && tigt_terminal_is_released()) {
+            result = tigt_terminal_restore();
+            if (result == TIGT_OK) result = tigt_terminal_poll();
+            return result < TIGT_OK ? result : TIGT_OK;
+        }
         return TIGT_OK;
+    }
     if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO))
         return TIGT_ERROR_TERMINAL;
-    if (tcgetattr(STDIN_FILENO, &saved_input_termios) < 0 ||
-        tcgetattr(STDOUT_FILENO, &saved_output_termios) < 0)
-        return TIGT_ERROR_SYSTEM;
-    terminal_modes_saved = true;
-    if (setlocale(LC_CTYPE, "") == NULL)
-        goto failure;
+    session_requested = true;
+    if (!terminal_captured) {
+        result = tigt_terminal_capture(STDIN_FILENO, STDOUT_FILENO);
+        if (result != TIGT_OK) return result;
+        terminal_captured = true;
+        tigt_terminal_set_owner(terminal_transition);
+    }
+    if (background_presenter == NULL) {
+        tigt_presenter_config glass = {
+            .abi_version = TIGT_PRESENTER_ABI_VERSION, .output_fd = STDOUT_FILENO,
+            .mode = TIGT_PRESENT_GLASS, .encoding = TIGT_ENCODING_LOCALE
+        };
+        result = tigt_presenter_create(&glass, &background_presenter);
+        if (result != TIGT_OK) goto failure;
+    }
+    if (setlocale(LC_CTYPE, "") == NULL) { result = TIGT_ERROR_TERMINAL; goto failure; }
+    if (!tigt_terminal_is_foreground()) goto start_workers;
+    result = tigt_terminal_restore();
+    if (result != TIGT_OK) goto failure;
+    result = TIGT_ERROR_TERMINAL;
     for (size_t index = 0; index < sizeof(application_signals) / sizeof(application_signals[0]); index++) {
         if (sigaction(application_signals[index], NULL, &saved_signals[index]) < 0) {
             result = TIGT_ERROR_SYSTEM;
@@ -1195,9 +1326,12 @@ tigt_resume(void)
     }
     /* Unlike initscr, newterm reports unavailable terminals without exiting.
        ncurses may install default job-control handlers: leave policy to the caller. */
+    if (!tigt_terminal_begin_io(1)) { result = TIGT_ERROR_BACKGROUND; goto failure; }
+    tigt_terminal_screen(1);
     renderer_screen = newterm(NULL, stdout, stdin);
     for (size_t index = 0; index < sizeof(application_signals) / sizeof(application_signals[0]); index++)
         sigaction(application_signals[index], &saved_signals[index], NULL);
+    tigt_terminal_end_io();
     if (renderer_screen == NULL)
         goto failure;
     memset(&rendered_window, 0, sizeof(rendered_window));
@@ -1216,34 +1350,27 @@ tigt_resume(void)
     terminal_cursor_style_valid = false;
     terminal_cursor_visible = false;
     terminal_cursor_position_valid = false;
+    if (!tigt_terminal_begin_io(1)) { result = TIGT_ERROR_BACKGROUND; goto failure; }
     if (has_colors() && start_color() == OK)
         terminal_default_colors_available = use_default_colors() == OK;
+    tigt_terminal_end_io();
     if (renderer_config.on_input != NULL || renderer_config.on_mouse != NULL) {
-        renderer_input = tigt_input_create_with_mouse(renderer_config.on_input, renderer_config.user,
+        renderer_input = tigt_input_create_with_mouse(
+            terminal_input, NULL,
             renderer_config.on_mouse != NULL ? terminal_mouse : NULL, NULL, renderer_config.mouse_mode);
         if (renderer_input == NULL) {
             result = TIGT_ERROR_SYSTEM;
             goto failure;
         }
         tigt_input_set_terminal_report_callback(renderer_input, terminal_report, NULL);
-        if (raw() == ERR || noecho() == ERR)
-            goto failure;
-        if (renderer_config.on_input != NULL) {
-            terminal_keyboard_enabled = true;
-            if (fputs("\033[>u\033[=11;1u", stdout) == EOF)
-                goto failure;
-        }
-        if (renderer_config.on_mouse != NULL) {
-            terminal_mouse_enabled = true;
-            if (fputs("\033[?9;1000;1002;1003;1005;1006;1015;1016s", stdout) == EOF ||
-                fputs(mouse_modes_reset, stdout) == EOF)
-                goto failure;
-        }
-        if (fflush(stdout) == EOF) goto failure;
+        result = tigt_terminal_set_input_mode(1, renderer_config.on_input != NULL);
+        if (result != TIGT_OK) goto failure;
     }
+    if (!tigt_terminal_begin_io(1)) { result = TIGT_ERROR_BACKGROUND; goto failure; }
     curs_set(0);
-    if (refresh() == ERR)
-        goto failure;
+    int refresh_result = refresh();
+    tigt_terminal_end_io();
+    if (refresh_result == ERR) goto failure;
     if (renderer_input != NULL) {
         atomic_store_explicit(&input_running, true, memory_order_relaxed);
         thread_error = pthread_create(&input_thread, NULL, input_main, NULL);
@@ -1256,6 +1383,7 @@ tigt_resume(void)
     }
     result = resolve_terminal_modes();
     if (result != TIGT_OK) goto failure;
+start_workers:
     atomic_store_explicit(&renderer_running, true, memory_order_relaxed);
     thread_error = pthread_create(&renderer_thread, NULL, renderer_main, NULL);
     if (thread_error != 0) {
@@ -1275,9 +1403,40 @@ failure:
     return result;
 }
 
+static void
+terminal_transition(unsigned changes)
+{
+    if (!renderer_initialized || !session_requested) return;
+    if ((changes & (TIGT_TERMINAL_RELEASED | TIGT_TERMINAL_RESTORED)) &&
+        native_epoch != tigt_terminal_generation()) {
+        bool foreground = tigt_terminal_is_foreground();
+        bool restart = !tigt_terminal_is_faulted() &&
+                       (!foreground || (changes & TIGT_TERMINAL_RESTORED));
+        if (!foreground) {
+            pthread_mutex_lock(&renderer_mutex);
+            if (renderer_has_frame && renderer_bitmap_valid &&
+                renderer_frame_serial != rendered_frame_serial)
+                tigt_terminal_record_error(TIGT_ERROR_BACKGROUND);
+            pthread_mutex_unlock(&renderer_mutex);
+        }
+        stop_session();
+        if (restart) {
+            int result = tigt_resume();
+            if (result != TIGT_OK) tigt_terminal_record_error(result);
+        }
+        native_epoch = tigt_terminal_generation();
+    }
+    if (changes & TIGT_TERMINAL_RESIZED) {
+        pthread_mutex_lock(&renderer_mutex);
+        renderer_frame_serial++;
+        pthread_mutex_unlock(&renderer_mutex);
+    }
+}
+
 void
 tigt_suspend(void)
 {
+    session_requested = false;
     if (renderer_initialized)
         stop_session();
 }
@@ -1310,6 +1469,10 @@ tigt_init(const tigt_config *config)
 
     if (result != TIGT_OK) {
         stop_session();
+        tigt_presenter_destroy(background_presenter);
+        background_presenter = NULL;
+        if (terminal_captured) tigt_terminal_forget();
+        terminal_captured = false;
         tigt_snapshot_session_stop(true);
         pthread_mutex_lock(&renderer_mutex);
         renderer_initialized = false;
@@ -1326,7 +1489,12 @@ tigt_shutdown(void)
 {
     if (!renderer_initialized)
         return;
+    session_requested = false;
     stop_session();
+    tigt_presenter_destroy(background_presenter);
+    background_presenter = NULL;
+    if (terminal_captured) tigt_terminal_forget();
+    terminal_captured = false;
     tigt_snapshot_session_stop(true);
     pthread_mutex_lock(&renderer_mutex);
     renderer_initialized = false;
@@ -1350,10 +1518,19 @@ tigt_present_bitmap(const uint32_t *pixels, uint16_t width, uint16_t height,
         return TIGT_ERROR_ARGUMENT;
     if (!renderer_active)
         return TIGT_ERROR_BUSY;
+    if (!tigt_terminal_is_foreground()) {
+        tigt_terminal_record_error(TIGT_ERROR_BACKGROUND);
+        return TIGT_ERROR_BACKGROUND;
+    }
     pthread_mutex_lock(&renderer_mutex);
-    if (!renderer_active) {
+    if (!renderer_active || tigt_terminal_is_released()) {
         pthread_mutex_unlock(&renderer_mutex);
         return TIGT_ERROR_BUSY;
+    }
+    if (!tigt_terminal_is_foreground()) {
+        pthread_mutex_unlock(&renderer_mutex);
+        tigt_terminal_record_error(TIGT_ERROR_BACKGROUND);
+        return TIGT_ERROR_BACKGROUND;
     }
     bool changed = !renderer_bitmap_valid || renderer_bitmap_width != width ||
                    renderer_bitmap_pixel_width != pixel_width;
@@ -1395,10 +1572,20 @@ tigt_present_indexed_bitmap(const uint8_t *indices, uint16_t width, uint16_t hei
         for (uint16_t column = 0; column < width; column++)
             if (indices[(size_t) row * stride + column] >= palette_size)
                 return TIGT_ERROR_ARGUMENT;
+    if (!renderer_active) return TIGT_ERROR_BUSY;
+    if (!tigt_terminal_is_foreground()) {
+        tigt_terminal_record_error(TIGT_ERROR_BACKGROUND);
+        return TIGT_ERROR_BACKGROUND;
+    }
     pthread_mutex_lock(&renderer_mutex);
-    if (!renderer_active) {
+    if (!renderer_active || tigt_terminal_is_released()) {
         pthread_mutex_unlock(&renderer_mutex);
         return TIGT_ERROR_BUSY;
+    }
+    if (!tigt_terminal_is_foreground()) {
+        pthread_mutex_unlock(&renderer_mutex);
+        tigt_terminal_record_error(TIGT_ERROR_BACKGROUND);
+        return TIGT_ERROR_BACKGROUND;
     }
     bool changed = !renderer_bitmap_valid || renderer_bitmap_width != width ||
                    renderer_bitmap_pixel_width != pixel_width;
@@ -1466,6 +1653,10 @@ tigt_present_text(const tigt_text_cell *cells, uint16_t columns, uint16_t rows,
             }
         }
     }
+    if (!tigt_terminal_is_foreground() && !cursor_present)
+        return TIGT_ERROR_UNREPRESENTABLE;
+    if (tigt_terminal_is_foreground() && tigt_terminal_is_released())
+        return TIGT_ERROR_BUSY;
 
     pthread_mutex_lock(&renderer_mutex);
     if (!renderer_active) {
