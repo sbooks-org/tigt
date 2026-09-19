@@ -96,7 +96,8 @@ static void shared_modifiers_and_errors(void) {
     assert(handle_events(keyboard, b, output) == 1);
     assert(output[0].key == 0x30 && output[0].down == 1);
     b.kind = PC_XT_KEYBOARD_V1_REPEAT;
-    assert(handle_events(keyboard, b, output) == 0);
+    assert(handle_events(keyboard, b, output) == 1);
+    assert(output[0].key == 0x30 && output[0].down == 1);
 
     a.kind = PC_XT_KEYBOARD_V1_RELEASE;
     for (size_t i = 0; i < PC_XT_KEYBOARD_V1_EVENT_MAX_KEYS; ++i) {

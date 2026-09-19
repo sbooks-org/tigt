@@ -85,7 +85,7 @@ typedef struct {
  * XT Print Screen is 0x37; XT Pause emits Ctrl (0x1d) + Num Lock (0x45).
  * AT navigation outside the Command layer uses 0x100 | make-position (Left
  * is 0x14b); XT navigation and explicit Command/keypad mappings stay unextended.
- * `down` is 1 for press and 0 for release, including AT Pause releases.
+ * `down` is 1 for press/repeat and 0 for release, including AT Pause releases.
  */
 typedef struct pc_xt_keyboard_v1_key_event {
     uint16_t key;

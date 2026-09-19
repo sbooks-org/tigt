@@ -54,7 +54,7 @@ fn consumer_receives_physical_identity_for_both_models() {
 }
 
 #[test]
-fn physical_transitions_preserve_shared_modifiers_and_ignore_repeat() {
+fn physical_repeats_preserve_shared_modifiers() {
     let mut keyboard = PcKeyboard::default();
     let shift = InputKey::Modifier(ModifierKey::LeftShift);
     for (key, modifiers, kind, expected) in [
@@ -87,7 +87,7 @@ fn physical_transitions_preserve_shared_modifiers_and_ignore_repeat() {
             InputKey::Char('B'),
             Modifiers::SHIFT,
             InputKind::Repeat,
-            vec![],
+            vec![(0x30, true)],
         ),
         (
             InputKey::Char('b'),
@@ -101,6 +101,31 @@ fn physical_transitions_preserve_shared_modifiers_and_ignore_repeat() {
             expected
         );
     }
+}
+
+#[test]
+fn repeat_uses_held_mapping_and_cannot_resurrect_released_keys() {
+    let mut keyboard = PcKeyboard::new(KeyboardModel::AtSet1);
+    let key = InputKey::Left;
+    let repeat = InputEvent::new(key, Modifiers::NONE, InputKind::Repeat);
+    assert_eq!(physical(keyboard.handle(&repeat)), []);
+    assert_eq!(
+        physical(keyboard.handle(&InputEvent::new(key, Modifiers::SUPER, InputKind::Press))),
+        [(0x4b, true)]
+    );
+    // Loss of the modifier in the repeat report must not change keypad Left
+    // into enhanced Left or acquire another ownership reference.
+    assert_eq!(physical(keyboard.handle(&repeat)), [(0x4b, true)]);
+    assert_eq!(physical(keyboard.handle(&repeat)), [(0x4b, true)]);
+    assert_eq!(
+        physical(keyboard.handle(&InputEvent::new(
+            InputKey::Modifier(ModifierKey::LeftSuper),
+            Modifiers::NONE,
+            InputKind::Release
+        ))),
+        [(0x4b, false)]
+    );
+    assert_eq!(physical(keyboard.handle(&repeat)), []);
 }
 
 #[test]
@@ -245,8 +270,16 @@ fn function_aliases_preserve_physical_and_wire_release_identity() {
                 .collect::<Vec<_>>();
             assert_eq!(make_bytes, expected);
             assert_eq!(
-                keyboard.handle(&InputEvent::new(key, Modifiers::NONE, InputKind::Repeat)),
-                []
+                physical(keyboard.handle(&InputEvent::new(
+                    key,
+                    Modifiers::NONE,
+                    InputKind::Repeat
+                ))),
+                if number == 13 {
+                    vec![(0x37, true)]
+                } else {
+                    vec![]
+                }
             );
             // Release modifiers need not match the press: release the held chord,
             // not whichever alias those current modifiers would select.
@@ -414,5 +447,70 @@ fn alias_modifier_references_survive_chord_changes_and_other_held_keys() {
             ))),
             [(0x3B, true)]
         );
+    }
+}
+
+#[test]
+fn enhanced_right_modifiers_keep_their_side_across_shared_chords() {
+    for (right, left, modifiers, code) in [
+        (
+            ModifierKey::RightControl,
+            ModifierKey::LeftControl,
+            Modifiers::CONTROL,
+            0x1D,
+        ),
+        (
+            ModifierKey::RightAlt,
+            ModifierKey::LeftAlt,
+            Modifiers::ALT,
+            0x38,
+        ),
+    ] {
+        let mut keyboard = PcKeyboard::new(KeyboardModel::AtSet1);
+        let right = InputKey::Modifier(right);
+        let left = InputKey::Modifier(left);
+        let press = InputEvent::new(right, modifiers, InputKind::Press);
+        assert_eq!(pc_xt_keyboard::map_key(&press, KeyboardModel::XtSet1), []);
+        assert!(matches!(
+            keyboard.handle(&press).as_slice(),
+            [PcEvent::Make(key)]
+                if key.physical == 0x100 | u16::from(code)
+                    && key.make.bytes() == [0xE0, code]
+        ));
+        assert_eq!(
+            keyboard.handle(&InputEvent::new(right, modifiers, InputKind::Repeat)),
+            []
+        );
+        assert_eq!(
+            physical(keyboard.handle(&InputEvent::new(
+                InputKey::Char('a'),
+                modifiers,
+                InputKind::Press
+            ))),
+            [(0x1E, true)]
+        );
+        // An explicit left-side press must not be folded into the right-side chord.
+        for (kind, down) in [(InputKind::Press, true), (InputKind::Release, false)] {
+            assert_eq!(
+                physical(keyboard.handle(&InputEvent::new(left, modifiers, kind))),
+                [(u16::from(code), down)]
+            );
+        }
+        assert_eq!(
+            keyboard.handle(&InputEvent::new(right, Modifiers::NONE, InputKind::Release)),
+            []
+        );
+        let release = keyboard.handle(&InputEvent::new(
+            InputKey::Char('a'),
+            Modifiers::NONE,
+            InputKind::Release,
+        ));
+        assert!(matches!(
+            release.as_slice(),
+            [PcEvent::Break(modifier), PcEvent::Break(key)]
+                if modifier.physical == 0x100 | u16::from(code)
+                    && modifier.break_sequence.bytes() == [0xE0, code | 0x80]
+                    && key.physical == 0x1E
+        ));
     }
 }

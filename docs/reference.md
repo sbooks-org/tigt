@@ -458,7 +458,7 @@ This replaces the library dependency, not every artifact of the old repository. 
 
 ### Mapper state and C buffer contracts
 
-Send each actual press and release to the same mapper instance. It reference-counts guest keys held by multiple host sources, emitting a release only when the final source releases that key. Repeats are ignored. Releasing Command/Super also releases dependent command-layer mappings. Rust additionally exposes `release_source`, `release_command_mappings` and `release_all`; callers own any synthetic timeout or release policy.
+Send each actual press, repeat and release to the same mapper instance. It reference-counts guest keys held by multiple host sources, emitting a release only when the final source releases that key. A repeat emits only the held mapping's non-modifier make, without reacquiring modifiers, changing the press-time mapping, or adding a hold reference. Orphan repeats and repeats of modifiers, lock keys, Print Screen, Pause and SysRq are ignored. Releasing Command/Super also releases dependent command-layer mappings. Rust additionally exposes `release_source`, `release_command_mappings` and `release_all`; callers own any synthetic timeout or release policy.
 
 Direct C input uses `pc_xt_keyboard_v1_input_event`: semantic key identity, Unicode scalar for characters, function/modifier value where applicable, Shift/Control/Alt/Super bits, and Press/Repeat/Release kind. TIGT's adapter performs this conversion for its own semantic events.
 
@@ -478,6 +478,8 @@ Invalid input, null pointers and insufficient capacity return `PC_XT_KEYBOARD_V1
 | Navigation outside the Command layer | Unextended keypad positions | Enhanced positions listed below |
 
 AT navigation identities are Home `0x147`, Up `0x148`, Page Up `0x149`, Left `0x14b`, Right `0x14d`, End `0x14f`, Down `0x150`, Page Down `0x151`, Insert `0x152` and Delete `0x153`. Their Set 1 wire sequences are `E0 position` on press and `E0 (position | 80)` on release. XT navigation, Command-layer keypad mappings and explicit keypad function-key mappings retain unextended identities.
+
+AT right Control and right Alt have independent identities `0x11d` and `0x138`, with the same E0-prefixed make/break encoding. XT has neither key. When only the right side of a modifier is held, implicit Control/Alt chords reuse that side rather than pressing an additional left modifier; explicit left-side presses remain independent.
 
 AT Print Screen's wire sequences are `E0 2A E0 37` / `E0 B7 E0 AA`. AT Pause emits `E1 1D 45 E1 9D C5` with no wire break sequence, but the physical API still emits a matching release. The Command-layer mapping can emit AT SysRq (`0x54`) for the corresponding Super/Control/Shift/Alt input. Rust `PcKey::make` and `PcKey::break_sequence` expose complete wire sequences; `PcKey::physical` is a guest key identity, not a byte to inject into a keyboard controller.
 

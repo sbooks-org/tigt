@@ -216,12 +216,34 @@ impl PcKeyboard {
         self.model
     }
 
-    /// Processes one transport-neutral input event.
+    /// Processes one transport-neutral input event. Repeats emit the held
+    /// non-modifier key's make without changing its mapping or ownership.
     pub fn handle(&mut self, input: &InputEvent) -> Vec<PcEvent> {
         match input.kind {
             InputKind::Press => {
                 let source = source_id(input.key);
-                let mapping = map_key(input, self.model);
+                let mut mapping = map_key(input, self.model);
+                if !matches!(input.key, InputKey::Modifier(_)) {
+                    // Implicit chord modifiers reuse an already-held right side;
+                    // explicit left/right modifier presses remain independent.
+                    for key in &mut mapping {
+                        match key.id {
+                            "CTRL"
+                                if !self.counts.contains_key("CTRL")
+                                    && self.counts.contains_key("R_CTRL") =>
+                            {
+                                *key = single(self.model, "R_CTRL", 0x1D);
+                            }
+                            "ALT"
+                                if !self.counts.contains_key("ALT")
+                                    && self.counts.contains_key("R_ALT") =>
+                            {
+                                *key = single(self.model, "R_ALT", 0x38);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 let release_with_command = is_command_layer_mapping(input, &mapping);
                 let suppress_shift = input.key == InputKey::Function(13)
                     && input.modifiers.contains(Modifiers::SHIFT);
@@ -234,7 +256,29 @@ impl PcKeyboard {
                 }
                 events
             }
-            InputKind::Repeat => Vec::new(),
+            InputKind::Repeat => self
+                .held
+                .get(&source_id(input.key))
+                .and_then(|held| held.keys.last())
+                .filter(|key| {
+                    !matches!(
+                        key.id,
+                        "L_SHIFT"
+                            | "R_SHIFT"
+                            | "CTRL"
+                            | "ALT"
+                            | "R_CTRL"
+                            | "R_ALT"
+                            | "CAPS"
+                            | "NUMLOCK"
+                            | "SCROLL"
+                            | "PRINT"
+                            | "PAUSE"
+                            | "SYSRQ"
+                    )
+                })
+                .map(|key| vec![PcEvent::Make(*key)])
+                .unwrap_or_default(),
         }
     }
 
@@ -348,6 +392,12 @@ fn is_shift(id: &str) -> bool {
 
 fn single(model: KeyboardModel, id: &'static str, make_code: u8) -> PcKey {
     match (model, id) {
+        (KeyboardModel::AtSet1, "R_CTRL" | "R_ALT") => PcKey {
+            id,
+            physical: 0x100 | u16::from(make_code),
+            make: ScanSequence::two([0xE0, make_code]),
+            break_sequence: ScanSequence::two([0xE0, make_code | 0x80]),
+        },
         (KeyboardModel::AtSet1, "PRINT") => PcKey {
             id,
             physical: 0x137,
@@ -396,6 +446,8 @@ pub fn map_key(input: &InputEvent, model: KeyboardModel) -> Vec<PcKey> {
         Modifier(RightShift) => single("R_SHIFT", 0x36),
         Modifier(LeftControl) => single("CTRL", 0x1D),
         Modifier(LeftAlt) => single("ALT", 0x38),
+        Modifier(RightControl) if model == KeyboardModel::AtSet1 => single("R_CTRL", 0x1D),
+        Modifier(RightAlt) if model == KeyboardModel::AtSet1 => single("R_ALT", 0x38),
         Modifier(RightControl | RightAlt | Other | LeftSuper | RightSuper) => Vec::new(),
         Escape => single("ESC", 0x01),
         Null | Char('\0') => vec![
